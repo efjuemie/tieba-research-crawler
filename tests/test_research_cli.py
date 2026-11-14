@@ -23,8 +23,8 @@ def test_export_cli_reports_the_created_batch_directory(tmp_path: Path, monkeypa
     batch_directory = tmp_path / "exports" / "all-runs_source-synthetic_20261114_120000_abc"
     calls = []
 
-    async def fake_export(output_dir, run_id):
-        calls.append((output_dir, run_id))
+    async def fake_export(output_dir, run_id, entity_scope):
+        calls.append((output_dir, run_id, entity_scope))
         return batch_directory
 
     monkeypatch.setattr(research_cli, "_run_export", fake_export)
@@ -33,7 +33,7 @@ def test_export_cli_reports_the_created_batch_directory(tmp_path: Path, monkeypa
     assert research_cli.main(["export", "--output", str(output_root), "--run-id", "synthetic-run"]) == 0
     captured = capsys.readouterr()
 
-    assert calls == [(output_root, "synthetic-run")]
+    assert calls == [(output_root, "synthetic-run", "all")]
     assert str(batch_directory) in captured.out
     assert "all runs" in captured.out
 
@@ -44,6 +44,12 @@ def test_export_cli_help_states_run_id_is_context_not_entity_filter(capsys):
     help_text = capsys.readouterr().out
 
     assert "entity CSVs always include all local runs" in help_text
+    assert "completed-threads" in help_text
+
+
+def test_export_cli_defaults_to_all_entity_scope():
+    args = research_cli._build_parser().parse_args(["export"])
+    assert args.entity_scope == "all"
 
 
 @pytest.mark.asyncio
@@ -64,8 +70,15 @@ async def test_run_export_passes_run_context_and_returns_real_batch_path(tmp_pat
         calls.append(("quality", received_sessions, run_id))
         return ()
 
-    async def fake_export(received_sessions, received_output, quality_rows, *, source_run_id=None):
-        calls.append(("export", received_sessions, received_output, quality_rows, source_run_id))
+    async def fake_export(
+        received_sessions,
+        received_output,
+        quality_rows,
+        *,
+        source_run_id=None,
+        entity_scope="all",
+    ):
+        calls.append(("export", received_sessions, received_output, quality_rows, source_run_id, entity_scope))
         return {"threads": batch_directory / "threads.csv", "manifest": batch_directory / "manifest.json"}
 
     monkeypatch.setattr(core_config, "Config", FakeConfig)
@@ -75,10 +88,10 @@ async def test_run_export_passes_run_context_and_returns_real_batch_path(tmp_pat
     monkeypatch.setattr(datastore_module, "iter_crawl_quality_summaries", fake_quality)
     monkeypatch.setattr(exporter_module, "export_research_csvs", fake_export)
 
-    result = await research_cli._run_export(output_root, "synthetic-run")
+    result = await research_cli._run_export(output_root, "synthetic-run", "completed-threads")
 
     assert result == batch_directory
     assert calls[0] == ("migration", engine)
     assert calls[1] == ("quality", sessions, "synthetic-run")
-    assert calls[2] == ("export", sessions, output_root, (), "synthetic-run")
+    assert calls[2] == ("export", sessions, output_root, (), "synthetic-run", "completed-threads")
     assert engine.dispose.await_count == 1

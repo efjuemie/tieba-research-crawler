@@ -20,13 +20,17 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, literal, or_, select, union
+from sqlalchemy.orm import aliased
 from tiebameow.models.orm import Comment as BaseComment
 from tiebameow.models.orm import Post as BasePost
 from tiebameow.models.orm import Thread as BaseThread
 from tiebameow.models.orm import User as BaseUser
 
+from src.core.models import ResearchTaskScope
+
 from .models import MediaAsset, ResearchComment, ResearchPost, ResearchThread, ResearchUser, UserForumSnapshot
+from .urls import canonical_thread_url
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -90,6 +94,14 @@ THREAD_FIELDS = (
     "missing_reasons_json",
     "record_source",
     "legacy_base_snapshot_json",
+    "thread_url",
+    "thread_url_source",
+    "thread_url_validation_status",
+    "thread_url_observed_at",
+    "latest_scope_status",
+    "latest_scope_run_id",
+    "latest_scope_generation",
+    "latest_comment_scope_status",
 )
 
 POST_FIELDS = (
@@ -133,6 +145,12 @@ POST_FIELDS = (
     "missing_reasons_json",
     "record_source",
     "legacy_base_snapshot_json",
+    "thread_url",
+    "thread_url_source",
+    "thread_url_validation_status",
+    "thread_url_observed_at",
+    "post_url",
+    "post_url_validation_status",
 )
 
 COMMENT_FIELDS = (
@@ -179,6 +197,14 @@ COMMENT_FIELDS = (
     "missing_reasons_json",
     "record_source",
     "legacy_base_snapshot_json",
+    "thread_url",
+    "thread_url_source",
+    "thread_url_validation_status",
+    "thread_url_observed_at",
+    "parent_post_url",
+    "parent_post_url_validation_status",
+    "comment_url",
+    "comment_url_validation_status",
 )
 
 USER_FIELDS = (
@@ -195,6 +221,7 @@ USER_FIELDS = (
     "missing_reasons_json",
     "record_source",
     "legacy_base_snapshot_json",
+    "global_growth_level",
 )
 
 USER_FORUM_SNAPSHOT_FIELDS = (
@@ -261,6 +288,17 @@ CRAWL_QUALITY_FIELDS = (
     "reason",
 )
 
+THREAD_SCOPE_QUALITY_FIELDS = (
+    "tid",
+    "latest_scope_status",
+    "latest_scope_run_id",
+    "latest_scope_generation",
+    "latest_comment_scope_status",
+    "entity_scope",
+    "selection_status",
+    "exclusion_reason",
+)
+
 
 async def export_research_csvs(
     async_sessionmaker_: async_sessionmaker[AsyncSession],
@@ -268,16 +306,20 @@ async def export_research_csvs(
     quality_summaries: Iterable[QualitySummary] | AsyncIterable[QualitySummary] = (),
     *,
     source_run_id: str | None = None,
+    entity_scope: str = "all",
 ) -> dict[str, Path]:
-    """Write a validated seven-file all-runs batch without materializing tables.
+    """Write a validated CSV batch without materializing entity tables.
 
     Extension rows take precedence as a complete research observation: a NULL
     in one of those rows is kept NULL. Legacy base rows are still included and
     marked ``legacy_base_unverified``; their stored values are never used to
-    fill NULL extension fields. ``source_run_id`` is filename context only;
-    entity tables have no run filter and are exported as all-runs. Pause
-    collection while exporting so quality summaries cannot race active writes.
+    fill NULL extension fields. ``source_run_id`` is filename and quality
+    report context only. ``all`` is unfiltered; ``completed-threads`` applies
+    a conservative current-scope filter to threads, posts, comments, and media.
+    Pause collection while exporting so quality summaries cannot race writes.
     """
+    if entity_scope not in {"all", "completed-threads"}:
+        raise ValueError("entity_scope must be 'all' or 'completed-threads'.")
     destination_root = Path(output_dir)
     if await asyncio.to_thread(destination_root.is_symlink):
         raise ResearchExportValidationError("Export root must not be a symbolic link.")
@@ -286,7 +328,7 @@ async def export_research_csvs(
         raise ResearchExportValidationError("Export root must be a directory.")
     await asyncio.to_thread(destination_root.chmod, 0o700)
 
-    batch_prefix, export_id, exported_at = _batch_identity(source_run_id)
+    batch_prefix, export_id, exported_at = _batch_identity(source_run_id, entity_scope)
     batch_directory = destination_root / batch_prefix
     already_exists = await asyncio.to_thread(batch_directory.exists)
     is_symlink = await asyncio.to_thread(batch_directory.is_symlink)
@@ -304,15 +346,17 @@ async def export_research_csvs(
             "users",
             "user_forum_snapshots",
             "media_assets",
+            "thread_scope_quality_report",
             "crawl_quality_report",
         )
     }
 
     try:
-        specs = _query_specs()
+        specs = _query_specs(entity_scope)
         async with async_sessionmaker_() as session:
             await _begin_consistent_snapshot(session)
-            expected_counts = await _validate_database(session, specs)
+            expected_counts = await _validate_database(session, specs, entity_scope)
+            scope_selection_counts = await _thread_scope_selection_counts(session, entity_scope)
             csv_counts: dict[str, int] = {}
             for name, statement, fields, row_mapper, _unique_fields in specs:
                 written = await _write_query_csv(session, paths[name], fields, statement, row_mapper)
@@ -345,7 +389,33 @@ async def export_research_csvs(
             {
                 "export_id": export_id,
                 "exported_at": exported_at.isoformat(timespec="microseconds"),
-                "entity_scope": "all_database_rows",
+                "entity_scope": "all_database_rows" if entity_scope == "all" else "completed_threads_latest_scope",
+                "entity_scope_filter": entity_scope,
+                "entity_scope_table_semantics": {
+                    "threads": entity_scope,
+                    "posts": entity_scope,
+                    "comments": entity_scope,
+                    "media_assets": (
+                        "all_database_rows" if entity_scope == "all" else "selected_content_owners_only"
+                    ),
+                    "users": "all_database_rows_unfiltered",
+                    "user_forum_snapshots": "all_database_rows_unfiltered",
+                },
+                "scope_selection_semantics": (
+                    "latest ResearchTaskScope per tid and logical scope across runs by last_checked DESC, run_id DESC; "
+                    "generation is current within its run; all known child comment scopes must be completed; "
+                    "a missing child scope excludes only when comments or a positive reported count require it"
+                    if entity_scope == "completed-threads"
+                    else "all database rows; latest scope status is descriptive only"
+                ),
+                "database_export_validation_status": "passed",
+                "source_scope_completion_status": (
+                    "latest_scope_completed_for_included_threads_only"
+                    if entity_scope == "completed-threads"
+                    else ("known_scope_summaries_present" if quality_summary_count else "unknown_not_tested")
+                ),
+                "forum_coverage_status": "unknown_not_proven",
+                "thread_scope_selection_counts": scope_selection_counts,
                 "source_run_id_context_only": source_run_id,
                 "csv_files": {name: path.name for name, path in paths.items()},
                 "database_row_counts": expected_counts,
@@ -369,20 +439,21 @@ async def export_research_csvs(
             await asyncio.to_thread(shutil.rmtree, staging_directory, ignore_errors=True)
 
 
-def _batch_identity(source_run_id: str | None) -> tuple[str, str, datetime]:
+def _batch_identity(source_run_id: str | None, entity_scope: str = "all") -> tuple[str, str, datetime]:
     safe_run_id = "unknown" if source_run_id is None else re.sub(r"[^A-Za-z0-9_-]+", "-", source_run_id).strip("-_")
     safe_run_id = safe_run_id[:48] or "unknown"
     exported_at = datetime.now(ZoneInfo("Asia/Shanghai"))
     timestamp = exported_at.strftime("%Y%m%d_%H%M%S_%f")
     export_id = uuid4().hex
-    return f"all-runs_source-{safe_run_id}_{timestamp}_{export_id}", export_id, exported_at
+    scope_prefix = "all-runs" if entity_scope == "all" else "completed-threads"
+    return f"{scope_prefix}_source-{safe_run_id}_{timestamp}_{export_id}", export_id, exported_at
 
 
-def _query_specs():
+def _query_specs(entity_scope: str = "all"):
     return [
-        ("threads", _thread_query(), THREAD_FIELDS, _thread_row, ("export_id",)),
-        ("posts", _post_query(), POST_FIELDS, _post_row, ("export_id",)),
-        ("comments", _comment_query(), COMMENT_FIELDS, _comment_row, ("export_id",)),
+        ("threads", _thread_query(entity_scope), THREAD_FIELDS, _thread_row, ("export_id",)),
+        ("posts", _post_query(entity_scope), POST_FIELDS, _post_row, ("export_id",)),
+        ("comments", _comment_query(entity_scope), COMMENT_FIELDS, _comment_row, ("export_id",)),
         ("users", _user_query(), USER_FIELDS, _user_row, ("export_id",)),
         (
             "user_forum_snapshots",
@@ -393,10 +464,17 @@ def _query_specs():
         ),
         (
             "media_assets",
-            _media_query(),
+            _media_query(entity_scope),
             MEDIA_ASSET_FIELDS,
             lambda row: _research_row(row[3], MEDIA_ASSET_FIELDS),
             ("export_owner_type", "export_owner_id", "export_position"),
+        ),
+        (
+            "thread_scope_quality_report",
+            _thread_scope_quality_query(entity_scope),
+            THREAD_SCOPE_QUALITY_FIELDS,
+            _thread_scope_quality_row,
+            ("tid",),
         ),
     ]
 
@@ -410,7 +488,11 @@ async def _begin_consistent_snapshot(session: AsyncSession) -> None:
         await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
 
 
-async def _validate_database(session: AsyncSession, specs: list[tuple]) -> dict[str, int]:
+async def _validate_database(
+    session: AsyncSession,
+    specs: list[tuple],
+    entity_scope: str = "all",
+) -> dict[str, int]:
     expected_counts: dict[str, int] = {}
     for name, statement, _fields, _row_mapper, unique_fields in specs:
         subquery = statement.subquery()
@@ -422,14 +504,14 @@ async def _validate_database(session: AsyncSession, specs: list[tuple]) -> dict[
         if duplicates:
             raise ResearchExportValidationError(f"Export validation failed: {name} contains duplicate primary keys.")
 
-    await _validate_relationships(session)
+    await _validate_relationships(session, entity_scope)
     return expected_counts
 
 
-async def _validate_relationships(session: AsyncSession) -> None:
-    threads = _thread_query().subquery("export_threads")
-    posts = _post_query().subquery("export_posts")
-    comments = _comment_query().subquery("export_comments")
+async def _validate_relationships(session: AsyncSession, entity_scope: str = "all") -> None:
+    threads = _thread_query(entity_scope).subquery("export_threads")
+    posts = _post_query(entity_scope).subquery("export_posts")
+    comments = _comment_query(entity_scope).subquery("export_comments")
 
     post_thread_exists = select(1).select_from(threads).where(threads.c.export_id == posts.c.export_tid).exists()
     orphan_posts = await session.scalar(
@@ -475,7 +557,240 @@ async def _validate_relationships(session: AsyncSession) -> None:
         )
 
 
-def _thread_query():
+def _latest_scope_rows(scope_type: str):
+    scope = aliased(ResearchTaskScope)
+    partition_columns = [scope.tid]
+    conditions = [scope.scope_type == scope_type, scope.tid.is_not(None)]
+    if scope_type == "post_comments":
+        partition_columns.append(scope.parent_pid)
+        conditions.append(scope.parent_pid.is_not(None))
+    ranked = (
+        select(
+            scope.run_id.label("run_id"),
+            scope.logical_task_key.label("logical_task_key"),
+            scope.tid.label("tid"),
+            scope.parent_pid.label("parent_pid"),
+            scope.generation.label("generation"),
+            scope.status.label("status"),
+            scope.last_checked.label("last_checked"),
+            func.row_number()
+            .over(
+                partition_by=partition_columns,
+                order_by=(scope.last_checked.desc(), scope.run_id.desc(), scope.logical_task_key.desc()),
+            )
+            .label("scope_rank"),
+        )
+        .where(*conditions)
+        .subquery(f"ranked_{scope_type}")
+    )
+    return (
+        select(
+            ranked.c.run_id,
+            ranked.c.logical_task_key,
+            ranked.c.tid,
+            ranked.c.parent_pid,
+            ranked.c.generation,
+            ranked.c.status,
+            ranked.c.last_checked,
+        )
+        .where(ranked.c.scope_rank == 1)
+        .subquery(f"latest_{scope_type}")
+    )
+
+
+def _comment_scope_requirements():
+    comment_rows = _comment_query().subquery("known_export_comments")
+    post_tid = case((ResearchPost.pid.is_not(None), ResearchPost.tid), else_=BasePost.tid)
+    post_pid = case((ResearchPost.pid.is_not(None), ResearchPost.pid), else_=BasePost.pid)
+    post_subreply_count = case(
+        (ResearchPost.pid.is_not(None), ResearchPost.subreply_count_reported),
+        else_=BasePost.reply_num,
+    )
+    positive_post_parents = (
+        select(post_tid.label("tid"), post_pid.label("parent_pid"))
+        .select_from(BasePost)
+        .join(ResearchPost, BasePost.pid == ResearchPost.pid, full=True)
+        .where(post_tid.is_not(None), post_pid.is_not(None), post_subreply_count > 0)
+    )
+    first_post_subreply_count = (
+        ResearchThread.source_payload_json["first_post"]["subreply_count_reported"].as_integer()
+    )
+    positive_first_post_parents = select(
+        ResearchThread.tid.label("tid"),
+        ResearchThread.first_pid.label("parent_pid"),
+    ).where(
+        first_post_subreply_count > 0,
+    )
+    known_comment_parents = select(
+        comment_rows.c.export_tid.label("tid"),
+        comment_rows.c.export_parent_pid.label("parent_pid"),
+    ).where(
+        comment_rows.c.export_tid.is_not(None),
+        comment_rows.c.export_parent_pid.is_not(None),
+    )
+    return union(known_comment_parents, positive_post_parents, positive_first_post_parents).subquery(
+        "required_comment_scope_parents"
+    )
+
+
+def _scope_state_queries():
+    latest_thread = _latest_scope_rows("thread_replies")
+    latest_comments = _latest_scope_rows("post_comments")
+    comment_scope_summary = (
+        select(
+            latest_comments.c.tid,
+            func.count().label("scope_count"),
+            func.sum(case((latest_comments.c.status != "completed", 1), else_=0)).label("incomplete_count"),
+        )
+        .group_by(latest_comments.c.tid)
+        .subquery("latest_comment_scope_summary")
+    )
+    required_parents = _comment_scope_requirements()
+    missing_comment_scopes = (
+        select(required_parents.c.tid, func.count().label("missing_count"))
+        .select_from(required_parents)
+        .outerjoin(
+            latest_comments,
+            and_(
+                latest_comments.c.tid == required_parents.c.tid,
+                latest_comments.c.parent_pid == required_parents.c.parent_pid,
+            ),
+        )
+        .where(latest_comments.c.run_id.is_(None))
+        .group_by(required_parents.c.tid)
+        .subquery("missing_comment_scope_summary")
+    )
+    return latest_thread, latest_comments, comment_scope_summary, missing_comment_scopes
+
+
+def _comment_scope_status(summary: Any, missing: Any):
+    child_scope_count = func.coalesce(summary.c.scope_count, 0)
+    incomplete_child_scope_count = func.coalesce(summary.c.incomplete_count, 0)
+    missing_child_scope_count = func.coalesce(missing.c.missing_count, 0)
+    return case(
+        (incomplete_child_scope_count > 0, literal("incomplete")),
+        (missing_child_scope_count > 0, literal("missing_completion_evidence")),
+        (child_scope_count > 0, literal("completed")),
+        else_=literal("no_known_comment_scope_required"),
+    )
+
+
+def _completed_thread_ids():
+    latest_thread, _latest_comments, comment_summary, missing_summary = _scope_state_queries()
+    thread_ids = _thread_id_query().subquery("all_export_thread_ids")
+    comment_status = _comment_scope_status(comment_summary, missing_summary)
+    return (
+        select(thread_ids.c.export_id)
+        .select_from(thread_ids)
+        .join(latest_thread, latest_thread.c.tid == thread_ids.c.export_id)
+        .outerjoin(comment_summary, comment_summary.c.tid == thread_ids.c.export_id)
+        .outerjoin(missing_summary, missing_summary.c.tid == thread_ids.c.export_id)
+        .where(
+            latest_thread.c.status == "completed",
+            comment_status.in_(("completed", "no_known_comment_scope_required")),
+        )
+    )
+
+
+def _thread_scope_quality_query(entity_scope: str):
+    export_id = case(
+        (ResearchThread.tid.is_not(None), ResearchThread.tid),
+        else_=BaseThread.tid,
+    ).label("tid")
+    latest_thread, _latest_comments, comment_summary, missing_summary = _scope_state_queries()
+    latest_scope_status = func.coalesce(latest_thread.c.status, literal("no_evidence"))
+    latest_comment_scope_status = _comment_scope_status(comment_summary, missing_summary)
+    is_completed = and_(
+        latest_scope_status == "completed",
+        latest_comment_scope_status.in_(("completed", "no_known_comment_scope_required")),
+    )
+    if entity_scope == "all":
+        selection_status = literal("unfiltered")
+        exclusion_reason = literal(None)
+    else:
+        selection_status = case((is_completed, literal("included")), else_=literal("excluded"))
+        exclusion_reason = case(
+            (latest_scope_status == "no_evidence", literal("missing_detail_evidence")),
+            (latest_scope_status != "completed", literal("latest_scope_not_completed")),
+            (
+                latest_comment_scope_status == "missing_completion_evidence",
+                literal("missing_completion_evidence"),
+            ),
+            (
+                latest_comment_scope_status == "incomplete",
+                literal("latest_child_comment_scope_not_completed"),
+            ),
+            else_=literal(None),
+        )
+    return (
+        select(
+            export_id,
+            latest_scope_status.label("latest_scope_status"),
+            latest_thread.c.run_id.label("latest_scope_run_id"),
+            latest_thread.c.generation.label("latest_scope_generation"),
+            latest_comment_scope_status.label("latest_comment_scope_status"),
+            literal(entity_scope).label("entity_scope"),
+            selection_status.label("selection_status"),
+            exclusion_reason.label("exclusion_reason"),
+        )
+        .select_from(BaseThread)
+        .join(ResearchThread, BaseThread.tid == ResearchThread.tid, full=True)
+        .outerjoin(latest_thread, latest_thread.c.tid == export_id)
+        .outerjoin(comment_summary, comment_summary.c.tid == export_id)
+        .outerjoin(missing_summary, missing_summary.c.tid == export_id)
+    )
+
+
+async def _thread_scope_selection_counts(session: AsyncSession, entity_scope: str) -> dict[str, object]:
+    report = _thread_scope_quality_query(entity_scope).subquery("thread_scope_selection")
+    result = await session.execute(
+        select(report.c.selection_status, report.c.exclusion_reason, func.count())
+        .group_by(report.c.selection_status, report.c.exclusion_reason)
+        .order_by(report.c.selection_status, report.c.exclusion_reason)
+    )
+    selection_counts: dict[str, int] = {}
+    exclusion_counts: dict[str, int] = {}
+    candidate_count = 0
+    for status, reason, count in result:
+        count = int(count)
+        candidate_count += count
+        selection_counts[status] = selection_counts.get(status, 0) + count
+        if reason is not None:
+            exclusion_counts[reason] = exclusion_counts.get(reason, 0) + count
+    return {
+        "candidate_thread_count": candidate_count,
+        "selection_status_counts": selection_counts,
+        "exclusion_reason_counts": exclusion_counts,
+    }
+
+
+def _thread_scope_quality_row(row: Any) -> dict[str, object]:
+    return dict(zip(THREAD_SCOPE_QUALITY_FIELDS, row, strict=True))
+
+
+def _thread_id_query():
+    export_id = case(
+        (ResearchThread.tid.is_not(None), ResearchThread.tid),
+        else_=BaseThread.tid,
+    ).label("export_id")
+    export_first_pid = case(
+        (ResearchThread.tid.is_not(None), ResearchThread.first_pid),
+        else_=(
+            select(BasePost.pid)
+            .where(BasePost.tid == BaseThread.tid, BasePost.floor == 1)
+            .order_by(BasePost.create_time.asc(), BasePost.pid.asc())
+            .limit(1)
+            .scalar_subquery()
+        ),
+    ).label("export_first_pid")
+    return (
+        select(export_id, export_first_pid)
+        .select_from(BaseThread)
+        .join(ResearchThread, BaseThread.tid == ResearchThread.tid, full=True)
+    )
+
+
+def _thread_query(entity_scope: str = "all"):
     export_id = case(
         (ResearchThread.tid.is_not(None), ResearchThread.tid),
         else_=BaseThread.tid,
@@ -494,15 +809,41 @@ def _thread_query():
         (ResearchThread.tid.is_not(None), ResearchThread.author_user_id),
         else_=BaseThread.author_id,
     )
-    return (
-        select(export_id, export_first_pid, BaseThread, ResearchThread, BaseUser)
+    # This matches _thread_row's source selection: a research row is used as a
+    # whole observation, so its NULL create_time must remain NULL for ordering.
+    export_create_time = case(
+        (ResearchThread.tid.is_not(None), ResearchThread.create_time),
+        else_=BaseThread.create_time,
+    )
+    latest_thread, _latest_comments, comment_summary, missing_summary = _scope_state_queries()
+    latest_scope_status = func.coalesce(latest_thread.c.status, literal("no_evidence"))
+    latest_comment_scope_status = _comment_scope_status(comment_summary, missing_summary)
+    statement = (
+        select(
+            export_id,
+            export_first_pid,
+            BaseThread,
+            ResearchThread,
+            BaseUser,
+            latest_scope_status.label("latest_scope_status"),
+            latest_thread.c.run_id.label("latest_scope_run_id"),
+            latest_thread.c.generation.label("latest_scope_generation"),
+            latest_comment_scope_status.label("latest_comment_scope_status"),
+        )
         .select_from(BaseThread)
         .join(ResearchThread, BaseThread.tid == ResearchThread.tid, full=True)
         .outerjoin(BaseUser, author_id == BaseUser.user_id)
+        .outerjoin(latest_thread, latest_thread.c.tid == export_id)
+        .outerjoin(comment_summary, comment_summary.c.tid == export_id)
+        .outerjoin(missing_summary, missing_summary.c.tid == export_id)
+        .order_by(export_create_time.desc().nulls_last(), export_id.desc())
     )
+    if entity_scope == "completed-threads":
+        statement = statement.where(export_id.in_(_completed_thread_ids()))
+    return statement
 
 
-def _post_query():
+def _post_query(entity_scope: str = "all"):
     tid = case((ResearchPost.pid.is_not(None), ResearchPost.tid), else_=BasePost.tid)
     export_id = case((ResearchPost.pid.is_not(None), ResearchPost.pid), else_=BasePost.pid).label("export_id")
     export_tid = tid.label("export_tid")
@@ -510,16 +851,24 @@ def _post_query():
         (ResearchPost.pid.is_not(None), ResearchPost.author_user_id),
         else_=BasePost.author_id,
     )
-    return (
+    export_create_time = case(
+        (ResearchPost.pid.is_not(None), ResearchPost.create_time),
+        else_=BasePost.create_time,
+    )
+    statement = (
         select(export_id, export_tid, BasePost, ResearchPost, ResearchThread, BaseUser)
         .select_from(BasePost)
         .join(ResearchPost, BasePost.pid == ResearchPost.pid, full=True)
         .outerjoin(ResearchThread, ResearchThread.tid == tid)
         .outerjoin(BaseUser, author_id == BaseUser.user_id)
+        .order_by(tid.asc().nulls_last(), export_create_time.asc().nulls_last(), export_id.asc())
     )
+    if entity_scope == "completed-threads":
+        statement = statement.where(tid.in_(_completed_thread_ids()))
+    return statement
 
 
-def _comment_query():
+def _comment_query(entity_scope: str = "all"):
     export_id = case((ResearchComment.cid.is_not(None), ResearchComment.cid), else_=BaseComment.cid).label("export_id")
     export_tid = case(
         (ResearchComment.cid.is_not(None), ResearchComment.tid),
@@ -533,12 +882,25 @@ def _comment_query():
         (ResearchComment.cid.is_not(None), ResearchComment.author_user_id),
         else_=BaseComment.author_id,
     )
-    return (
+    export_create_time = case(
+        (ResearchComment.cid.is_not(None), ResearchComment.create_time),
+        else_=BaseComment.create_time,
+    )
+    statement = (
         select(export_id, export_tid, export_parent_pid, BaseComment, ResearchComment, BaseUser)
         .select_from(BaseComment)
         .join(ResearchComment, BaseComment.cid == ResearchComment.cid, full=True)
         .outerjoin(BaseUser, author_id == BaseUser.user_id)
+        .order_by(
+            export_tid.asc().nulls_last(),
+            export_parent_pid.asc().nulls_last(),
+            export_create_time.asc().nulls_last(),
+            export_id.asc(),
+        )
     )
+    if entity_scope == "completed-threads":
+        statement = statement.where(export_tid.in_(_completed_thread_ids()))
+    return statement
 
 
 def _user_query():
@@ -556,17 +918,70 @@ def _snapshot_query():
     return select(UserForumSnapshot.user_id.label("export_id"), UserForumSnapshot)
 
 
-def _media_query():
-    return select(
+def _media_query(entity_scope: str = "all"):
+    statement = select(
         MediaAsset.owner_type.label("export_owner_type"),
         MediaAsset.owner_id.label("export_owner_id"),
         MediaAsset.position.label("export_position"),
         MediaAsset,
     )
+    if entity_scope == "all":
+        return statement
+
+    thread_query = _thread_id_query()
+    threads = thread_query.where(thread_query.selected_columns.export_id.in_(_completed_thread_ids())).subquery(
+        "selected_thread_owners"
+    )
+    posts = _post_query("completed-threads").subquery("selected_post_owners")
+    comments = _comment_query("completed-threads").subquery("selected_comment_owners")
+    thread_owner_exists = (
+        select(1)
+        .select_from(threads)
+        .where(
+            threads.c.export_id == MediaAsset.tid,
+            threads.c.export_first_pid == MediaAsset.owner_id,
+        )
+        .exists()
+    )
+    post_owner_exists = (
+        select(1)
+        .select_from(posts)
+        .where(
+            posts.c.export_tid == MediaAsset.tid,
+            posts.c.export_id == MediaAsset.owner_id,
+        )
+        .exists()
+    )
+    comment_owner_exists = (
+        select(1)
+        .select_from(comments)
+        .where(
+            comments.c.export_tid == MediaAsset.tid,
+            comments.c.export_id == MediaAsset.owner_id,
+        )
+        .exists()
+    )
+    return statement.where(
+        or_(
+            and_(MediaAsset.owner_type == "thread_first_post", thread_owner_exists),
+            and_(MediaAsset.owner_type == "post", post_owner_exists),
+            and_(MediaAsset.owner_type == "comment", comment_owner_exists),
+        )
+    )
 
 
 def _thread_row(row: Any) -> dict[str, object]:
-    _export_id, export_first_pid, base, research, author = row
+    (
+        _export_id,
+        export_first_pid,
+        base,
+        research,
+        author,
+        latest_scope_status,
+        latest_scope_run_id,
+        latest_scope_generation,
+        latest_comment_scope_status,
+    ) = row
     if research is not None:
         values = _research_values(research, THREAD_FIELDS)
         values["record_source"] = "research_api"
@@ -592,6 +1007,11 @@ def _thread_row(row: Any) -> dict[str, object]:
             "record_source": "legacy_base_unverified",
         }
     values["legacy_base_snapshot_json"] = _legacy_snapshot(base, author)
+    _add_thread_url_metadata(values)
+    values["latest_scope_status"] = latest_scope_status
+    values["latest_scope_run_id"] = latest_scope_run_id
+    values["latest_scope_generation"] = latest_scope_generation
+    values["latest_comment_scope_status"] = latest_comment_scope_status
     return values
 
 
@@ -629,6 +1049,8 @@ def _post_row(row: Any) -> dict[str, object]:
             "record_source": "legacy_base_unverified",
         }
     values["legacy_base_snapshot_json"] = _legacy_snapshot(base, author)
+    _add_thread_url_metadata(values)
+    _mark_unverified_deep_links(values, ("post_url",))
     return values
 
 
@@ -661,7 +1083,35 @@ def _comment_row(row: Any) -> dict[str, object]:
             "record_source": "legacy_base_unverified",
         }
     values["legacy_base_snapshot_json"] = _legacy_snapshot(base, author)
+    _add_thread_url_metadata(values)
+    _mark_unverified_deep_links(values, ("parent_post_url", "comment_url"))
     return values
+
+
+def _add_thread_url_metadata(values: dict[str, object]) -> None:
+    url = canonical_thread_url(values.get("tid"))
+    values["thread_url"] = url
+    values["thread_url_source"] = "constructed_from_tid" if url is not None else None
+    values["thread_url_validation_status"] = "not_live_verified" if url is not None else "invalid_tid"
+    # URL construction is local computation, not a live observation.
+    values["thread_url_observed_at"] = None
+    if url is None:
+        _add_missing_reasons(values, {"thread_url": "invalid_tid"})
+
+
+def _mark_unverified_deep_links(values: dict[str, object], url_fields: tuple[str, ...]) -> None:
+    reasons = dict.fromkeys(url_fields, "not_live_verified_identity_unverified")
+    for field in url_fields:
+        values[field] = None
+        values[f"{field}_validation_status"] = "identity_unverified"
+    _add_missing_reasons(values, reasons)
+
+
+def _add_missing_reasons(values: dict[str, object], additions: Mapping[str, str]) -> None:
+    existing = values.get("missing_reasons_json")
+    reasons = dict(existing) if isinstance(existing, Mapping) else {}
+    reasons.update(additions)
+    values["missing_reasons_json"] = reasons
 
 
 def _user_row(row: Any) -> dict[str, object]:

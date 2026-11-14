@@ -36,6 +36,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "filter the crawl-quality report and label this export batch; entity CSVs always include all local runs"
         ),
     )
+    export.add_argument(
+        "--entity-scope",
+        choices=("all", "completed-threads"),
+        default="all",
+        help="all exports every entity by default; completed-threads selects complete current detail scopes",
+    )
     return parser
 
 
@@ -49,8 +55,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Saved local Baidu account file: {path}")
         return 0
 
-    batch_directory = asyncio.run(_run_export(args.output, args.run_id))
-    print(f"Exported all local research rows (all runs) to: {batch_directory}")
+    batch_directory = asyncio.run(_run_export(args.output, args.run_id, args.entity_scope))
+    if args.entity_scope == "all":
+        print(f"Exported all local research rows (all runs) to: {batch_directory}")
+    else:
+        print(f"Exported rows for completed threads (all runs) to: {batch_directory}")
     return 0
 
 
@@ -60,7 +69,7 @@ async def _login_with_browser(account_file: Path | None) -> Path:
     return await browser_login(account_file)
 
 
-async def _run_export(output_dir: Path, run_id: str | None) -> Path:
+async def _run_export(output_dir: Path, run_id: str | None, entity_scope: str = "all") -> Path:
     """Connect to the configured local PostgreSQL database and export it."""
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -79,6 +88,7 @@ async def _run_export(output_dir: Path, run_id: str | None) -> Path:
             output_dir,
             quality_summaries,
             source_run_id=run_id,
+            entity_scope=entity_scope,
         )
         if not paths:
             raise RuntimeError("CSV exporter returned no batch paths.")
