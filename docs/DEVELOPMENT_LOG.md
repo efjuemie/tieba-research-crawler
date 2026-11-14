@@ -59,3 +59,15 @@
 - GitHub 公开仓库只放代码、非敏感配置模板及不含真实用户数据的文档/测试。
 - PostgreSQL 数据、备份、CSV、日志、参考截图、BDUSS/Cookie 和 `config.toml` 留在本机。
 - VS Code 共享配置虽已跟踪，也不能包含数据库密码或账号凭据。提交前逐项核对 `git status`、暂存文件清单、忽略规则和 staged diff；不要使用 `git add -A`。
+
+## 2026-11-15：V2 Stage 0收尾审计
+
+- 从 `origin/main` 拉取后仍位于 `2aebedffb81862ce7447e7b9c2f1a58c3989f663`；当前检查没有修改产品源码、测试或公开配置。
+- 在 Python 3.12.16、aiotieba 4.8.2、tiebameow 0.5.0 的本机环境运行全仓 pytest：236 passed、10 skipped、15 warnings；Ruff 0 issues。
+- 为原有本地数据库留存权限受限的备份。在线验收库恢复至新隔离库后，非系统表列、逐表行数与 run 状态汇总一致；旧数据源保持只读。备份文件及详细结果留在本机忽略目录。
+- Stage 0字段审计区分“解析类未映射”与“接口不支持”：本地protobuf descriptor列出了评论作者 `ip_address`、`user_growth.level_id`、`tieba_uid`、`bawu_type` wire候选，而 aiotieba 4.8.2 的 `UserInfo_c` 解析类未映射这些字段。一次低频 `get_comments` 请求正常返回，但安全scope匹配失败，因此本次字段值为 `NOT_TESTED`，不能据此认定字段未返回或接口不支持。
+- 用户提供的DOM与nested-floor JSON摘要支持后续核验候选字段，但没有将真实标识、用户名、帖子/回复正文或字段原值写入本记录。root通过用户手动完成验证的专用本地浏览器会话做了只读UI核验并触发展开控件；这只证明当前页面可读和展开操作可用。JSON字段与请求上下文仍需在当前会话中live capture核对，深链和楼中楼数据库身份关联尚未验证。
+- 匿名网页探测曾收到HTTP 403人工验证拦截并立即停止。未尝试绕过、重放签名请求或读取用户已有浏览器Profile。
+- 审计还确认：`get_user_info`结果尚未作为用户观察持久化，昵称空值fallback与稀疏upsert存在字段丢失风险，`get_bawu_info`尚未接入研究管线；当前threads CSV没有最终排序约束，模型/CSV没有主题帖及回复URL列。详细字段矩阵和本机备份证据仅在本地审核材料中。
+
+本节更新了前文“备份恢复尚未验证”的状态：该项已在Stage 0后续完成。Stage 0审计结束，后续按批准的分阶段计划推进；当前记录不表示全吧采集、回复完整性或网页补采已经通过验收。
