@@ -6,23 +6,37 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import uuid
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, ClassVar, Literal
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from cashews import Cache, add_prefix
-from sqlalchemy import case, delete, select
+from sqlalchemy import BigInteger, String, and_, case, cast, delete, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 from tiebameow.models.orm import Comment, Forum, Post, Thread, User
 from tiebameow.utils.logger import logger
 
 from .metrics import CACHE_HITS, CACHE_MISSES, DB_OPERATIONS
-from .models import PendingCommentScan, PendingThreadScan
+from .models import (
+    PendingCommentScan,
+    PendingThreadScan,
+    ResearchCheckpoint,
+    ResearchRun,
+    ResearchTaskScope,
+    research_comments_task_key,
+    research_posts_task_key,
+)
 from .publisher import EventEnvelope, NoopPublisher, RedisStreamsPublisher, WebSocketPublisher, build_envelope
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from collections.abc import AsyncIterator
 
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
     from tiebameow.models.dto import CommentDTO, PostDTO, ThreadDTO
 
     from .container import Container
@@ -39,6 +53,52 @@ PRIMARY_KEY_MAP = {
     Forum: {"fid"},
     User: {"user_id"},
 }
+
+
+async def iter_crawl_quality_summaries(
+    async_sessionmaker_: async_sessionmaker,
+    run_id: str | None = None,
+) -> AsyncIterator[dict[str, object]]:
+    """Stream scope-level crawl quality rows without constructing DataStore."""
+    async for summary in DataStore._iter_crawl_quality_summaries(async_sessionmaker_, run_id):
+        yield summary
+
+
+def _first_post_comment_count_expressions(checkpoint):
+    """Build the trusted first-post comment count and its missing reason."""
+    from src.research.models import ResearchThread
+
+    payload = (
+        select(ResearchThread.source_payload_json["first_post"])
+        .where(ResearchThread.tid == checkpoint.tid, ResearchThread.first_pid == checkpoint.parent_pid)
+        .limit(1)
+        .scalar_subquery()
+    )
+    payload_count = cast(payload["subreply_count_reported"].as_integer(), BigInteger)
+    payload_reason = payload["missing_reason"].as_string()
+    pages = aliased(ResearchCheckpoint)
+    reported = (
+        select(pages.reported_count)
+        .where(
+            pages.run_id == checkpoint.run_id,
+            pages.task_key == checkpoint.task_key,
+            pages.status == "completed",
+        )
+        .order_by(pages.page_number.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    missing = (
+        select(pages.reported_count_missing_reason)
+        .where(pages.run_id == checkpoint.run_id, pages.task_key == checkpoint.task_key)
+        .order_by(pages.page_number.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    trusted_checkpoint_count = case((missing.is_(None), reported), else_=None)
+    return func.coalesce(trusted_checkpoint_count, payload_count), func.coalesce(
+        missing, payload_reason, "first_post_reply_count_unavailable"
+    )
 
 
 class DataStore:
@@ -103,6 +163,1135 @@ class DataStore:
                 await self.publisher.close()
         except Exception as e:
             logger.warning("Failed to close publisher: {}", e)
+
+    async def start_research_run(
+        self,
+        *,
+        mode: str,
+        forums: list[tuple[int, str]],
+        max_backfill_pages: int,
+        resume: bool = False,
+        run_id: str | None = None,
+    ) -> str:
+        """Create a durable run or reopen the latest compatible incomplete run."""
+        normalized_forums = sorted({(int(fid), fname) for fid, fname in forums})
+        scope_payload = {
+            "forums": normalized_forums,
+            "sort_mode": "create",
+            "sampling_scope": "all_accessible_threads_and_replies",
+            "checkpoint_version": 1,
+        }
+        scope_key = hashlib.sha256(json.dumps(scope_payload, separators=(",", ":")).encode()).hexdigest()
+        now = datetime.now(UTC)
+        async with self.async_sessionmaker() as session:
+            if resume:
+                statement = select(ResearchRun).where(
+                        ResearchRun.scope_key == scope_key,
+                        ResearchRun.status.in_(
+                            (
+                                "running",
+                                "interrupted",
+                                "incomplete",
+                                "paused_auth",
+                                "paused_rate_limit",
+                                "paused_limit",
+                                "blocked",
+                            )
+                        ),
+                    )
+                if run_id is not None:
+                    statement = statement.where(ResearchRun.run_id == run_id)
+                else:
+                    statement = statement.order_by(ResearchRun.last_checked.desc()).limit(1)
+                result = await session.execute(statement)
+                run = result.scalar_one_or_none()
+                if run is None:
+                    raise ValueError("No resumable research run matches the current mode and forum scope.")
+                run.status = "running"
+                run.reason = None
+                run.last_checked = now
+            else:
+                run = ResearchRun(
+                    run_id=str(uuid.uuid4()),
+                    mode=mode,
+                    scope_key=scope_key,
+                    forums_json=[{"fid": fid, "fname": fname} for fid, fname in normalized_forums],
+                    status="running",
+                    started_at=now,
+                    last_checked=now,
+                )
+                session.add(run)
+            await session.commit()
+            return run.run_id
+
+    async def set_research_run_status(self, run_id: str, status: str, reason: str | None = None) -> None:
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(select(ResearchRun).where(ResearchRun.run_id == run_id))
+            run = result.scalar_one_or_none()
+            if run is None:
+                raise ValueError(f"Research run {run_id} does not exist.")
+            run.status = status
+            run.reason = reason
+            run.last_checked = datetime.now(UTC)
+            await session.commit()
+
+    async def resume_research_run_if_status(self, run_id: str, expected_status: str) -> bool:
+        """Change a paused run to running only if no other pause superseded it."""
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(
+                update(ResearchRun)
+                .where(ResearchRun.run_id == run_id, ResearchRun.status == expected_status)
+                .values(status="running", reason=None, last_checked=datetime.now(UTC))
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    async def set_research_run_status_if(
+        self,
+        run_id: str,
+        expected_statuses: set[str],
+        status: str,
+        reason: str | None = None,
+    ) -> bool:
+        """Compare-and-set run state without overwriting a stronger pause."""
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(
+                update(ResearchRun)
+                .where(ResearchRun.run_id == run_id, ResearchRun.status.in_(expected_statuses))
+                .values(status=status, reason=reason, last_checked=datetime.now(UTC))
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    async def reconcile_research_run_status_after_drain(self, run_id: str) -> str:
+        """Reconcile scheduler status with the latest page state for every scope."""
+        protected_statuses = {"paused_auth", "paused_rate_limit", "blocked", "paused_limit", "interrupted"}
+        checkpoint = ResearchCheckpoint
+        latest_pages = (
+            select(
+                checkpoint.task_key.label("task_key"),
+                func.max(checkpoint.page_number).label("page_number"),
+            )
+            .where(checkpoint.run_id == run_id)
+            .group_by(checkpoint.task_key)
+            .subquery()
+        )
+        is_blocked_network = and_(checkpoint.status == "blocked", checkpoint.error_code == 220034)
+        is_auth_paused = or_(checkpoint.status == "paused_auth", checkpoint.scope_status == "paused_auth")
+        is_rate_paused = or_(checkpoint.status == "paused_rate_limit", checkpoint.scope_status == "paused_rate_limit")
+        is_incomplete = or_(
+            checkpoint.status != "completed",
+            checkpoint.scope_status.is_(None),
+            checkpoint.scope_status != "completed",
+        )
+        async with self.async_sessionmaker() as session:
+            run = await session.get(ResearchRun, run_id)
+            if run is None:
+                raise ValueError(f"Research run {run_id} does not exist.")
+            if run.status in protected_statuses:
+                return run.status
+
+            list_counts_result = await session.execute(
+                select(
+                    func.coalesce(
+                        func.sum(case((is_blocked_network, 1), else_=0)),
+                        0,
+                    ).label("blocked_count"),
+                    func.coalesce(
+                        func.sum(case((is_auth_paused, 1), else_=0)),
+                        0,
+                    ).label("auth_count"),
+                    func.coalesce(
+                        func.sum(case((is_rate_paused, 1), else_=0)),
+                        0,
+                    ).label("rate_count"),
+                    func.coalesce(
+                        func.sum(case((is_incomplete, 1), else_=0)),
+                        0,
+                    ).label("incomplete_count"),
+                )
+                .select_from(checkpoint)
+                .join(
+                    latest_pages,
+                    and_(
+                        checkpoint.task_key == latest_pages.c.task_key,
+                        checkpoint.page_number == latest_pages.c.page_number,
+                    ),
+                )
+                .where(checkpoint.run_id == run_id, checkpoint.scope_type == "thread_list")
+            )
+            list_counts = list_counts_result.one()
+            scope_status_rows = await session.execute(
+                select(ResearchTaskScope.status).where(
+                    ResearchTaskScope.run_id == run_id,
+                    ResearchTaskScope.scope_type.in_(("thread_replies", "post_comments")),
+                )
+            )
+            scope_statuses = list(scope_status_rows.scalars())
+            if list_counts.blocked_count or "blocked" in scope_statuses:
+                status, reason = "blocked", "latest_checkpoint_reports_api_220034"
+            elif list_counts.auth_count or "paused_auth" in scope_statuses:
+                status, reason = "paused_auth", "latest_checkpoint_requires_authentication"
+            elif list_counts.rate_count or "paused_rate_limit" in scope_statuses:
+                status, reason = "paused_rate_limit", "latest_checkpoint_paused_for_rate_limit"
+            elif list_counts.incomplete_count or any(
+                scope_status != "completed" for scope_status in scope_statuses
+            ):
+                status, reason = "incomplete", "latest_checkpoint_not_terminal"
+            else:
+                status, reason = "completed", None
+
+            updated = await session.execute(
+                update(ResearchRun)
+                .where(
+                    ResearchRun.run_id == run_id,
+                    ResearchRun.status.in_({"running", "completed", "incomplete"}),
+                )
+                .values(status=status, reason=reason, last_checked=datetime.now(UTC))
+            )
+            await session.commit()
+            if updated.rowcount:
+                return status
+            latest_run = await session.get(ResearchRun, run_id)
+            if latest_run is None:
+                raise ValueError(f"Research run {run_id} does not exist.")
+            return latest_run.status
+
+    async def record_research_checkpoint(
+        self,
+        *,
+        run_id: str,
+        task_key: str,
+        page_number: int,
+        task_type: str,
+        scope_type: str,
+        status: str,
+        scope_status: str | None = None,
+        sort_mode: str | None = None,
+        fid: int | None = None,
+        fname: str | None = None,
+        tid: int | None = None,
+        parent_pid: int | None = None,
+        parent_kind: str | None = None,
+        is_good: bool | None = None,
+        attempts: int = 0,
+        has_more: bool | None = None,
+        next_page: int | None = None,
+        total_pages: int | None = None,
+        reported_count: int | None = None,
+        reported_count_missing_reason: str | None = None,
+        page_item_count: int | None = None,
+        continuation_json: dict[str, object] | None = None,
+        error_type: str | None = None,
+        error_code: int | None = None,
+        reason: str | None = None,
+        generation: int | None = None,
+        session: AsyncSession | None = None,
+    ) -> bool:
+        """Idempotently record one page state; all key columns are non-null."""
+        if page_number < 1:
+            raise ValueError("Checkpoint page_number must be positive.")
+        values = {
+            "task_type": task_type,
+            "scope_type": scope_type,
+            "sort_mode": sort_mode,
+            "fid": fid,
+            "fname": fname,
+            "tid": tid,
+            "parent_pid": parent_pid,
+            "parent_kind": parent_kind,
+            "is_good": is_good,
+            "status": status,
+            "scope_status": scope_status,
+            "attempts": attempts,
+            "has_more": has_more,
+            "next_page": next_page,
+            "total_pages": total_pages,
+            "reported_count": reported_count,
+            "reported_count_missing_reason": reported_count_missing_reason,
+            "page_item_count": page_item_count,
+            "continuation_json": continuation_json,
+            "error_type": error_type,
+            "error_code": error_code,
+            "reason": reason,
+            "last_checked": datetime.now(UTC),
+        }
+        if session is not None:
+            return await self._record_research_checkpoint_in_session(
+                session,
+                run_id=run_id,
+                task_key=task_key,
+                page_number=page_number,
+                values=values,
+                generation=generation,
+            )
+
+        async with self.async_sessionmaker() as owned_session, owned_session.begin():
+            return await self._record_research_checkpoint_in_session(
+                owned_session,
+                run_id=run_id,
+                task_key=task_key,
+                page_number=page_number,
+                values=values,
+                generation=generation,
+            )
+
+    async def _record_research_checkpoint_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: str,
+        task_key: str,
+        page_number: int,
+        values: dict[str, object],
+        generation: int | None,
+    ) -> bool:
+        if generation is not None:
+            logical_key = task_key.rsplit(":g", 1)[0] if ":g" in task_key else task_key
+            scope = await self.get_research_task_scope_for_update(session, run_id, logical_key)
+            if scope is None or scope.generation != generation:
+                return False
+
+        row = await session.get(ResearchCheckpoint, (run_id, task_key, page_number))
+        if row is None:
+            session.add(
+                ResearchCheckpoint(
+                    run_id=run_id,
+                    task_key=task_key,
+                    page_number=page_number,
+                    **values,
+                )
+            )
+        else:
+            for name, value in values.items():
+                setattr(row, name, value)
+        run = await session.get(ResearchRun, run_id)
+        if run is not None:
+            run.last_checked = datetime.now(UTC)
+        if generation is not None and scope is not None:
+            scope.status = values.get("scope_status") or values.get("status") or scope.status
+            scope.reason = values.get("reason")
+            scope.last_checked = datetime.now(UTC)
+        return True
+
+    async def get_research_task_scope_for_update(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        logical_task_key: str,
+    ) -> ResearchTaskScope | None:
+        result = await session.execute(
+            select(ResearchTaskScope)
+            .where(
+                ResearchTaskScope.run_id == run_id,
+                ResearchTaskScope.logical_task_key == logical_task_key,
+            )
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    async def get_research_task_scope_state(
+        self,
+        run_id: str,
+        logical_task_key: str,
+    ) -> tuple[int, str, int | None] | None:
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(
+                select(
+                    ResearchTaskScope.generation,
+                    ResearchTaskScope.status,
+                    ResearchTaskScope.parent_generation,
+                ).where(
+                    ResearchTaskScope.run_id == run_id,
+                    ResearchTaskScope.logical_task_key == logical_task_key,
+                )
+            )
+            row = result.one_or_none()
+        return None if row is None else (row.generation, row.status, row.parent_generation)
+
+    async def ensure_research_task_scope(
+        self,
+        *,
+        run_id: str,
+        logical_task_key: str,
+        task_type: str,
+        scope_type: str,
+        fid: int | None = None,
+        fname: str | None = None,
+        tid: int | None = None,
+        parent_pid: int | None = None,
+        parent_kind: str | None = None,
+        is_good: bool | None = None,
+        backfill: bool = True,
+        rn: int = 30,
+        parent_logical_task_key: str | None = None,
+        parent_generation: int | None = None,
+        refresh: bool = False,
+        session: AsyncSession | None = None,
+    ) -> ResearchTaskScope | None:
+        """Create or refresh a scope; an optional session keeps it in a caller transaction."""
+        if session is not None:
+            return await self._ensure_research_task_scope_in_session(
+                session,
+                run_id=run_id,
+                logical_task_key=logical_task_key,
+                task_type=task_type,
+                scope_type=scope_type,
+                fid=fid,
+                fname=fname,
+                tid=tid,
+                parent_pid=parent_pid,
+                parent_kind=parent_kind,
+                is_good=is_good,
+                backfill=backfill,
+                rn=rn,
+                parent_logical_task_key=parent_logical_task_key,
+                parent_generation=parent_generation,
+                refresh=refresh,
+            )
+        async with self.async_sessionmaker() as owned_session, owned_session.begin():
+            return await self._ensure_research_task_scope_in_session(
+                owned_session,
+                run_id=run_id,
+                logical_task_key=logical_task_key,
+                task_type=task_type,
+                scope_type=scope_type,
+                fid=fid,
+                fname=fname,
+                tid=tid,
+                parent_pid=parent_pid,
+                parent_kind=parent_kind,
+                is_good=is_good,
+                backfill=backfill,
+                rn=rn,
+                parent_logical_task_key=parent_logical_task_key,
+                parent_generation=parent_generation,
+                refresh=refresh,
+            )
+
+    async def _ensure_research_task_scope_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: str,
+        logical_task_key: str,
+        task_type: str,
+        scope_type: str,
+        fid: int | None,
+        fname: str | None,
+        tid: int | None,
+        parent_pid: int | None,
+        parent_kind: str | None,
+        is_good: bool | None,
+        backfill: bool,
+        rn: int,
+        parent_logical_task_key: str | None,
+        parent_generation: int | None,
+        refresh: bool,
+    ) -> ResearchTaskScope | None:
+        if parent_logical_task_key is not None:
+            parent = await self.get_research_task_scope_for_update(session, run_id, parent_logical_task_key)
+            if parent is None or parent.generation != parent_generation:
+                return None
+
+        scope = await self.get_research_task_scope_for_update(session, run_id, logical_task_key)
+        now = datetime.now(UTC)
+        if scope is None:
+            scope = ResearchTaskScope(
+                run_id=run_id,
+                logical_task_key=logical_task_key,
+                generation=0,
+                task_type=task_type,
+                scope_type=scope_type,
+                fid=fid,
+                fname=fname,
+                tid=tid,
+                parent_pid=parent_pid,
+                parent_kind=parent_kind,
+                is_good=is_good,
+                backfill=backfill,
+                rn=rn,
+                parent_logical_task_key=parent_logical_task_key,
+                parent_generation=parent_generation,
+                status="pending",
+                last_checked=now,
+            )
+            session.add(scope)
+            await session.flush()
+            return scope
+
+        if parent_logical_task_key is not None and scope.parent_generation not in (None, parent_generation):
+            return None
+        if refresh:
+            scope.generation += 1
+            scope.status = "pending"
+            scope.reason = None
+            if scope_type == "thread_replies":
+                await session.execute(
+                    update(ResearchTaskScope)
+                    .where(
+                        ResearchTaskScope.run_id == run_id,
+                        ResearchTaskScope.parent_logical_task_key == logical_task_key,
+                    )
+                    .values(
+                        generation=ResearchTaskScope.generation + 1,
+                        parent_generation=scope.generation,
+                        status="pending",
+                        reason=None,
+                        last_checked=now,
+                    )
+                )
+        if parent_logical_task_key is not None and scope.parent_generation is None:
+            scope.parent_generation = parent_generation
+        scope.task_type = task_type
+        scope.scope_type = scope_type
+        scope.fid = fid if fid is not None else scope.fid
+        scope.fname = fname if fname is not None else scope.fname
+        scope.tid = tid if tid is not None else scope.tid
+        scope.parent_pid = parent_pid if parent_pid is not None else scope.parent_pid
+        scope.parent_kind = parent_kind if parent_kind is not None else scope.parent_kind
+        scope.is_good = is_good if is_good is not None else scope.is_good
+        scope.backfill = backfill
+        scope.rn = rn
+        scope.parent_logical_task_key = parent_logical_task_key or scope.parent_logical_task_key
+        scope.last_checked = now
+        return scope
+
+    async def iter_pending_research_task_scopes(
+        self,
+        run_id: str,
+        responsible_fids: set[int],
+        *,
+        batch_size: int = 500,
+    ) -> AsyncIterator[list[ResearchTaskScope]]:
+        """Yield current non-completed detail scopes in bounded, comments-first batches."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if not responsible_fids:
+            return
+        for scope_type in ("post_comments", "thread_replies"):
+            last_key = ""
+            while True:
+                async with self.async_sessionmaker() as session:
+                    result = await session.execute(
+                        select(ResearchTaskScope)
+                        .where(
+                            ResearchTaskScope.run_id == run_id,
+                            ResearchTaskScope.scope_type == scope_type,
+                            ResearchTaskScope.status != "completed",
+                            ResearchTaskScope.fid.in_(responsible_fids),
+                            ResearchTaskScope.logical_task_key > last_key,
+                        )
+                        .order_by(ResearchTaskScope.logical_task_key)
+                        .limit(batch_size)
+                    )
+                    rows = list(result.scalars().all())
+                if not rows:
+                    break
+                last_key = rows[-1].logical_task_key
+                yield rows
+
+    async def adopt_legacy_research_scopes(self, run_id: str, responsible_fids: set[int]) -> None:
+        """Adopt old pending full scans as generation-zero authoritative scopes."""
+        if not responsible_fids:
+            return
+        last_tid = 0
+        while True:
+            async with self.async_sessionmaker() as session, session.begin():
+                thread_rows = await session.execute(
+                    select(PendingThreadScan)
+                    .where(PendingThreadScan.fid.in_(responsible_fids), PendingThreadScan.tid > last_tid)
+                    .order_by(PendingThreadScan.tid)
+                    .limit(500)
+                )
+                batch = list(thread_rows.scalars())
+                if not batch:
+                    break
+                last_tid = batch[-1].tid
+                for pending in batch:
+                    await self._ensure_research_task_scope_in_session(
+                        session,
+                        run_id=run_id,
+                        logical_task_key=research_posts_task_key(pending.tid),
+                        task_type="full_scan_posts",
+                        scope_type="thread_replies",
+                        fid=pending.fid,
+                        fname=pending.fname,
+                        tid=pending.tid,
+                        parent_pid=None,
+                        parent_kind=None,
+                        is_good=None,
+                        backfill=pending.backfill,
+                        rn=30,
+                        parent_logical_task_key=None,
+                        parent_generation=None,
+                        refresh=False,
+                    )
+
+        for scope_type in ("thread_replies", "post_comments"):
+            last_key = ""
+            while True:
+                async with self.async_sessionmaker() as session, session.begin():
+                    latest_pages = (
+                        select(
+                            ResearchCheckpoint.task_key.label("task_key"),
+                            func.max(ResearchCheckpoint.page_number).label("page_number"),
+                        )
+                        .where(
+                            ResearchCheckpoint.run_id == run_id,
+                            ResearchCheckpoint.scope_type == scope_type,
+                            ResearchCheckpoint.fid.in_(responsible_fids),
+                            ResearchCheckpoint.task_key.not_like("%:g%"),
+                        )
+                        .group_by(ResearchCheckpoint.task_key)
+                        .subquery()
+                    )
+                    result = await session.execute(
+                        select(ResearchCheckpoint)
+                        .join(
+                            latest_pages,
+                            and_(
+                                ResearchCheckpoint.task_key == latest_pages.c.task_key,
+                                ResearchCheckpoint.page_number == latest_pages.c.page_number,
+                            ),
+                        )
+                        .where(
+                            ResearchCheckpoint.run_id == run_id,
+                            ResearchCheckpoint.task_key > last_key,
+                        )
+                        .order_by(ResearchCheckpoint.task_key)
+                        .limit(500)
+                    )
+                    batch = list(result.scalars())
+                    if not batch:
+                        break
+                    last_key = batch[-1].task_key
+                    for checkpoint in batch:
+                        if checkpoint.tid is None:
+                            continue
+                        if scope_type == "thread_replies":
+                            logical_key = research_posts_task_key(checkpoint.tid)
+                            parent_key = None
+                            parent_generation = None
+                        else:
+                            if checkpoint.parent_pid is None:
+                                continue
+                            logical_key = research_comments_task_key(checkpoint.tid, checkpoint.parent_pid)
+                            parent_key = research_posts_task_key(checkpoint.tid)
+                            parent = await self.get_research_task_scope_for_update(session, run_id, parent_key)
+                            if parent is None:
+                                parent = await self._ensure_research_task_scope_in_session(
+                                    session,
+                                    run_id=run_id,
+                                    logical_task_key=parent_key,
+                                    task_type="full_scan_posts",
+                                    scope_type="thread_replies",
+                                    fid=checkpoint.fid,
+                                    fname=checkpoint.fname,
+                                    tid=checkpoint.tid,
+                                    parent_pid=None,
+                                    parent_kind=None,
+                                    is_good=None,
+                                    backfill=True,
+                                    rn=30,
+                                    parent_logical_task_key=None,
+                                    parent_generation=None,
+                                    refresh=False,
+                                )
+                                if parent is not None:
+                                    parent.status = "completed"
+                            parent_generation = parent.generation if parent is not None else None
+                        scope_was_missing = await session.get(ResearchTaskScope, (run_id, logical_key)) is None
+                        scope = await self._ensure_research_task_scope_in_session(
+                            session,
+                            run_id=run_id,
+                            logical_task_key=logical_key,
+                            task_type="full_scan_posts" if scope_type == "thread_replies" else "full_scan_comments",
+                            scope_type=scope_type,
+                            fid=checkpoint.fid,
+                            fname=checkpoint.fname,
+                            tid=checkpoint.tid,
+                            parent_pid=checkpoint.parent_pid,
+                            parent_kind=checkpoint.parent_kind,
+                            is_good=checkpoint.is_good,
+                            backfill=True,
+                            rn=30,
+                            parent_logical_task_key=parent_key,
+                            parent_generation=parent_generation,
+                            refresh=False,
+                        )
+                        if scope is not None and scope_was_missing:
+                            scope.status = checkpoint.scope_status or (
+                                "completed"
+                                if checkpoint.status == "completed" and checkpoint.has_more is False
+                                else "incomplete"
+                            )
+                            scope.reason = checkpoint.reason
+                            scope.last_checked = checkpoint.last_checked
+
+        last_pair = (0, 0)
+        while True:
+            async with self.async_sessionmaker() as session, session.begin():
+                comment_rows = await session.execute(
+                    select(PendingCommentScan)
+                    .where(
+                        PendingCommentScan.fid.in_(responsible_fids),
+                        PendingCommentScan.task_kind == "full",
+                        or_(
+                            PendingCommentScan.tid > last_pair[0],
+                            and_(PendingCommentScan.tid == last_pair[0], PendingCommentScan.pid > last_pair[1]),
+                        ),
+                    )
+                    .order_by(PendingCommentScan.tid, PendingCommentScan.pid)
+                    .limit(500)
+                )
+                batch = list(comment_rows.scalars())
+                if not batch:
+                    break
+                last_pair = (batch[-1].tid, batch[-1].pid)
+                for pending in batch:
+                    parent_key = research_posts_task_key(pending.tid)
+                    parent = await self.get_research_task_scope_for_update(session, run_id, parent_key)
+                    if parent is None:
+                        parent = await self._ensure_research_task_scope_in_session(
+                            session,
+                            run_id=run_id,
+                            logical_task_key=parent_key,
+                            task_type="full_scan_posts",
+                            scope_type="thread_replies",
+                            fid=pending.fid,
+                            fname=pending.fname,
+                            tid=pending.tid,
+                            parent_pid=None,
+                            parent_kind=None,
+                            is_good=None,
+                            backfill=pending.backfill,
+                            rn=30,
+                            parent_logical_task_key=None,
+                            parent_generation=None,
+                            refresh=False,
+                        )
+                        if parent is not None and not await session.scalar(
+                            select(PendingThreadScan.tid).where(PendingThreadScan.tid == pending.tid)
+                        ):
+                            parent.status = "completed"
+                    await self._ensure_research_task_scope_in_session(
+                        session,
+                        run_id=run_id,
+                        logical_task_key=research_comments_task_key(pending.tid, pending.pid),
+                        task_type="full_scan_comments",
+                        scope_type="post_comments",
+                        fid=pending.fid,
+                        fname=pending.fname,
+                        tid=pending.tid,
+                        parent_pid=pending.pid,
+                        parent_kind=None,
+                        is_good=None,
+                        backfill=pending.backfill,
+                        rn=30,
+                        parent_logical_task_key=parent_key if parent is not None else None,
+                        parent_generation=parent.generation if parent is not None else None,
+                        refresh=False,
+                    )
+
+    async def save_items_in_session(self, session: AsyncSession, items: list[Any], upsert: bool = False) -> None:
+        """Write base ORM items inside a caller-owned transaction."""
+        if not items:
+            return
+        items_as_dicts = [item.to_dict() for item in items]
+        model_class = type(items[0])
+        statement = insert(model_class).values(items_as_dicts)
+        if upsert:
+            primary_key = PRIMARY_KEY_MAP.get(model_class)
+            update_dict = {
+                col.name: statement.excluded[col.name]
+                for col in model_class.__table__.columns
+                if col.name not in primary_key
+            }
+            statement = statement.on_conflict_do_update(index_elements=list(primary_key), set_=update_dict)  # type: ignore[arg-type]
+        else:
+            statement = statement.on_conflict_do_nothing()
+        await session.execute(statement)
+
+    async def add_pending_comment_scan_in_session(
+        self,
+        session: AsyncSession,
+        tid: int,
+        pid: int,
+        *,
+        fid: int,
+        fname: str,
+        backfill: bool,
+        task_kind: PendingCommentTaskKind = "full",
+    ) -> None:
+        pending = PendingCommentScan(
+            tid=tid,
+            pid=pid,
+            fid=fid,
+            fname=fname,
+            backfill=backfill,
+            task_kind=task_kind,
+        )
+        statement = insert(PendingCommentScan).values(pending.to_dict())
+        task_kind_expr = case(
+            (PendingCommentScan.task_kind == "full", "full"),
+            (statement.excluded.task_kind == "full", "full"),
+            else_="incremental",
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=[PendingCommentScan.tid, PendingCommentScan.pid],
+            set_={
+                "task_kind": task_kind_expr,
+                "backfill": statement.excluded.backfill,
+                "fid": statement.excluded.fid,
+                "fname": statement.excluded.fname,
+            },
+        )
+        await session.execute(statement)
+
+    async def remove_pending_comment_scan_in_session(
+        self,
+        session: AsyncSession,
+        tid: int,
+        pid: int,
+        *,
+        task_kind: PendingCommentTaskKind | None = None,
+    ) -> None:
+        statement = delete(PendingCommentScan).where(
+            PendingCommentScan.tid == tid,
+            PendingCommentScan.pid == pid,
+        )
+        if task_kind is not None:
+            statement = statement.where(PendingCommentScan.task_kind == task_kind)
+        await session.execute(statement)
+
+    async def remove_pending_thread_scan_in_session(self, session: AsyncSession, tid: int) -> None:
+        await session.execute(delete(PendingThreadScan).where(PendingThreadScan.tid == tid))
+
+    async def mark_research_checkpoint_scope_status(
+        self, run_id: str, task_key: str, page_number: int, scope_status: str
+    ) -> None:
+        async with self.async_sessionmaker() as session:
+            row = await session.get(ResearchCheckpoint, (run_id, task_key, page_number))
+            if row is None:
+                raise ValueError("Cannot mark a scope without its committed page checkpoint.")
+            row.scope_status = scope_status
+            row.last_checked = datetime.now(UTC)
+            await session.commit()
+
+    async def get_research_list_checkpoint_states(
+        self, run_id: str
+    ) -> dict[tuple[int, bool], tuple[int | None, str | None, dict[str, object] | None]]:
+        """Return the resume page, status, and bounded cursor for each list stream.
+
+        A successful non-terminal page is replayed once after restart to absorb
+        page drift caused by deletions or updates at the top of the list.
+        """
+        latest: dict[str, ResearchCheckpoint] = {}
+        async with self.async_sessionmaker() as session:
+            result = await session.stream(
+                select(ResearchCheckpoint)
+                .where(
+                    ResearchCheckpoint.run_id == run_id,
+                    ResearchCheckpoint.scope_type == "thread_list",
+                )
+                .order_by(ResearchCheckpoint.task_key, ResearchCheckpoint.page_number)
+            )
+            async for row in result.scalars():
+                latest[row.task_key] = row
+
+        states: dict[tuple[int, bool], tuple[int | None, str | None, dict[str, object] | None]] = {}
+        for row in latest.values():
+            if row.fid is None or row.is_good is None:
+                continue
+            if row.status == "completed" and row.has_more is False:
+                next_page = None
+                scope_status = row.scope_status or "completed"
+                cursor = row.continuation_json
+            elif row.status == "completed":
+                next_page = row.page_number if row.has_more is True else row.next_page or row.page_number + 1
+                scope_status = row.scope_status or "running"
+                cursor = {} if row.has_more is True else row.continuation_json
+            else:
+                next_page = row.page_number
+                scope_status = row.scope_status or row.status
+                cursor = row.continuation_json
+            states[(row.fid, row.is_good)] = (next_page, scope_status, cursor)
+        return states
+
+    async def get_research_resume_state(
+        self, run_id: str, task_key: str
+    ) -> tuple[int | None, str | None, dict[str, object] | None]:
+        """Return a detail scope's next page, status, and bounded cursor."""
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(
+                select(ResearchCheckpoint)
+                .where(
+                    ResearchCheckpoint.run_id == run_id,
+                    ResearchCheckpoint.task_key == task_key,
+                )
+                .order_by(ResearchCheckpoint.page_number.desc())
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+        if row is None:
+            return 1, None, None
+        if row.status == "completed" and row.has_more is False:
+            return None, row.scope_status or "completed", row.continuation_json
+        if row.status == "completed":
+            return row.next_page or row.page_number + 1, row.scope_status or "running", row.continuation_json
+        return row.page_number, row.scope_status or row.status, row.continuation_json
+
+    async def get_research_resume_page(self, run_id: str, task_key: str) -> tuple[int | None, str | None]:
+        """Compatibility wrapper returning the detail scope's next page and status."""
+        page, status, _ = await self.get_research_resume_state(run_id, task_key)
+        return page, status
+
+    async def get_research_first_post_pids(self, tid: int, *, session: AsyncSession | None = None) -> set[int]:
+        """Return known first-post IDs for a thread from research detail rows."""
+        from src.research.models import ResearchThread
+
+        statement = select(ResearchThread.first_pid).where(
+            ResearchThread.tid == tid,
+            ResearchThread.first_pid.is_not(None),
+        )
+        if session is not None:
+            result = await session.execute(statement)
+            return {int(pid) for pid in result.scalars().all()}
+
+        async with self.get_session() as owned_session:
+            result = await owned_session.execute(statement)
+            return {int(pid) for pid in result.scalars().all()}
+
+    async def iter_pending_thread_scans(
+        self,
+        responsible_fids: set[int],
+        *,
+        batch_size: int = 500,
+    ) -> AsyncIterator[list[PendingThreadScan]]:
+        """Yield pending thread scans in keyset-paginated bounded batches."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if not responsible_fids:
+            return
+        last_tid = 0
+        while True:
+            async with self.async_sessionmaker() as session:
+                result = await session.execute(
+                    select(PendingThreadScan)
+                    .where(PendingThreadScan.fid.in_(responsible_fids), PendingThreadScan.tid > last_tid)
+                    .order_by(PendingThreadScan.tid)
+                    .limit(batch_size)
+                )
+                rows = list(result.scalars().all())
+            if not rows:
+                return
+            last_tid = rows[-1].tid
+            yield rows
+
+    async def iter_pending_comment_scans(
+        self,
+        responsible_fids: set[int],
+        *,
+        batch_size: int = 500,
+    ) -> AsyncIterator[list[PendingCommentScan]]:
+        """Yield pending comment scans in keyset-paginated bounded batches."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if not responsible_fids:
+            return
+        last_tid = 0
+        last_pid = 0
+        while True:
+            async with self.async_sessionmaker() as session:
+                result = await session.execute(
+                    select(PendingCommentScan)
+                    .where(
+                        PendingCommentScan.fid.in_(responsible_fids),
+                        or_(
+                            PendingCommentScan.tid > last_tid,
+                            and_(PendingCommentScan.tid == last_tid, PendingCommentScan.pid > last_pid),
+                        ),
+                    )
+                    .order_by(PendingCommentScan.tid, PendingCommentScan.pid)
+                    .limit(batch_size)
+                )
+                rows = list(result.scalars().all())
+            if not rows:
+                return
+            last_tid, last_pid = rows[-1].tid, rows[-1].pid
+            yield rows
+
+    def get_crawl_quality_summaries(
+        self, run_id: str | None = None
+    ) -> AsyncIterator[dict[str, object]]:
+        """Stream summaries from this store's session factory."""
+        return iter_crawl_quality_summaries(self.async_sessionmaker, run_id)
+
+    @staticmethod
+    async def _iter_crawl_quality_summaries(
+        async_sessionmaker_: async_sessionmaker,
+        run_id: str | None = None,
+    ) -> AsyncIterator[dict[str, object]]:
+        """Stream one SQL-aggregated quality summary per current task generation."""
+        from src.research.models import ResearchComment, ResearchPost, ResearchThread
+
+        scope = ResearchTaskScope
+        checkpoint = ResearchCheckpoint
+        task_key = case(
+            (scope.generation == 0, scope.logical_task_key),
+            else_=scope.logical_task_key + literal(":g") + cast(scope.generation, String),
+        )
+        current_checkpoint = aliased(ResearchCheckpoint)
+        latest_reason = (
+            select(func.coalesce(current_checkpoint.reason, current_checkpoint.reported_count_missing_reason))
+            .where(
+                current_checkpoint.run_id == scope.run_id,
+                current_checkpoint.task_key == task_key,
+            )
+            .order_by(current_checkpoint.page_number.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        first_post_payload = (
+            select(ResearchThread.source_payload_json["first_post"])
+            .where(ResearchThread.tid == scope.tid, ResearchThread.first_pid == scope.parent_pid)
+            .limit(1)
+            .scalar_subquery()
+        )
+        first_post_payload_count = cast(first_post_payload["subreply_count_reported"].as_integer(), BigInteger)
+        first_post_payload_reason = first_post_payload["missing_reason"].as_string()
+        latest_completed_checkpoint = aliased(ResearchCheckpoint)
+        latest_completed_checkpoint_reported = (
+            select(latest_completed_checkpoint.reported_count)
+            .where(
+                latest_completed_checkpoint.run_id == scope.run_id,
+                latest_completed_checkpoint.task_key == task_key,
+                latest_completed_checkpoint.status == "completed",
+            )
+            .order_by(latest_completed_checkpoint.page_number.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        first_post_checkpoint_missing = (
+            select(latest_completed_checkpoint.reported_count_missing_reason)
+            .where(
+                latest_completed_checkpoint.run_id == scope.run_id,
+                latest_completed_checkpoint.task_key == task_key,
+                latest_completed_checkpoint.status == "completed",
+            )
+            .order_by(latest_completed_checkpoint.page_number.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        trusted_checkpoint_count = case(
+            (first_post_checkpoint_missing.is_(None), latest_completed_checkpoint_reported),
+            else_=None,
+        )
+        first_post_count = func.coalesce(trusted_checkpoint_count, first_post_payload_count)
+        first_post_missing_reason = func.coalesce(
+            first_post_checkpoint_missing,
+            first_post_payload_reason,
+            "first_post_reply_count_unavailable",
+        )
+        first_post_exists = (
+            select(ResearchThread.tid)
+            .where(ResearchThread.tid == scope.tid, ResearchThread.first_pid == scope.parent_pid)
+            .limit(1)
+            .scalar_subquery()
+        )
+        is_first_post = or_(scope.parent_kind == "first_post", first_post_exists.is_not(None))
+        reported_posts = (
+            select(ResearchThread.reply_count)
+            .where(ResearchThread.tid == scope.tid)
+            .limit(1)
+            .scalar_subquery()
+        )
+        parent_reported_reply_comments = (
+            select(ResearchPost.subreply_count_reported)
+            .where(ResearchPost.pid == scope.parent_pid, ResearchPost.tid == scope.tid)
+            .limit(1)
+            .scalar_subquery()
+        )
+        reported_reply_comments = func.coalesce(trusted_checkpoint_count, parent_reported_reply_comments)
+        reported = case(
+            (scope.scope_type == "thread_replies", reported_posts),
+            (is_first_post, first_post_count),
+            else_=reported_reply_comments,
+        )
+        reason = case(
+            (
+                and_(scope.scope_type == "post_comments", is_first_post, first_post_count.is_(None)),
+                first_post_missing_reason,
+            ),
+            (scope.scope_type == "post_comments", latest_reason),
+            else_=latest_reason,
+        )
+        unique_posts = select(func.count(ResearchPost.pid)).where(ResearchPost.tid == scope.tid).scalar_subquery()
+        unique_comments = (
+            select(func.count(ResearchComment.cid))
+            .where(
+                ResearchComment.tid == scope.tid,
+                ResearchComment.parent_post_pid == scope.parent_pid,
+            )
+            .scalar_subquery()
+        )
+        saved = case((scope.scope_type == "thread_replies", unique_posts), else_=unique_comments)
+        mismatch = case((reported.is_(None), None), else_=(saved != reported))
+        successful_pages = func.sum(case((checkpoint.status == "completed", 1), else_=0))
+        failure_pages = func.sum(
+            case((checkpoint.status.in_(("failed", "blocked", "paused_auth", "paused_rate_limit")), 1), else_=0)
+        )
+        parent_kind = case((is_first_post, "first_post"), else_=scope.parent_kind)
+        statement = (
+            select(
+                scope.run_id.label("run_id"),
+                scope.generation.label("generation"),
+                scope.scope_type.label("scope_type"),
+                scope.fid.label("fid"),
+                scope.tid.label("tid"),
+                scope.parent_pid.label("parent_pid"),
+                parent_kind.label("parent_kind"),
+                reported.label("reported_reply_num"),
+                saved.label("unique_saved_replies"),
+                func.coalesce(func.max(checkpoint.total_pages), func.count(checkpoint.page_number)).label(
+                    "total_pages"
+                ),
+                successful_pages.label("success_pages"),
+                failure_pages.label("failure_pages"),
+                scope.status.label("status"),
+                func.coalesce(func.max(checkpoint.last_checked), scope.last_checked).label("last_checked"),
+                mismatch.label("count_mismatch"),
+                func.coalesce(scope.reason, reason).label("reason"),
+            )
+            .select_from(scope)
+            .outerjoin(
+                checkpoint,
+                and_(checkpoint.run_id == scope.run_id, checkpoint.task_key == task_key),
+            )
+            .where(scope.scope_type.in_(("thread_replies", "post_comments")))
+            .group_by(
+                scope.run_id,
+                scope.logical_task_key,
+                scope.generation,
+                scope.scope_type,
+                scope.fid,
+                scope.tid,
+                scope.parent_pid,
+                scope.parent_kind,
+                scope.status,
+                scope.reason,
+                scope.last_checked,
+            )
+            .order_by(scope.run_id, scope.scope_type, scope.fid, scope.tid, scope.parent_pid)
+        )
+        if run_id is not None:
+            statement = statement.where(scope.run_id == run_id)
+
+        async with async_sessionmaker_() as session:
+            result = await session.stream(statement)
+            async for row in result.mappings():
+                yield dict(row)  # noqa: ASYNC119 - keep the session open while the caller consumes the stream.
 
     @asynccontextmanager
     async def get_session(self):
@@ -311,6 +1500,23 @@ class DataStore:
             result = await session.execute(statement)
             return list(result.scalars().all())
 
+    async def needs_research_thread_detail(self, tids: list[int] | set[int]) -> set[int]:
+        """Return tids without an authoritative first-post content observation."""
+        if not tids:
+            return set()
+        from src.research.models import ResearchContentObservation
+
+        requested = set(tids)
+        async with self.get_session() as session:
+            result = await session.execute(
+                select(ResearchContentObservation.owner_id).where(
+                    ResearchContentObservation.owner_type == "thread_first_post",
+                    ResearchContentObservation.owner_id.in_(requested),
+                )
+            )
+            complete = set(result.scalars().all())
+        return requested - complete
+
     async def get_posts_by_pids(self, pids: list[int] | set[int]) -> list[Post]:
         """根据一组pid从数据库获取回复信息。
 
@@ -352,7 +1558,10 @@ class DataStore:
         backfill: bool = False,
         *,
         upsert_threads: bool = False,
-    ) -> None:
+        force_pending_scan: bool = False,
+        research_run_id: str | None = None,
+        refresh_research_run_id: str | None = None,
+    ) -> dict[int, int]:
         """原子保存 thread 元数据与 pending_scan 标记。
 
         Args:
@@ -362,15 +1571,41 @@ class DataStore:
                 仅在需要强制刷新 thread 元数据（如 force 全量扫描）时启用。
         """
         if not thread_dtos:
-            return
+            return {}
         thread_models = [Thread.from_dto(dto) for dto in thread_dtos]
         pending_scans = [
             PendingThreadScan(tid=dto.tid, fid=dto.fid, fname=dto.fname, backfill=backfill)
             for dto in thread_dtos
-            if dto.reply_num > 0 or backfill
+            if dto.reply_num > 0 or backfill or force_pending_scan
         ]
 
+        generations: dict[int, int] = {}
         async with self.get_session() as session:
+            for dto in thread_dtos:
+                scope_run_id = refresh_research_run_id or research_run_id
+                if scope_run_id is None:
+                    continue
+                scope = await self._ensure_research_task_scope_in_session(
+                    session,
+                    run_id=scope_run_id,
+                    logical_task_key=research_posts_task_key(dto.tid),
+                    task_type="full_scan_posts",
+                    scope_type="thread_replies",
+                    fid=dto.fid,
+                    fname=dto.fname,
+                    tid=dto.tid,
+                    parent_pid=None,
+                    parent_kind=None,
+                    is_good=None,
+                    backfill=backfill,
+                    rn=30,
+                    parent_logical_task_key=None,
+                    parent_generation=None,
+                    refresh=refresh_research_run_id is not None,
+                )
+                if scope is not None:
+                    generations[dto.tid] = scope.generation
+
             if thread_models:
                 thread_values = [item.to_dict() for item in thread_models]
                 thread_stmt = insert(Thread).values(thread_values)
@@ -393,15 +1628,27 @@ class DataStore:
                 pending_values = [item.to_dict() for item in pending_scans]
                 pending_stmt = insert(PendingThreadScan).values(pending_values).on_conflict_do_nothing()
                 await session.execute(pending_stmt)
-
             await session.commit()
 
-    async def remove_pending_thread_scan(self, tid: int) -> None:
+        return generations
+
+    async def remove_pending_thread_scan(
+        self,
+        tid: int,
+        *,
+        run_id: str | None = None,
+        generation: int | None = None,
+    ) -> bool:
         """移除一条待扫描的主题贴记录。"""
         async with self.get_session() as session:
+            if run_id is not None and generation is not None:
+                scope = await self.get_research_task_scope_for_update(session, run_id, research_posts_task_key(tid))
+                if scope is None or scope.generation != generation:
+                    return False
             stmt = delete(PendingThreadScan).where(PendingThreadScan.tid == tid)
             await session.execute(stmt)
             await session.commit()
+            return True
 
     async def get_all_pending_thread_scans(self) -> list[PendingThreadScan]:
         """获取所有待扫描的主题贴记录（用于重启恢复）。"""
@@ -428,6 +1675,7 @@ class DataStore:
         fname: str | None = None,
         backfill: bool,
         task_kind: PendingCommentTaskKind,
+        refresh_research_run_id: str | None = None,
     ) -> None:
         """添加一条楼中楼待扫描记录。"""
         async with self.get_session() as session:
@@ -467,14 +1715,23 @@ class DataStore:
         pid: int,
         *,
         task_kind: PendingCommentTaskKind | None = None,
-    ) -> None:
+        run_id: str | None = None,
+        generation: int | None = None,
+    ) -> bool:
         """移除一条楼中楼待扫描记录。"""
         async with self.get_session() as session:
+            if run_id is not None and generation is not None:
+                scope = await self.get_research_task_scope_for_update(
+                    session, run_id, f"post_comments:{tid}:{pid}"
+                )
+                if scope is None or scope.generation != generation:
+                    return False
             stmt = delete(PendingCommentScan).where((PendingCommentScan.tid == tid) & (PendingCommentScan.pid == pid))
             if task_kind is not None:
                 stmt = stmt.where(PendingCommentScan.task_kind == task_kind)
             await session.execute(stmt)
             await session.commit()
+            return True
 
     async def get_all_pending_comment_scans(self) -> list[PendingCommentScan]:
         """获取所有楼中楼待扫描记录（用于重启恢复）。"""

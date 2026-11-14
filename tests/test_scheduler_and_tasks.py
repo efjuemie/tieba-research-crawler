@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -172,6 +173,9 @@ async def _consume_backfill_pages(scheduler: Scheduler, on_page):
 
 
 def _synthetic_page(content: ScanThreadsTask, *, tids: tuple[int, ...], times: tuple[int, ...], has_more: bool):
+    continuation = {}
+    if times:
+        continuation["last_create_time"] = datetime.fromtimestamp(times[-1]).isoformat()
     return ThreadPageResult(
         has_more=has_more,
         current_page=content.pn,
@@ -179,12 +183,13 @@ def _synthetic_page(content: ScanThreadsTask, *, tids: tuple[int, ...], times: t
         total_count=len(tids),
         tids=tids,
         non_top_create_times=tuple(datetime.fromtimestamp(value) for value in times),
+        continuation_json=continuation,
     )
 
 
 @pytest.mark.asyncio
-async def test_scheduler_round_robins_both_streams_and_starts_hybrid_at_page_two():
-    """unlimited mode runs finite normal/good pages in a fair, bounded sequence."""
+async def test_scheduler_round_robins_both_streams_from_create_page_one_in_hybrid():
+    """Hybrid mode still starts both CREATE streams at page one."""
     router = QueueRouter(maxsize=1)
     container = DummyContainer(config=DummyConfig(mode="hybrid", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
     scheduler = Scheduler(router, container)  # type: ignore[arg-type]
@@ -196,7 +201,7 @@ async def test_scheduler_round_robins_both_streams_and_starts_hybrid_at_page_two
             content,
             tids=(content.pn + int(content.is_good) * 10,),
             times=(100 - content.pn * 10,),
-            has_more=content.pn == 2,
+            has_more=content.pn == 1,
         )
         assert content.max_pages == 0
         assert content.completion is not None
@@ -204,7 +209,7 @@ async def test_scheduler_round_robins_both_streams_and_starts_hybrid_at_page_two
 
     await _consume_backfill_pages(scheduler, acknowledge)
 
-    assert requested == [(False, 2), (True, 2), (False, 3), (True, 3)]
+    assert requested == [(False, 1), (True, 1), (False, 2), (True, 2)]
 
 
 @pytest.mark.asyncio
@@ -226,6 +231,84 @@ async def test_scheduler_stream_failure_does_not_skip_good_stream():
         await _consume_backfill_pages(scheduler, acknowledge)
 
     assert requested == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_preserves_rate_limit_pause_when_stream_fails():
+    class RateLimitedError(Exception):
+        code = 429
+
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(config=DummyConfig(mode="backfill", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
+    container.research_run_id = "synthetic-run"
+    run_status = {"value": "running"}
+    recorded = []
+    requested = []
+
+    async def set_status_if(_run_id, expected_statuses, status, _reason=None):
+        if run_status["value"] not in expected_statuses:
+            return False
+        run_status["value"] = status
+        return True
+
+    async def scan_page(_forum, pn, _max_pages, is_good, _continuation=None):
+        requested.append(is_good)
+        if not is_good:
+            run_status["value"] = "paused_rate_limit"
+            raise RateLimitedError("synthetic 429")
+        return ThreadPageResult(
+            has_more=False,
+            current_page=pn,
+            total_pages=pn,
+            total_count=0,
+            tids=(),
+            non_top_create_times=(),
+        )
+
+    datastore = SimpleNamespace(
+        get_research_list_checkpoint_states=AsyncMock(return_value={}),
+        record_research_checkpoint=AsyncMock(side_effect=lambda **kwargs: recorded.append(kwargs)),
+        set_research_run_status_if=AsyncMock(side_effect=set_status_if),
+    )
+    scheduler = Scheduler(router, container, cast("Any", datastore))  # type: ignore[arg-type]
+    scheduler._scan_backfill_page = scan_page  # type: ignore[method-assign]
+
+    with pytest.raises(BackfillIncompleteError):
+        await scheduler._run_backfill()
+
+    assert recorded[0]["status"] == "paused_rate_limit"
+    assert recorded[0]["scope_status"] == "paused_rate_limit"
+    assert run_status["value"] == "paused_rate_limit"
+    assert requested == [False]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_leaves_run_resumable_after_list_pages_before_detail_drain():
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(config=DummyConfig(mode="backfill", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
+    container.research_run_id = "synthetic-run"
+    set_status = AsyncMock(return_value=True)
+    datastore = SimpleNamespace(
+        get_research_list_checkpoint_states=AsyncMock(return_value={}),
+        set_research_run_status_if=set_status,
+    )
+    scheduler = Scheduler(router, container, cast("Any", datastore))  # type: ignore[arg-type]
+
+    async def terminal_list_page(_forum, pn, _max_pages, _is_good, _continuation=None):
+        return ThreadPageResult(
+            has_more=False,
+            current_page=pn,
+            total_pages=pn,
+            total_count=0,
+            tids=(),
+            non_top_create_times=(),
+        )
+
+    scheduler._scan_backfill_page = terminal_list_page  # type: ignore[method-assign]
+
+    await scheduler._run_backfill()
+
+    set_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -5,9 +5,9 @@ from datetime import datetime
 from typing import Any, cast
 
 import pytest
+from conftest import make_thread
 from sqlalchemy.dialects import postgresql
 from tiebameow.models.dto import BaseThreadDTO, ThreadDTO, ThreadUserDTO
-from conftest import make_thread
 
 from src.core.config import ConsumerConfig
 from src.core.datastore import DataStore

@@ -112,6 +112,7 @@ class RateLimitConfig(BaseModel):
     concurrency: int = Field(default=10, gt=0)
     cooldown_seconds_429: float = Field(default=5.0, gt=0)
 
+    global_rps: float = Field(default=0.2, gt=0)
     threads_rps: float = Field(default=2.0, gt=0)
     posts_rps: float = Field(default=2.0, gt=0)
     comments_rps: float = Field(default=5.0, gt=0)
@@ -174,6 +175,7 @@ class SchedulerConfig(BaseModel):
     good_page_every_n_ticks: int = Field(default=10, gt=0)
     queue_depth_threshold: int = Field(default=0, ge=0)
     skip_wait_seconds: int = Field(default=5, gt=0)
+    queue_maxsize: int = Field(default=1000, gt=0)
 
 
 class DeepScanConfig(BaseModel):
@@ -192,6 +194,16 @@ class WorkerConfig(BaseModel):
     threads: int = Field(default=1, gt=0)
     posts: int = Field(default=2, gt=0)
     comments: int = Field(default=2, gt=0)
+
+
+class ResearchConfig(BaseModel):
+    """Research capture and explicitly optional account enrichment settings."""
+
+    enabled: bool = True
+    account_file: str = "secrets/baidu-account.json"
+    fetch_user_forum_info: bool = False
+    max_api_retries: int = Field(default=3, ge=1)
+    retry_wait_seconds: float = Field(default=0.5, ge=0)
 
 
 class PydanticConfig(BaseSettings):
@@ -216,6 +228,7 @@ class PydanticConfig(BaseSettings):
     )
     deep_scan: DeepScanConfig = Field(default_factory=lambda: DeepScanConfig(enabled=False, depth=3))
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
+    research: ResearchConfig = Field(default_factory=ResearchConfig)
     websocket: WebSocketConfig = Field(default_factory=lambda: WebSocketConfig(host="localhost", port=8000))
     consumer: ConsumerConfig = Field(
         default_factory=lambda: ConsumerConfig(transport="none", max_len=10000, stream_prefix="scraper:tieba:events")
@@ -399,6 +412,26 @@ class Config:
         return self.pydantic_config.tieba.backfill_force_scan
 
     @property
+    def research_enabled(self) -> bool:
+        return self.pydantic_config.research.enabled
+
+    @property
+    def research_account_file(self) -> str:
+        return self.pydantic_config.research.account_file
+
+    @property
+    def fetch_user_forum_info(self) -> bool:
+        return self.pydantic_config.research.fetch_user_forum_info
+
+    @property
+    def research_max_api_retries(self) -> int:
+        return self.pydantic_config.research.max_api_retries
+
+    @property
+    def research_retry_wait_seconds(self) -> float:
+        return self.pydantic_config.research.retry_wait_seconds
+
+    @property
     def concurrency_limit(self) -> int:
         """获取并发限制。"""
         return self.pydantic_config.rate_limit.concurrency
@@ -407,6 +440,11 @@ class Config:
     def cooldown_seconds_429(self) -> float:
         """获取429响应后的冷却时间（秒）。"""
         return self.pydantic_config.rate_limit.cooldown_seconds_429
+
+    @property
+    def global_rps(self) -> float:
+        """获取所有研究API请求共享的全局速率限制。"""
+        return self.pydantic_config.rate_limit.global_rps
 
     @property
     def threads_rps(self) -> float:
@@ -457,6 +495,10 @@ class Config:
     def skip_wait_seconds(self) -> int:
         """获取跳过调度后的等待时间（秒）。"""
         return self.pydantic_config.scheduler.skip_wait_seconds
+
+    @property
+    def queue_maxsize(self) -> int:
+        return self.pydantic_config.scheduler.queue_maxsize
 
     @property
     def deep_scan_enabled(self) -> bool:

@@ -218,6 +218,8 @@ data/
 test-data/
 exports/
 logs/
+*.zip
+screenshots/
 secrets/
 references/
 *.csv
@@ -235,6 +237,8 @@ references/
 *token*
 *bduss*
 *stoken*
+.vscode/
+.idea/
 
 # Local credentials
 .env

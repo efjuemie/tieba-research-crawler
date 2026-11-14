@@ -14,7 +14,13 @@ from tiebameow.utils.logger import logger
 
 from .config import Config
 from .container import Container
-from .models import PendingCommentScan, PendingThreadScan  # noqa: F401  确保 pending 表被 create_all 发现
+from .models import (  # noqa: F401  确保本地表被 create_all 发现
+    PendingCommentScan,
+    PendingThreadScan,
+    ResearchCheckpoint,
+    ResearchRun,
+    ResearchTaskScope,
+)
 
 if TYPE_CHECKING:
     from ..scraper.router import QueueRouter
@@ -45,13 +51,18 @@ async def initialize_application(
     app_config = Config(mode=mode)
 
     container = Container(config=app_config)
-    await container.setup()
+    try:
+        await container.setup()
+        await create_tables(container)
+        await initialize_forums(container)
+    except BaseException:
+        try:
+            await container.teardown()
+        except BaseException:
+            logger.exception("Failed to tear down container after initialization failure.")
+        raise
 
-    await create_tables(container)
-
-    await initialize_forums(container)
-
-    router = QueueRouter(maxsize=0)
+    router = QueueRouter(maxsize=app_config.queue_maxsize)
 
     logger.info("Application initialized successfully.")
     return container, router
@@ -108,6 +119,8 @@ async def initialize_forums(container: Container) -> None:
     logger.info("Initializing forum list...")
     if not container.tb_client or not container.async_sessionmaker:
         raise RuntimeError("Container is not set up properly.")
+    if container.config.research_enabled and not container.config.forums:
+        raise RuntimeError("Research mode requires at least one configured forum.")
 
     forum_list: list[Forum] = []
     try:
@@ -118,11 +131,15 @@ async def initialize_forums(container: Container) -> None:
 
                 for forum_name in container.config.forums:
                     if forum := next((f for f in existing_forums if f.fname == forum_name), None):
+                        if container.config.research_enabled and forum.fid <= 0:
+                            raise RuntimeError(f"Configured forum [{forum_name}吧] has invalid fid metadata.")
                         forum_list.append(forum)
                         continue
 
                     fid = await container.tb_client.get_fid(forum_name)
                     if not fid:
+                        if container.config.research_enabled:
+                            raise RuntimeError(f"Could not resolve fid for configured forum [{forum_name}吧].")
                         logger.warning("Forum [{}吧] not found, skipping.", forum_name)
                         continue
                     new_forum = Forum(fid=fid, fname=forum_name)

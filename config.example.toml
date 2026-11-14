@@ -108,6 +108,8 @@ port = 8001
 concurrency = 10
 # 遇 HTTP 429 后的全局冷却时间（秒）
 cooldown_seconds_429 = 5.0
+# 所有 aiotieba HTTP 请求共享的全局上限；研究Client内部每个HTTP请求都会消耗一次
+global_rps = 0.2
 # 分接口 RPS 配置
 # 贴吧服务端对各接口独立限流，使用令牌桶算法
 # threads/posts 接口令牌桶容量≈60, 恢复速率≈2.0/s
@@ -134,8 +136,7 @@ url = "socks5://127.0.0.1:1080"
 username = ""
 # 代理认证密码（可留空）
 password = ""
-# 多代理轮换：配置多个代理 URL 可线性提升吞吐量
-# 由于贴吧限流是基于 IP 的，N 个代理 = N 倍吞吐量
+# 多代理轮换仅用于网络路由；所有代理共用 global_rps 请求预算，不能用于绕过服务限流。
 # 配置此项后将忽略上面的 url 配置
 # urls = [
 #     "socks5://proxy1:1080",
@@ -155,6 +156,7 @@ good_page_every_n_ticks = 10
 queue_depth_threshold = 0
 # 跳过调度后的等待时间（秒）
 skip_wait_seconds = 5
+queue_maxsize = 1000
 
 # DeepScan 配置
 [deep_scan]
@@ -163,3 +165,15 @@ enabled = false
 # 扫描深度
 # 即最多扫描前 n 页 + 后 n 页
 depth = 3
+
+# 科研采集与补充账号快照
+[research]
+# 启用项目自有原始字段扩展、页级checkpoint与恢复
+enabled = true
+# 只在fetch_user_forum_info=true时从本机文件加载，不读取浏览器profile
+account_file = "secrets/baidu-account.json"
+# 默认游客模式；仅显式开启后抓取需登录的用户贴吧快照
+fetch_user_forum_info = false
+# 每一页遇到可重试错误的最大API调用次数（429/验证码改为暂停）
+max_api_retries = 3
+retry_wait_seconds = 0.5

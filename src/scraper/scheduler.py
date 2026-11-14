@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Literal
 from tiebameow.utils.logger import logger
 
 from ..core.metrics import BACKFILL_FORUMS_COUNT, PERIODIC_FORUMS_COUNT
+from ..core.models import research_thread_list_task_key
 from .tasks import Priority, ScanThreadsTask, Task, ThreadPageResult
 
 if TYPE_CHECKING:
@@ -48,9 +49,10 @@ class Scheduler:
         log: 日志记录器。
     """
 
-    def __init__(self, router: QueueRouter, container: Container):
+    def __init__(self, router: QueueRouter, container: Container, datastore=None):
         self.router = router
         self.container = container
+        self.datastore = datastore
         self.log = logger.bind(name="Scheduler")
         self._stop_event = asyncio.Event()
 
@@ -286,15 +288,27 @@ class Scheduler:
 
         BACKFILL_FORUMS_COUNT.set(len(forums))
 
-        start_page = 2 if self.container.config.mode == "hybrid" else 1
+        # Backfill uses CREATE sort while the live monitor uses REPLY sort, so
+        # the monitor's page 1 cannot stand in for CREATE page 1.
+        start_page = 1
         streams = [(forum, is_good) for forum in forums for is_good in (False, True)]
         pages = {(forum.fid, is_good): start_page for forum, is_good in streams}
+        cursors: dict[tuple[int, bool], dict[str, object]] = {key: {} for key in pages}
+        run_id = getattr(self.container, "research_run_id", None)
+        if run_id and self.datastore is not None:
+            saved_states = await self.datastore.get_research_list_checkpoint_states(run_id)
+            for key, (next_page, _scope_status, cursor) in saved_states.items():
+                if key in pages:
+                    pages[key] = next_page if next_page is not None else 0
+                    cursors[key] = cursor or {}
         scanned = dict.fromkeys(pages, 0)
-        last_create_time = dict.fromkeys(pages)
         recent_fingerprints = {key: deque(maxlen=3) for key in pages}
+        for key, cursor in cursors.items():
+            for fingerprint in cursor.get("recent_page_fingerprints", []):
+                recent_fingerprints[key].append(tuple(fingerprint))
         failures: list[str] = []
         limited: list[str] = []
-        active = list(streams)
+        active = [(forum, is_good) for forum, is_good in streams if pages[(forum.fid, is_good)] != 0]
 
         while active and not self._stop_event.is_set():
             for forum, is_good in tuple(active):
@@ -305,14 +319,45 @@ class Scheduler:
                     continue
 
                 try:
-                    result = await self._scan_backfill_page(forum, pn, max_pages, is_good)
+                    result = await self._scan_backfill_page(forum, pn, max_pages, is_good, cursors[key])
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     failure = f"forum={forum.fname} is_good={is_good} pn={pn} error={type(exc).__name__}"
                     failures.append(failure)
                     logger.error("Backfill list stream paused: {}", failure)
+                    error_code = getattr(exc, "code", None)
+                    pause_status = {4011: "paused_auth", 429: "paused_rate_limit", 220034: "blocked"}.get(error_code)
+                    if run_id and self.datastore is not None:
+                        await self.datastore.record_research_checkpoint(
+                            run_id=run_id,
+                            task_key=research_thread_list_task_key(forum.fid, is_good),
+                            page_number=pn,
+                            task_type="thread_list",
+                            scope_type="thread_list",
+                            sort_mode="create",
+                            fid=forum.fid,
+                            fname=forum.fname,
+                            is_good=is_good,
+                            status=pause_status or "failed",
+                            scope_status=pause_status or "incomplete",
+                            next_page=pn,
+                            error_type=type(exc).__name__,
+                            error_code=getattr(exc, "code", None),
+                            reason=type(exc).__name__,
+                            continuation_json=cursors[key],
+                        )
+                    if run_id and self.datastore is not None and error_code not in {4011, 429, 220034}:
+                        await self.datastore.set_research_run_status_if(
+                            run_id,
+                            {"running", "paused_rate_limit"},
+                            "incomplete",
+                            type(exc).__name__,
+                        )
                     active.remove((forum, is_good))
+                    if error_code in {429, 220034}:
+                        active.clear()
+                        break
                     continue
 
                 scanned[key] += 1
@@ -370,21 +415,31 @@ class Scheduler:
                     recent_fingerprints[key].append(fingerprint)
 
                 page_times = result.non_top_create_times
-                previous_oldest = last_create_time[key]
+                previous_oldest = cursors[key].get("last_create_time")
+                if previous_oldest:
+                    from datetime import datetime
+
+                    previous_oldest = datetime.fromisoformat(str(previous_oldest))
                 if page_times and previous_oldest is not None and page_times[0] > previous_oldest:
                     failure = f"forum={forum.fname} is_good={is_good} pn={pn} create_time_order_reversed"
                     failures.append(failure)
                     logger.error("Backfill CREATE order moved forward across pages: {}", failure)
                     active.remove((forum, is_good))
                     continue
-                if page_times:
-                    last_create_time[key] = page_times[-1]
+                cursors[key] = result.continuation_json or cursors[key]
 
                 if result.has_more:
                     if max_pages > 0 and scanned[key] >= max_pages:
                         limit_state = f"forum={forum.fname} is_good={is_good} status=paused_limit pages={max_pages}"
                         limited.append(limit_state)
                         logger.warning("Backfill stream paused at its configured page limit: {}", limit_state)
+                        if run_id and self.datastore is not None:
+                            await self.datastore.mark_research_checkpoint_scope_status(
+                                run_id,
+                                research_thread_list_task_key(forum.fid, is_good),
+                                pn,
+                                "paused_limit",
+                            )
                         active.remove((forum, is_good))
                     else:
                         pages[key] += 1
@@ -402,9 +457,35 @@ class Scheduler:
             len(limited),
         )
         if failures:
+            if run_id and self.datastore is not None:
+                await self.datastore.set_research_run_status_if(
+                    run_id,
+                    {"running"},
+                    "incomplete",
+                    "; ".join(failures),
+                )
             raise BackfillIncompleteError(failures)
+        if run_id and self.datastore is not None:
+            if active and self._stop_event.is_set():
+                await self.datastore.set_research_run_status_if(
+                    run_id, {"running", "paused_rate_limit"}, "interrupted", "scheduler_stopped"
+                )
+            elif limited:
+                await self.datastore.set_research_run_status_if(
+                    run_id, {"running"}, "paused_limit", "; ".join(limited)
+                )
+            # List completion is not whole-run completion: detail work may
+            # still be queued. The application reconciles all checkpoint
+            # scopes after its workers drain.
 
-    async def _scan_backfill_page(self, forum: Forum, pn: int, max_pages: int, is_good: bool) -> ThreadPageResult:
+    async def _scan_backfill_page(
+        self,
+        forum: Forum,
+        pn: int,
+        max_pages: int,
+        is_good: bool,
+        continuation_json: dict[str, object] | None = None,
+    ) -> ThreadPageResult:
         """Queue one page and wait for its worker acknowledgement before continuing."""
         completion = asyncio.get_running_loop().create_future()
         task_content = ScanThreadsTask(
@@ -416,6 +497,7 @@ class Scheduler:
             is_good=is_good,
             force=self.container.config.backfill_force_scan,
             completion=completion,
+            continuation_json=continuation_json,
         )
         task = Task(priority=Priority.BACKFILL_THREADS, content=task_content)
         try:

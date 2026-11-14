@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from src.core.config import TiebaConfig
+from src.core.config import RateLimitConfig, TiebaConfig
 
 
 def test_zero_backfill_page_limit_is_explicitly_unbounded():
@@ -17,3 +17,9 @@ def test_zero_backfill_page_limit_is_explicitly_unbounded():
 def test_negative_backfill_page_limit_is_rejected():
     with pytest.raises(ValidationError):
         TiebaConfig(max_backfill_pages=-1)
+
+
+def test_global_request_rate_limit_has_a_positive_conservative_default():
+    assert RateLimitConfig().global_rps == 0.2
+    with pytest.raises(ValidationError):
+        RateLimitConfig(global_rps=0)

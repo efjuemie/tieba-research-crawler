@@ -26,7 +26,7 @@ async def test_main_propagates_incomplete_backfill_failure(monkeypatch):
             pass
 
     class FakeScheduler:
-        def __init__(self, router, container):
+        def __init__(self, router, container, datastore=None):
             pass
 
         async def run(self, mode):

@@ -21,6 +21,13 @@ from tiebameow.client import Client
 from tiebameow.models.orm import Forum
 from tiebameow.utils.logger import logger
 
+from ..research.client import ResearchClient, ResearchRunCache
+from .auth import (
+    GateAwareSemaphore,
+    account_file_fingerprint,
+    verify_research_credentials,
+    wait_for_account_file_update,
+)
 from .lock import LockManager, MemoryLockManager, RedisLockManager
 from .ws_server import WebSocketServer
 
@@ -58,7 +65,8 @@ class Container:
         """
         self.config = config
 
-        self.semaphore: asyncio.Semaphore | None = None
+        self.semaphore: GateAwareSemaphore | None = None
+        self._request_semaphore: asyncio.Semaphore | None = None
         # 分接口限流器（多代理模式下，每个代理有独立的限流器组）
         self.threads_limiter: AsyncLimiter | None = None
         self.posts_limiter: AsyncLimiter | None = None
@@ -72,6 +80,20 @@ class Container:
         self.redis_client: redis.Redis | None = None
         self.tb_client: Client | None = None
         self.tb_clients: list[Client] = []
+        self.research_run_cache = ResearchRunCache()
+        self.research_run_id: str | None = None
+        self.research_auth_ready = asyncio.Event()
+        self.research_auth_ready.set()
+        # Compatibility alias; this gate is auth-only. New request paths should
+        # call wait_for_research_ready() to include both auth and cooldown gates.
+        self.research_ready = self.research_auth_ready
+        self.research_network_ready = asyncio.Event()
+        self.research_network_ready.set()
+        self._research_rate_limit_deadline = 0.0
+        self._research_rate_limit_lock = asyncio.Lock()
+        self._auth_refresh_lock = asyncio.Lock()
+        self._research_account_file_state: tuple[int, int, int, int] | None = None
+        self._research_credentials_loaded = False
         self.forums: list[Forum] | None = None
         self.ws_server: WebSocketServer | None = None
         self.lock_manager: LockManager = MemoryLockManager()
@@ -247,8 +269,35 @@ class Container:
         """
         logger.info("Initializing container resources...")
         try:
+            client_type: type[Client] = ResearchClient if self.config.research_enabled else Client
+            research_client_kwargs: dict[str, object] = {}
+            research_request_interval = 0.0
+            if self.config.research_enabled:
+                research_client_kwargs["research_run_cache"] = self.research_run_cache
+                global_rps = float(self.config.global_rps)
+                if global_rps <= 0:
+                    raise ValueError("Research global_rps must be positive.")
+                research_request_interval = 1 / global_rps
+            if self.config.research_enabled and self.config.fetch_user_forum_info:
+                from ..research.credentials import load_bduss
+
+                self._research_account_file_state = account_file_fingerprint(self.config.research_account_file)
+                try:
+                    research_client_kwargs["BDUSS"] = load_bduss(self.config.research_account_file)
+                    self._research_credentials_loaded = True
+                except (OSError, ValueError):
+                    self._research_credentials_loaded = False
+
             # 全局限流
-            self.semaphore = asyncio.Semaphore(self.config.concurrency_limit)
+            self._request_semaphore = asyncio.Semaphore(self.config.concurrency_limit)
+            self.semaphore = GateAwareSemaphore(
+                self._request_semaphore,
+                self.wait_for_research_ready,
+                self._research_request_gates_open,
+                self.wait_for_research_network_ready,
+                self._research_network_gates_open,
+                minimum_interval_seconds=research_request_interval,
+            )
             logger.info("Global concurrency limit set to {}.", self.config.concurrency_limit)
 
             # 分接口限流器
@@ -273,11 +322,12 @@ class Container:
                     self._comments_limiters.append(AsyncLimiter(1, time_period=1 / self.config.comments_rps))
 
                     proxy_config = AiotiebaProxyConfig(url=url)
-                    client = await Client(
+                    client = await client_type(
                         proxy=proxy_config,
                         semaphore=self.semaphore,
                         cooldown_429=self.config.cooldown_seconds_429,
-                        retry_attempts=5,
+                        retry_attempts=1 if self.config.research_enabled else 5,
+                        **research_client_kwargs,
                     ).__aenter__()
                     self.tb_clients.append(client)
                     logger.info("Tieba Client #{} started with proxy: {}", i, url.split("@")[-1])
@@ -300,11 +350,12 @@ class Container:
                     proxy_config = AiotiebaProxyConfig(url=proxy_url)
                     logger.info("Proxy enabled: {}", proxy_url.split("@")[-1])
 
-                self.tb_client = await Client(
+                self.tb_client = await client_type(
                     proxy=proxy_config,
                     semaphore=self.semaphore,
                     cooldown_429=self.config.cooldown_seconds_429,
-                    retry_attempts=5,
+                    retry_attempts=1 if self.config.research_enabled else 5,
+                    **research_client_kwargs,
                 ).__aenter__()
                 logger.info("Tieba Client started.")
 
@@ -314,14 +365,14 @@ class Container:
             )
             logger.info("PostgreSQL AsyncEngine created.")
 
-            if self.config.consumer_transport == "redis" or self.config.redis_url:
+            if self.config.consumer_transport == "redis" or self.config.cache_backend == "redis":
                 try:
                     self.redis_client = await redis.from_url(self.config.redis_url, decode_responses=True)
                     await self.redis_client.ping()  # type: ignore
                     self.lock_manager = RedisLockManager(self.redis_client)
                     logger.info("Redis client connected successfully.")
                 except Exception as e:
-                    if self.config.consumer_transport == "redis":
+                    if self.config.consumer_transport == "redis" or self.config.cache_backend == "redis":
                         raise
                     logger.warning("Redis connection failed: {}. Redis commands will be unavailable.", e)
                     self.redis_client = None
@@ -356,6 +407,189 @@ class Container:
             logger.exception("Failed to initialize container resources: {}", e)
             await self.teardown()
             raise
+
+    async def validate_research_auth(self) -> None:
+        """Validate the explicitly configured local account without holding DB resources."""
+        if not self.config.research_enabled or not self.config.fetch_user_forum_info:
+            self.research_auth_ready.set()
+            return
+        if not self._research_credentials_loaded:
+            from .auth import ResearchAuthError
+
+            raise ResearchAuthError("paused_auth", "account_file_missing_or_invalid")
+        await self._verify_research_auth()
+        self.research_auth_ready.set()
+
+    async def wait_for_initial_auth(self) -> None:
+        """Wait for a changed account file, then validate it before resuming work."""
+        if not self.config.research_enabled or not self.config.fetch_user_forum_info:
+            self.research_auth_ready.set()
+            return
+
+        fingerprint = self._research_account_file_state
+        while True:
+            bduss, fingerprint = await wait_for_account_file_update(self.config.research_account_file, fingerprint)
+            self._research_account_file_state = fingerprint
+            await self._replace_research_accounts(bduss)
+            self._research_credentials_loaded = True
+            try:
+                await self._verify_research_auth()
+            except Exception as error:
+                from .auth import ResearchAuthError
+
+                if isinstance(error, ResearchAuthError) and error.status == "paused_auth":
+                    continue
+                raise
+            self.research_auth_ready.set()
+            return
+
+    async def wait_for_auth_refresh(self, verify_callback, *, run_id: str | None = None):
+        """Wait for an updated account file and retry the triggering API request."""
+        if not self.config.research_enabled or not self.config.fetch_user_forum_info:
+            return await verify_callback()
+
+        from tiebameow.client.tieba_client import RetriableApiError
+
+        from .auth import ResearchAuthError
+
+        async with self._auth_refresh_lock:
+            fingerprint = self._research_account_file_state
+            while True:
+                if not self.research_auth_ready.is_set():
+                    bduss, fingerprint = await wait_for_account_file_update(
+                        self.config.research_account_file,
+                        fingerprint,
+                    )
+                    self._research_account_file_state = fingerprint
+                    await self._replace_research_accounts(bduss)
+                    self._research_credentials_loaded = True
+                    try:
+                        await self._verify_research_auth()
+                    except ResearchAuthError as error:
+                        if error.status == "paused_auth":
+                            continue
+                        raise
+                    self.research_auth_ready.set()
+
+                retry_limit = self.config.research_max_api_retries
+                auth_rejected = False
+                for attempt in range(1, retry_limit + 1):
+                    try:
+                        return await verify_callback()
+                    except RetriableApiError as error:
+                        if error.code == 4011:
+                            self.research_auth_ready.clear()
+                            fingerprint = self._research_account_file_state
+                            auth_rejected = True
+                            break
+                        if error.code == 429 and attempt < retry_limit:
+                            await self.wait_for_rate_limit(
+                                self.config.cooldown_seconds_429,
+                                run_id=run_id,
+                            )
+                            continue
+                        raise
+                if auth_rejected:
+                    continue
+
+    async def wait_for_research_ready(self) -> None:
+        """Wait until auth/network gates are open and shared cooldown expires."""
+        loop = asyncio.get_running_loop()
+        while True:
+            await self.research_auth_ready.wait()
+            await self.research_network_ready.wait()
+            async with self._research_rate_limit_lock:
+                remaining = self._research_rate_limit_deadline - loop.time()
+                if remaining <= 0 and self.research_auth_ready.is_set() and self.research_network_ready.is_set():
+                    return
+            await asyncio.sleep(max(remaining, 0))
+
+    async def wait_for_research_network_ready(self) -> None:
+        """Wait for cooldown/network block without requiring valid login state."""
+        loop = asyncio.get_running_loop()
+        while True:
+            await self.research_network_ready.wait()
+            async with self._research_rate_limit_lock:
+                remaining = self._research_rate_limit_deadline - loop.time()
+                if remaining <= 0 and self.research_network_ready.is_set():
+                    return
+            await asyncio.sleep(max(remaining, 0))
+
+    async def wait_for_rate_limit(self, cooldown_seconds: float, *, run_id: str | None = None) -> None:
+        """Extend and await the shared monotonic request cooldown deadline."""
+        del run_id  # Status transitions belong to the caller; cooldown never reopens them.
+        loop = asyncio.get_running_loop()
+        async with self._research_rate_limit_lock:
+            self._research_rate_limit_deadline = max(
+                self._research_rate_limit_deadline,
+                loop.time() + max(0.0, cooldown_seconds),
+            )
+        while True:
+            async with self._research_rate_limit_lock:
+                remaining = self._research_rate_limit_deadline - loop.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(remaining)
+
+    async def block_research_network(self) -> None:
+        """Stop new research API requests until a new explicitly resumed process."""
+        self.research_network_ready.clear()
+
+    async def _research_request_gates_open(self) -> bool:
+        if not self.research_auth_ready.is_set() or not self.research_network_ready.is_set():
+            return False
+        async with self._research_rate_limit_lock:
+            return asyncio.get_running_loop().time() >= self._research_rate_limit_deadline
+
+    async def _research_network_gates_open(self) -> bool:
+        if not self.research_network_ready.is_set():
+            return False
+        async with self._research_rate_limit_lock:
+            return asyncio.get_running_loop().time() >= self._research_rate_limit_deadline
+
+    async def _verify_research_auth(self) -> None:
+        if self.tb_client is None:
+            from .auth import ResearchAuthError
+
+            raise ResearchAuthError("incomplete", "account_validation_client_unavailable")
+        if isinstance(self.semaphore, GateAwareSemaphore):
+            async with self.semaphore.bypass_auth_gate():
+                await self._verify_research_client()
+        else:
+            await self._verify_research_client()
+
+    async def _verify_research_client(self) -> None:
+        if self.tb_client is None:
+            from .auth import ResearchAuthError
+
+            raise ResearchAuthError("incomplete", "account_validation_client_unavailable")
+        await verify_research_credentials(
+            self.tb_client,
+            self.threads_limiter,
+            max_attempts=self.config.research_max_api_retries,
+            retry_wait_seconds=self.config.research_retry_wait_seconds,
+        )
+
+    async def _replace_research_accounts(self, bduss: str) -> None:
+        from aiotieba.core.account import Account
+
+        if self._request_semaphore is None:
+            raise RuntimeError("Cannot update research credentials before clients are initialized.")
+
+        acquired = 0
+        try:
+            for _ in range(self.config.concurrency_limit):
+                await self._request_semaphore.acquire()
+                acquired += 1
+            clients = self.tb_clients or ([self.tb_client] if self.tb_client is not None else [])
+            for client in clients:
+                if not isinstance(client, ResearchClient):
+                    raise RuntimeError("Research account update requires ResearchClient instances.")
+                client.account = Account(BDUSS=bduss)
+                client.research_run_cache.clear()
+        finally:
+            for _ in range(acquired):
+                self._request_semaphore.release()
 
     async def teardown(self):
         """异步关闭并清理所有资源。

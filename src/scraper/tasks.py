@@ -92,6 +92,8 @@ class ThreadPageResult:
     total_count: int
     tids: tuple[int, ...]
     non_top_create_times: tuple[datetime, ...]
+    non_top_tids: tuple[int, ...] = ()
+    continuation_json: dict[str, object] | None = None
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -118,6 +120,7 @@ class ScanThreadsTask:
     max_pages: int = 0
     force: bool = False
     completion: Future[ThreadPageResult] | None = dataclasses.field(default=None, compare=False, repr=False)
+    continuation_json: dict[str, object] | None = dataclasses.field(default=None, compare=False, repr=False)
 
     @property
     def unique_key(self) -> tuple[int, int, bool]:
@@ -137,10 +140,17 @@ class FullScanPostsTask:
     tid: int
     rn: int = 30
     backfill: bool = False
+    start_page: int = 1
+    run_id: str | None = None
+    generation: int = 0
+    fid: int | None = None
+    fname: str | None = None
 
     @property
-    def unique_key(self) -> int:
-        return self.tid
+    def unique_key(self) -> object:
+        if self.run_id is None and self.generation == 0:
+            return self.tid
+        return (self.run_id, self.tid, self.generation)
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -183,10 +193,20 @@ class FullScanCommentsTask:
     tid: int
     pid: int
     backfill: bool = False
+    start_page: int = 1
+    parent_kind: str | None = None
+    run_id: str | None = None
+    generation: int = 0
+    parent_generation: int | None = None
+    fid: int | None = None
+    fname: str | None = None
+    rn: int = 30
 
     @property
-    def unique_key(self) -> tuple[int, int]:
-        return (self.tid, self.pid)
+    def unique_key(self) -> object:
+        if self.run_id is None and self.generation == 0 and self.parent_generation is None:
+            return (self.tid, self.pid)
+        return (self.run_id, self.tid, self.pid, self.generation, self.parent_generation)
 
 
 @dataclasses.dataclass(slots=True, frozen=True)

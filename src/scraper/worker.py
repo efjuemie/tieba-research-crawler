@@ -16,12 +16,13 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Literal
 
 from aiotieba.enums import PostSortType, ThreadSortType
-from tiebameow.client.tieba_client import UnretriableApiError
+from tiebameow.client.tieba_client import RetriableApiError, UnretriableApiError
 from tiebameow.models.orm import Comment, Post, User
 from tiebameow.utils.logger import logger
 
@@ -33,6 +34,7 @@ from ..core.metrics import (
     TASK_DURATION,
     WORKER_ERRORS,
 )
+from ..core.models import research_comments_task_key, research_posts_task_key, research_thread_list_task_key
 from .tasks import (
     DeepScanTask,
     FullScanCommentsTask,
@@ -55,6 +57,16 @@ if TYPE_CHECKING:
     from ..core.lock import LockManager
     from .queue import UniquePriorityQueue
     from .router import QueueRouter
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FetchedPage:
+    response: Any
+    attempts: int
+
+
+class PageIntegrityError(ValueError):
+    """Raised when a returned API page does not match the requested scope."""
 
 
 class TaskHandler(ABC):
@@ -100,6 +112,10 @@ class TaskHandler(ABC):
         """释放锁（幂等操作）。"""
         await self.lock_manager.release(key)
 
+    @staticmethod
+    def _dto(response: Any) -> Any:
+        return getattr(response, "dto", response)
+
     def _get_client_and_limiter(self, api_type: Literal["threads", "posts", "comments"]) -> tuple[Any, Any]:
         """获取客户端和对应的限流器（支持多代理轮换）。
 
@@ -125,7 +141,7 @@ class TaskHandler(ABC):
         }
         return self.container.tb_client, limiter_map.get(api_type, self.container.threads_limiter)
 
-    async def get_threads(self, fname: str, **kwargs: Any) -> ThreadsDTO:
+    async def get_threads(self, fname: str, **kwargs: Any) -> FetchedPage:
         """带限流的 get_threads_dto 调用（支持多代理轮换）。
 
         Args:
@@ -135,28 +151,26 @@ class TaskHandler(ABC):
         Returns:
             ThreadsDTO: 主题贴列表数据。
         """
-        client, limiter = self._get_client_and_limiter("threads")
-        with RATELIMIT_WAIT_DURATION.labels(limiter_type="threads").time():
-            await limiter.acquire()
+        expected_fid = kwargs.pop("_expected_fid", None)
+        requested_page = kwargs.get("pn", 1)
+        fetched = await self._request_api(
+            "threads",
+            "get_threads_research",
+            "get_threads_dto",
+            (fname,),
+            kwargs,
+        )
+        page = self._dto(fetched.response)
+        self._validate_page_number("thread list", requested_page, page.page.current_page)
+        if expected_fid is not None:
+            wrong_fids = {thread.fid for thread in page.objs if thread.fid != expected_fid}
+            if wrong_fids:
+                raise PageIntegrityError(
+                    f"Thread list returned forum scope {sorted(wrong_fids)} instead of {expected_fid}."
+                )
+        return fetched
 
-        start = time.perf_counter()
-        status = "success"
-        try:
-            return await client.get_threads_dto(fname, **kwargs)  # type: ignore
-        except UnretriableApiError as e:
-            if e.code == 4:
-                status = "error_deleted"
-            else:
-                status = f"error_{e.code}"
-            raise
-        except Exception:
-            status = "unexpected_error"
-            raise
-        finally:
-            duration = time.perf_counter() - start
-            API_REQUEST_DURATION.labels(method="get_threads", status=status).observe(duration)
-
-    async def get_posts(self, tid: int, pn: int, **kwargs: Any) -> PostsDTO:
+    async def get_posts(self, tid: int, pn: int, **kwargs: Any) -> FetchedPage:
         """带限流的 get_posts_dto 调用（支持多代理轮换）。
 
         Args:
@@ -167,28 +181,26 @@ class TaskHandler(ABC):
         Returns:
             PostsDTO: 回复列表数据。
         """
-        client, limiter = self._get_client_and_limiter("posts")
-        with RATELIMIT_WAIT_DURATION.labels(limiter_type="posts").time():
-            await limiter.acquire()
+        fetched = await self._request_api(
+            "posts",
+            "get_posts_research",
+            "get_posts_dto",
+            (tid, pn),
+            kwargs,
+        )
+        page = self._dto(fetched.response)
+        if pn != 0xFFFF:
+            self._validate_page_number("post detail", pn, page.page.current_page)
+        wrong_tids = {post.tid for post in page.objs if post.tid != tid}
+        if wrong_tids:
+            raise PageIntegrityError(f"Post page returned tids {sorted(wrong_tids)} instead of {tid}.")
+        raw_thread = getattr(getattr(fetched.response, "raw", None), "thread", None)
+        raw_tid = getattr(raw_thread, "tid", tid)
+        if raw_thread is not None and raw_tid != tid:
+            raise PageIntegrityError(f"Post page first-post detail returned tid {raw_tid} instead of {tid}.")
+        return fetched
 
-        start = time.perf_counter()
-        status = "success"
-        try:
-            return await client.get_posts_dto(tid, pn, **kwargs)  # type: ignore
-        except UnretriableApiError as e:
-            if e.code == 4:
-                status = "error_deleted"
-            else:
-                status = f"error_{e.code}"
-            raise
-        except Exception:
-            status = "unexpected_error"
-            raise
-        finally:
-            duration = time.perf_counter() - start
-            API_REQUEST_DURATION.labels(method="get_posts", status=status).observe(duration)
-
-    async def get_comments(self, tid: int, pid: int, pn: int = 1) -> CommentsDTO:
+    async def get_comments(self, tid: int, pid: int, pn: int = 1) -> FetchedPage:
         """带限流的 get_comments_dto 调用（支持多代理轮换）。
 
         Args:
@@ -199,26 +211,438 @@ class TaskHandler(ABC):
         Returns:
             CommentsDTO: 楼中楼列表数据。
         """
-        client, limiter = self._get_client_and_limiter("comments")
-        with RATELIMIT_WAIT_DURATION.labels(limiter_type="comments").time():
-            await limiter.acquire()
+        fetched = await self._request_api(
+            "comments",
+            "get_comments_research",
+            "get_comments_dto",
+            (tid, pid, pn),
+            {},
+        )
+        page = self._dto(fetched.response)
+        self._validate_page_number("comment detail", pn, page.page.current_page)
+        wrong_scope = {(comment.tid, comment.pid) for comment in page.objs if comment.tid != tid or comment.pid != pid}
+        if wrong_scope:
+            raise PageIntegrityError(
+                f"Comment page returned parent scopes {sorted(wrong_scope)} instead of {(tid, pid)}."
+            )
+        return fetched
 
-        start = time.perf_counter()
-        status = "success"
-        try:
-            return await client.get_comments_dto(tid, pid, pn)  # type: ignore
-        except UnretriableApiError as e:
-            if e.code == 4:
-                status = "error_deleted"
-            else:
-                status = f"error_{e.code}"
-            raise
-        except Exception:
-            status = "unexpected_error"
-            raise
-        finally:
-            duration = time.perf_counter() - start
-            API_REQUEST_DURATION.labels(method="get_comments", status=status).observe(duration)
+    @staticmethod
+    def _validate_page_number(scope: str, requested: int, returned: int) -> None:
+        if requested != returned:
+            raise PageIntegrityError(f"{scope} returned page {returned} when page {requested} was requested.")
+
+    async def _request_api(
+        self,
+        api_type: Literal["threads", "posts", "comments"],
+        research_method: str,
+        dto_method: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> FetchedPage:
+        client, limiter = self._get_client_and_limiter(api_type)
+        config = self.container.config
+        research_enabled = config.research_enabled
+        method_name = research_method if research_enabled and hasattr(client, research_method) else dto_method
+        method = getattr(client, method_name)
+        attempt_limit = getattr(self.container.config, "research_max_api_retries", 3) if research_enabled else 1
+
+        async def request_once(*, bypass_pause: bool = False):
+            if research_enabled and not bypass_pause:
+                await self.container.wait_for_research_ready()
+            with RATELIMIT_WAIT_DURATION.labels(limiter_type=api_type).time():
+                await limiter.acquire()
+
+            start = time.perf_counter()
+            status = "success"
+            try:
+                return await method(*args, **kwargs)
+            except UnretriableApiError as error:
+                status = "error_deleted" if error.code == 4 else f"error_{error.code}"
+                raise
+            except RetriableApiError as error:
+                status = f"error_{error.code}"
+                raise
+            except Exception:
+                status = "unexpected_error"
+                raise
+            finally:
+                API_REQUEST_DURATION.labels(method=f"get_{api_type}", status=status).observe(
+                    time.perf_counter() - start
+                )
+
+        for attempt in range(1, attempt_limit + 1):
+            try:
+                response = await request_once()
+                run_id = getattr(self.container, "research_run_id", None)
+                if research_enabled and run_id:
+                    await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
+                return FetchedPage(response=response, attempts=attempt)
+            except RetriableApiError as error:
+                if research_enabled and error.code == 4011:
+                    run_id = getattr(self.container, "research_run_id", None)
+                    if run_id:
+                        await self.datastore.set_research_run_status_if(
+                            run_id,
+                            {"running", "paused_rate_limit"},
+                            "paused_auth",
+                            f"{api_type}_api_error_code_4011",
+                        )
+                    try:
+                        response = await self.container.wait_for_auth_refresh(
+                            lambda: request_once(bypass_pause=True),
+                            run_id=run_id,
+                        )
+                    except RetriableApiError as refresh_error:
+                        if refresh_error.code == 429:
+                            if run_id:
+                                await self.datastore.set_research_run_status_if(
+                                    run_id,
+                                    {"paused_auth"},
+                                    "paused_rate_limit",
+                                    f"{api_type}_api_error_code_429_after_auth_refresh",
+                                )
+                            await self.container.wait_for_rate_limit(
+                                self.container.config.cooldown_seconds_429,
+                                run_id=run_id,
+                            )
+                            if attempt >= attempt_limit:
+                                await self.container.block_research_network()
+                                raise
+                            if run_id:
+                                await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
+                            wait_seconds = self.container.config.research_retry_wait_seconds
+                            await asyncio.sleep(wait_seconds * attempt)
+                            continue
+                        if refresh_error.code == 220034:
+                            if run_id:
+                                await self.datastore.set_research_run_status_if(
+                                    run_id,
+                                    {"paused_auth"},
+                                    "blocked",
+                                    f"{api_type}_api_error_code_220034_after_auth_refresh",
+                                )
+                            await self.container.block_research_network()
+                        raise
+                    if run_id:
+                        await self.datastore.resume_research_run_if_status(run_id, "paused_auth")
+                    return FetchedPage(response=response, attempts=attempt + 1)
+                if research_enabled and error.code == 429:
+                    run_id = getattr(self.container, "research_run_id", None)
+                    if run_id:
+                        await self.datastore.set_research_run_status_if(
+                            run_id,
+                            {"running", "paused_rate_limit"},
+                            "paused_rate_limit",
+                            f"{api_type}_api_error_code_429",
+                        )
+                    await self.container.wait_for_rate_limit(
+                        self.container.config.cooldown_seconds_429,
+                        run_id=run_id,
+                    )
+                    if attempt >= attempt_limit:
+                        await self.container.block_research_network()
+                        raise
+                    if run_id:
+                        await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
+                    wait_seconds = self.container.config.research_retry_wait_seconds
+                    await asyncio.sleep(wait_seconds * attempt)
+                    continue
+                if research_enabled and error.code == 220034:
+                    run_id = getattr(self.container, "research_run_id", None)
+                    if run_id:
+                        await self.datastore.set_research_run_status_if(
+                            run_id,
+                            {"running", "paused_auth", "paused_rate_limit"},
+                            "blocked",
+                            f"{api_type}_api_error_code_220034",
+                        )
+                    await self.container.block_research_network()
+                    raise
+
+                if attempt >= attempt_limit:
+                    raise
+                wait_seconds = getattr(self.container.config, "research_retry_wait_seconds", 0.5)
+                await asyncio.sleep(wait_seconds * attempt)
+
+        raise RuntimeError("Research API retry loop exited without a response.")
+
+    async def _prepare_research_page(self, response: Any) -> None:
+        if not getattr(response, "source_api", None):
+            return
+        sessionmaker_ = getattr(self.container, "async_sessionmaker", None)
+        if sessionmaker_ is None:
+            raise RuntimeError("Research response cannot be persisted without a database session factory.")
+        if (
+            self.research_enabled
+            and self.container.config.fetch_user_forum_info
+            and response.source_api in {"aiotieba.get_posts", "aiotieba.get_comments"}
+        ):
+            await self._persist_user_forum_snapshots(response, sessionmaker_)
+
+    async def _persist_research_page(self, response: Any, *, session: Any = None) -> None:
+        if not getattr(response, "source_api", None):
+            return
+        sessionmaker_ = getattr(self.container, "async_sessionmaker", None)
+        if sessionmaker_ is None:
+            raise RuntimeError("Research response cannot be persisted without a database session factory.")
+        from ..research.persistence import persist_research_page
+
+        if session is None:
+            await self._prepare_research_page(response)
+        await persist_research_page(sessionmaker_, response, session=session)
+
+    async def _persist_user_forum_snapshots(self, response: Any, sessionmaker_: Any) -> None:
+        raw = getattr(response, "raw", None)
+        if raw is None:
+            return
+
+        default_fid = 0
+        if response.source_api == "aiotieba.get_posts":
+            raw_thread = getattr(raw, "thread", None)
+            default_fid = int(getattr(raw_thread, "fid", 0) or 0)
+            response_dto = self._dto(response)
+            if default_fid <= 0:
+                default_fid = int(getattr(getattr(response_dto, "forum", None), "fid", 0) or 0)
+            authors = ([raw_thread] if raw_thread is not None else []) + list(getattr(raw, "objs", ()) or ())
+        else:
+            response_dto = self._dto(response)
+            default_fid = int(getattr(getattr(response_dto, "forum", None), "fid", 0) or 0)
+            authors = list(getattr(raw, "objs", ()) or ())
+
+        client = self.container.tb_client
+        fetch_user_forum_info = getattr(client, "get_user_forum_info_research", None)
+        if fetch_user_forum_info is None:
+            raise RuntimeError("Forum user snapshots require ResearchClient when research enrichment is enabled.")
+
+        targets: dict[tuple[int, int], str | None] = {}
+        for author in authors:
+            user = getattr(author, "user", None)
+            try:
+                user_id = int(getattr(author, "author_id", 0) or getattr(user, "user_id", 0) or 0)
+                fid = int(getattr(author, "fid", 0) or default_fid)
+            except (TypeError, ValueError):
+                continue
+            if user_id > 0 and fid > 0:
+                targets.setdefault((fid, user_id), getattr(user, "portrait", None) or None)
+
+        for (fid, user_id), portrait in targets.items():
+            await self._fetch_user_forum_snapshot(
+                fetch_user_forum_info,
+                sessionmaker_,
+                fid=fid,
+                user_id=user_id,
+                portrait=portrait,
+            )
+
+    async def _fetch_user_forum_snapshot(
+        self,
+        fetch_user_forum_info: Any,
+        sessionmaker_: Any,
+        *,
+        fid: int,
+        user_id: int,
+        portrait: str | None,
+    ) -> None:
+        from ..research.persistence import persist_research_page
+
+        run_id = getattr(self.container, "research_run_id", None)
+        attempt_limit = self.container.config.research_max_api_retries
+        latest_page: Any = None
+
+        async def fetch_or_raise_expected_errors() -> Any:
+            nonlocal latest_page
+            page = await fetch_user_forum_info(fid, user_id, portrait)
+            latest_page = page
+            dto = page.dto
+            if dto.status == "retryable_failure" and dto.error_code in {4011, 429, 220034}:
+                raise RetriableApiError(dto.error_code, "Research user-forum request was rejected.")
+            return page
+
+        for attempt in range(1, attempt_limit + 1):
+            latest_page = await fetch_user_forum_info(fid, user_id, portrait)
+            dto = latest_page.dto
+            if dto.status != "retryable_failure":
+                break
+
+            if dto.error_code == 4011:
+                if run_id:
+                    await self.datastore.set_research_run_status_if(
+                        run_id,
+                        {"running", "paused_rate_limit"},
+                        "paused_auth",
+                        "user_forum_api_error_code_4011",
+                    )
+                self.container.research_auth_ready.clear()
+                try:
+                    latest_page = await self.container.wait_for_auth_refresh(
+                        fetch_or_raise_expected_errors,
+                        run_id=run_id,
+                    )
+                except RetriableApiError as error:
+                    if error.code == 429:
+                        if run_id:
+                            await self.datastore.set_research_run_status_if(
+                                run_id,
+                                {"paused_auth"},
+                                "paused_rate_limit",
+                                "user_forum_api_error_code_429_after_auth_refresh",
+                            )
+                        await self.container.block_research_network()
+                    elif error.code == 220034:
+                        if run_id:
+                            await self.datastore.set_research_run_status_if(
+                                run_id,
+                                {"paused_auth"},
+                                "blocked",
+                                "user_forum_api_error_code_220034_after_auth_refresh",
+                            )
+                        await self.container.block_research_network()
+                    elif run_id:
+                        await self.datastore.resume_research_run_if_status(run_id, "paused_auth")
+                    if latest_page is not None:
+                        await persist_research_page(sessionmaker_, latest_page)
+                    raise
+                if run_id:
+                    await self.datastore.resume_research_run_if_status(run_id, "paused_auth")
+                break
+
+            if dto.error_code == 429:
+                if attempt >= attempt_limit:
+                    await persist_research_page(sessionmaker_, latest_page)
+                await self._handle_user_forum_rate_limit(run_id, attempt, attempt_limit)
+                continue
+
+            if dto.error_code == 220034:
+                if run_id:
+                    await self.datastore.set_research_run_status_if(
+                        run_id,
+                        {"running", "paused_auth", "paused_rate_limit"},
+                        "blocked",
+                        "user_forum_api_error_code_220034",
+                    )
+                await self.container.block_research_network()
+                await persist_research_page(sessionmaker_, latest_page)
+                raise RetriableApiError(220034, "Research user-forum request was blocked.")
+
+            if attempt < attempt_limit:
+                await asyncio.sleep(self.container.config.research_retry_wait_seconds * attempt)
+                continue
+
+            await persist_research_page(sessionmaker_, latest_page)
+            error_code = dto.error_code or -65536
+            raise RetriableApiError(error_code, "Research user-forum request failed after bounded retries.")
+
+        assert latest_page is not None
+        await persist_research_page(sessionmaker_, latest_page)
+
+    async def _handle_user_forum_rate_limit(self, run_id: str | None, attempt: int, attempt_limit: int) -> None:
+        if run_id:
+            await self.datastore.set_research_run_status_if(
+                run_id,
+                {"running", "paused_auth", "paused_rate_limit"},
+                "paused_rate_limit",
+                "user_forum_api_error_code_429",
+            )
+        await self.container.wait_for_rate_limit(
+            self.container.config.cooldown_seconds_429,
+            run_id=run_id,
+        )
+        if attempt >= attempt_limit:
+            await self.container.block_research_network()
+            raise RetriableApiError(429, "Research user-forum request exhausted bounded retries.")
+        if run_id:
+            await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
+        await asyncio.sleep(self.container.config.research_retry_wait_seconds * attempt)
+
+    @property
+    def research_enabled(self) -> bool:
+        return self.container.config.research_enabled
+
+    async def _record_research_checkpoint(self, **values: Any) -> bool:
+        run_id = values.pop("run_id", None) or getattr(self.container, "research_run_id", None)
+        if run_id and hasattr(self.datastore, "record_research_checkpoint"):
+            return await self.datastore.record_research_checkpoint(run_id=run_id, **values)
+        return True
+
+    @staticmethod
+    def _continuation_from_page(
+        page_ids: list[int], previous: dict[str, object] | None, *, has_more: bool
+    ) -> dict[str, object]:
+        previous_pages = list((previous or {}).get("recent_page_fingerprints", []))
+        previous_pages.append(page_ids)
+        previous_pages = previous_pages[-3:]
+        return {"recent_page_fingerprints": previous_pages} if has_more else {}
+
+    @staticmethod
+    def _validate_terminal_metadata(scope: str, page_number: int, has_more: bool, total_pages: int) -> None:
+        if total_pages < 0:
+            raise PageIntegrityError(f"{scope} returned negative total_pages on page {page_number}.")
+        if has_more and total_pages > 0 and page_number >= total_pages:
+            raise PageIntegrityError(f"{scope} reports more pages beyond total_pages on page {page_number}.")
+        if not has_more and total_pages > 0 and page_number < total_pages:
+            raise PageIntegrityError(f"{scope} terminated before total_pages on page {page_number}.")
+
+    @staticmethod
+    def _is_confirmed_empty(page: Any, page_number: int) -> bool:
+        return page_number == 1 and not page.has_more and page.total_count == 0 and page.total_page in (0, 1)
+
+    @staticmethod
+    def _validate_repeated_page(ids: list[int], cursor: dict[str, object], *, has_more: bool, scope: str) -> None:
+        recent = cursor.get("recent_page_fingerprints", [])
+        if has_more and ids and len(recent) >= 3 and all(fingerprint == ids for fingerprint in recent[-3:]):
+            raise PageIntegrityError(f"{scope} repeated a recent page fingerprint.")
+
+    async def _record_detail_failure(
+        self,
+        *,
+        run_id: str | None,
+        task_key: str,
+        page_number: int,
+        task_type: str,
+        scope_type: str,
+        tid: int,
+        error: Exception,
+        continuation_json: dict[str, object],
+        parent_pid: int | None = None,
+        parent_kind: str | None = None,
+        generation: int | None = None,
+    ) -> None:
+        if run_id:
+            error_code = getattr(error, "code", None)
+            status = {
+                4011: "paused_auth",
+                429: "paused_rate_limit",
+                220034: "blocked",
+            }.get(error_code, "blocked" if error_code == 4 else "failed")
+            scope_status = status if status in {"paused_auth", "paused_rate_limit", "blocked"} else "incomplete"
+            current_generation = await self.datastore.record_research_checkpoint(
+                run_id=run_id,
+                task_key=task_key,
+                page_number=page_number,
+                task_type=task_type,
+                scope_type=scope_type,
+                tid=tid,
+                parent_pid=parent_pid,
+                parent_kind=parent_kind,
+                status=status,
+                scope_status=scope_status,
+                next_page=page_number,
+                error_type=type(error).__name__,
+                error_code=error_code,
+                reason="content_unavailable" if error_code == 4 else type(error).__name__,
+                continuation_json=continuation_json,
+                generation=generation,
+            )
+            if generation is not None and not current_generation:
+                return
+            if error_code not in {4011, 429, 220034}:
+                await self.datastore.set_research_run_status_if(
+                    run_id,
+                    {"running", "paused_rate_limit"},
+                    "incomplete",
+                    type(error).__name__,
+                )
 
     async def ensure_users(self, items: Sequence[ThreadDTO | PostDTO | CommentDTO]):
         """确保用户信息已保存到数据库。
@@ -264,15 +688,65 @@ class ThreadsTaskHandler(TaskHandler):
         pn = task_content.pn
         is_good = task_content.is_good
         sort = ThreadSortType.CREATE if task_content.backfill else ThreadSortType.REPLY
-        threads_data = await self.get_threads(fname, pn=pn, rn=task_content.rn, sort=sort, is_good=is_good)
+        fetched_page = await self.get_threads(
+            fname,
+            pn=pn,
+            rn=task_content.rn,
+            sort=sort,
+            is_good=is_good,
+            _expected_fid=task_content.fid,
+        )
+        threads_data = self._dto(fetched_page.response)
 
         all_tids = [thread.tid for thread in threads_data.objs]
-        non_top_create_times = tuple(thread.create_time for thread in threads_data.objs if not thread.is_top)
+        if threads_data.page.total_page < 0 or threads_data.page.total_count < 0:
+            raise PageIntegrityError(f"Thread list returned negative page metadata for {fname} pn={pn}.")
+        if not all_tids and (
+            threads_data.page.has_more
+            or threads_data.page.total_count > 0
+            or threads_data.page.total_page < 1
+        ):
+            raise PageIntegrityError(f"Thread list returned an unconfirmed empty page for {fname} pn={pn}.")
+        if threads_data.page.has_more and threads_data.page.total_page > 0 and pn >= threads_data.page.total_page:
+            raise PageIntegrityError(f"Thread list has_more exceeds total_page for {fname} pn={pn}.")
+        if not threads_data.page.has_more and threads_data.page.total_page > 0 and pn < threads_data.page.total_page:
+            raise PageIntegrityError(f"Thread list ended before total_page for {fname} pn={pn}.")
+        non_top_threads = [thread for thread in threads_data.objs if not thread.is_top]
+        non_top_create_times = tuple(thread.create_time for thread in non_top_threads)
+        non_top_tids = tuple(thread.tid for thread in non_top_threads)
+        cursor = task_content.continuation_json or {}
         if task_content.backfill and any(
             earlier < later
             for earlier, later in zip(non_top_create_times, non_top_create_times[1:], strict=False)
         ):
             raise ValueError(f"CREATE sort order is not descending for {fname} is_good={is_good} pn={pn}")
+        if task_content.backfill and len(set(non_top_tids)) != len(non_top_tids):
+            raise PageIntegrityError(f"CREATE page contains duplicate non-top tid values for {fname} pn={pn}.")
+        if task_content.backfill:
+            last_create_time = cursor.get("last_create_time")
+            if non_top_create_times and last_create_time:
+                from datetime import datetime
+
+                previous_oldest = datetime.fromisoformat(str(last_create_time))
+                if non_top_create_times[0] > previous_oldest:
+                    raise PageIntegrityError(f"CREATE sort order moved forward across pages for {fname} pn={pn}.")
+            recent_non_top = {int(tid) for tid in cursor.get("recent_non_top_tids", [])}
+            duplicate_tids = recent_non_top.intersection(non_top_tids)
+            fingerprints = cursor.get("recent_page_fingerprints", [])
+            if threads_data.page.has_more and all_tids and all_tids in fingerprints:
+                raise PageIntegrityError(f"CREATE pages repeated the same thread IDs for {fname} pn={pn}.")
+        else:
+            duplicate_tids = set()
+
+        continuation_json = self._thread_list_continuation(
+            cursor,
+            non_top_create_times,
+            non_top_tids,
+            all_tids,
+            duplicate_tids,
+            has_more=threads_data.page.has_more,
+        )
+        await self._persist_research_page(fetched_page.response)
 
         if not threads_data.objs:
             self.log.debug("No threads found for {}吧, is_good={}, pn={}", fname, is_good, pn)
@@ -289,6 +763,34 @@ class ThreadsTaskHandler(TaskHandler):
             await self._process_new_threads(threads_data, new_tids, task_content.backfill, task_content.force)
             await self._process_old_threads(threads_data, old_tids, task_content.backfill)
 
+        run_id = getattr(self.container, "research_run_id", None)
+        if task_content.backfill and run_id and hasattr(self.datastore, "record_research_checkpoint"):
+            await self.datastore.record_research_checkpoint(
+                run_id=run_id,
+                task_key=research_thread_list_task_key(task_content.fid, is_good),
+                page_number=pn,
+                task_type="thread_list",
+                scope_type="thread_list",
+                sort_mode="create",
+                fid=task_content.fid,
+                fname=fname,
+                is_good=is_good,
+                status="completed",
+                scope_status="running" if threads_data.page.has_more else "completed",
+                attempts=fetched_page.attempts,
+                has_more=threads_data.page.has_more,
+                next_page=pn + 1 if threads_data.page.has_more else None,
+                total_pages=threads_data.page.total_page,
+                reported_count=threads_data.page.total_count,
+                        reported_count_missing_reason=(
+                            "zero_presence_unverified_in_parsed_object"
+                            if threads_data.page.total_count == 0
+                            else None
+                        ),
+                page_item_count=len(all_tids),
+                continuation_json=continuation_json,
+            )
+
         return ThreadPageResult(
             has_more=threads_data.page.has_more,
             current_page=threads_data.page.current_page,
@@ -296,7 +798,35 @@ class ThreadsTaskHandler(TaskHandler):
             total_count=threads_data.page.total_count,
             tids=tuple(all_tids),
             non_top_create_times=non_top_create_times,
+            non_top_tids=non_top_tids,
+            continuation_json=continuation_json,
         )
+
+    @staticmethod
+    def _thread_list_continuation(
+        previous: dict[str, object],
+        page_times: tuple[datetime, ...],
+        non_top_tids: tuple[int, ...],
+        page_tids: list[int],
+        duplicate_tids: set[int],
+        *,
+        has_more: bool,
+    ) -> dict[str, object]:
+        previous_tids = [int(tid) for tid in previous.get("recent_non_top_tids", [])]
+        previous_tids.extend(non_top_tids)
+        fingerprints = list(previous.get("recent_page_fingerprints", []))
+        fingerprints.append(page_tids)
+        result: dict[str, object] = {
+            "recent_non_top_tids": previous_tids[-90:],
+            "recent_page_fingerprints": fingerprints[-3:],
+            "page_fingerprint": page_tids,
+            "page_duplicate_tids": sorted(duplicate_tids),
+        }
+        if page_times:
+            result["last_create_time"] = page_times[-1].isoformat()
+        elif previous.get("last_create_time"):
+            result["last_create_time"] = previous["last_create_time"]
+        return result
 
     async def _process_new_threads(
         self,
@@ -327,11 +857,15 @@ class ThreadsTaskHandler(TaskHandler):
         await self.ensure_users(new_threads)
 
         # 原子保存：新 thread 元数据 + pending_scan 标记
-        await self.datastore.save_threads_and_pending_scans(
+        run_id = getattr(self.container, "research_run_id", None)
+        generations = await self.datastore.save_threads_and_pending_scans(
             new_threads,
             backfill=backfill,
             upsert_threads=force,
+            force_pending_scan=self.research_enabled,
+            research_run_id=run_id if self.research_enabled else None,
         )
+        generations = generations or {}
 
         priority = Priority.BACKFILL_POSTS if backfill else Priority.MEDIUM
 
@@ -341,13 +875,17 @@ class ThreadsTaskHandler(TaskHandler):
                 await self.datastore.push_object_event("thread", thread)
                 self.log.debug("Pushed new thread tid={} to ID queue or object stream.", thread.tid)
 
-            if thread.reply_num == 0 and not backfill:
+            if thread.reply_num == 0 and not backfill and not self.research_enabled:
                 self.log.debug("Thread tid={} has no replies, saved metadata only.", thread.tid)
                 continue
 
             new_task_content = FullScanPostsTask(
                 tid=thread.tid,
                 backfill=backfill,
+                run_id=run_id if self.research_enabled else None,
+                generation=generations.get(thread.tid, 0),
+                fid=thread.fid,
+                fname=thread.fname,
             )
             await self.router.put(Task(priority=priority, content=new_task_content))
             self.log.info("[{}吧] Scheduled FullScanPostsTask for new tid={}", thread.fname, thread.tid)
@@ -371,19 +909,51 @@ class ThreadsTaskHandler(TaskHandler):
         stored_threads = await self.datastore.get_threads_by_tids(old_tids)
         stored_threads_map = {t.tid: t for t in stored_threads}
         pending_full_scan_tids = await self.datastore.get_pending_thread_scan_tids(old_tids)
+        research_detail_tids: set[int] = set()
+        if self.research_enabled and hasattr(
+            self.datastore, "needs_research_thread_detail"
+        ):
+            research_detail_tids = await self.datastore.needs_research_thread_detail(old_tids)
 
         priority = Priority.BACKFILL_POSTS if backfill else Priority.HIGH
 
         for thread_data in old_threads:
-            if thread_data.tid in pending_full_scan_tids:
+            stored_thread = stored_threads_map.get(thread_data.tid)
+            content_changed = (
+                backfill
+                and stored_thread is not None
+                and thread_data.reply_num != stored_thread.reply_num
+            )
+            if thread_data.tid in pending_full_scan_tids and not content_changed:
                 self.log.debug(
                     "Thread tid={} still has pending full scan. Skipping incremental scheduling.",
                     thread_data.tid,
                 )
                 continue
-
-            stored_thread = stored_threads_map.get(thread_data.tid)
-            if stored_thread and thread_data.last_time > stored_thread.last_time:
+            needs_full_research_scan = thread_data.tid in research_detail_tids or content_changed
+            if needs_full_research_scan:
+                run_id = getattr(self.container, "research_run_id", None)
+                generations = await self.datastore.save_threads_and_pending_scans(
+                    [thread_data],
+                    backfill=backfill,
+                    upsert_threads=True,
+                    force_pending_scan=True,
+                    refresh_research_run_id=run_id,
+                )
+                generations = generations or {}
+                full_task = FullScanPostsTask(
+                    tid=thread_data.tid,
+                    backfill=backfill,
+                    run_id=run_id,
+                    generation=generations.get(thread_data.tid, 0),
+                    fid=thread_data.fid,
+                    fname=thread_data.fname,
+                )
+                await self.router.put(
+                    Task(priority=Priority.BACKFILL_POSTS if backfill else Priority.MEDIUM, content=full_task)
+                )
+                self.log.info("[{}吧] Scheduled research detail scan for tid={}", thread_data.fname, thread_data.tid)
+            elif stored_thread and thread_data.last_time > stored_thread.last_time:
                 self.log.debug(
                     "Thread tid={} has updates. Reply count: {} -> {}",
                     thread_data.tid,
@@ -413,6 +983,189 @@ class FullScanPostsTaskHandler(TaskHandler):
     负责处理FullScanPostsTask类型的任务，全量扫描指定主题贴的所有回复内容。
     """
 
+    async def _commit_research_posts_page(
+        self,
+        task: FullScanPostsTask,
+        page: PostsDTO,
+        response: Any,
+        *,
+        page_number: int,
+        cursor: dict[str, object],
+        attempts: int,
+    ) -> tuple[bool, list[FullScanCommentsTask]]:
+        from ..research.persistence import persist_research_page
+
+        run_id = task.run_id or getattr(self.container, "research_run_id", None)
+        logical_key = research_posts_task_key(task.tid)
+        posts = [post for post in page.objs if post.floor != 1]
+        await self.ensure_users(posts)
+        await self.ensure_users([comment for post in posts for comment in post.comments])
+        await self._prepare_research_page(response)
+
+        post_models = [Post.from_dto(post) for post in posts]
+        child_tasks: list[FullScanCommentsTask] = []
+        parent_priority = Priority.BACKFILL_POSTS if task.backfill else Priority.LOW
+        raw_thread = getattr(getattr(response, "raw", None), "thread", None)
+        first_pid = int(getattr(raw_thread, "pid", 0) or 0)
+        first_floor = next((post for post in page.objs if post.tid == task.tid and post.floor == 1), None)
+        if first_pid <= 0 and first_floor is not None:
+            first_pid = int(getattr(first_floor, "pid", 0) or 0)
+
+        async with self.datastore.async_sessionmaker() as session, session.begin():
+            scope = await self.datastore.get_research_task_scope_for_update(session, run_id, logical_key)
+            if scope is None or scope.generation != task.generation:
+                return False, []
+
+            if first_pid <= 0 and self.research_enabled and hasattr(
+                self.datastore, "get_research_first_post_pids"
+            ):
+                stored_first_pids = await self.datastore.get_research_first_post_pids(task.tid, session=session)
+                if len(stored_first_pids) == 1:
+                    first_pid = next(iter(stored_first_pids))
+
+            await persist_research_page(self.datastore.async_sessionmaker, response, session=session)
+            await self.datastore.save_items_in_session(session, post_models)
+
+            for post in posts:
+                comments = list(post.comments)
+                await self.datastore.save_items_in_session(
+                    session,
+                    [Comment.from_dto(comment) for comment in comments],
+                )
+                fid = int(post.fid or task.fid or 0)
+                fname = post.fname or task.fname or ""
+                child = await self.datastore.ensure_research_task_scope(
+                    run_id=run_id,
+                    logical_task_key=research_comments_task_key(task.tid, post.pid),
+                    task_type="full_scan_comments",
+                    scope_type="post_comments",
+                    fid=fid,
+                    fname=fname,
+                    tid=task.tid,
+                    parent_pid=post.pid,
+                    parent_kind="reply_post",
+                    backfill=task.backfill,
+                    rn=task.rn,
+                    parent_logical_task_key=logical_key,
+                    parent_generation=task.generation,
+                    session=session,
+                )
+                if child is None:
+                    raise PageIntegrityError(
+                        f"Parent generation changed while registering comments for tid={task.tid} pid={post.pid}."
+                    )
+                if child.status != "completed":
+                    await self.datastore.add_pending_comment_scan_in_session(
+                        session,
+                        task.tid,
+                        post.pid,
+                        fid=fid,
+                        fname=fname,
+                        backfill=task.backfill,
+                    )
+                    child_tasks.append(
+                        FullScanCommentsTask(
+                            tid=task.tid,
+                            pid=post.pid,
+                            backfill=task.backfill,
+                            parent_kind="reply_post",
+                            run_id=run_id,
+                            generation=child.generation,
+                            parent_generation=task.generation,
+                            fid=fid,
+                            fname=fname,
+                            rn=task.rn,
+                        )
+                    )
+
+            if first_pid > 0:
+                fid = int(getattr(raw_thread, "fid", 0) or task.fid or page.forum.fid or 0)
+                fname = str(getattr(raw_thread, "fname", "") or task.fname or page.forum.fname or "")
+                child = await self.datastore.ensure_research_task_scope(
+                    run_id=run_id,
+                    logical_task_key=research_comments_task_key(task.tid, first_pid),
+                    task_type="full_scan_comments",
+                    scope_type="post_comments",
+                    fid=fid,
+                    fname=fname,
+                    tid=task.tid,
+                    parent_pid=first_pid,
+                    parent_kind="first_post",
+                    backfill=task.backfill,
+                    rn=task.rn,
+                    parent_logical_task_key=logical_key,
+                    parent_generation=task.generation,
+                    session=session,
+                )
+                if child is None:
+                    raise PageIntegrityError(
+                        f"Parent generation changed while registering first-post comments for tid={task.tid}."
+                    )
+                if child.status != "completed":
+                    await self.datastore.add_pending_comment_scan_in_session(
+                        session,
+                        task.tid,
+                        first_pid,
+                        fid=fid,
+                        fname=fname,
+                        backfill=task.backfill,
+                    )
+                    child_tasks.append(
+                        FullScanCommentsTask(
+                            tid=task.tid,
+                            pid=first_pid,
+                            backfill=task.backfill,
+                            parent_kind="first_post",
+                            run_id=run_id,
+                            generation=child.generation,
+                            parent_generation=task.generation,
+                            fid=fid,
+                            fname=fname,
+                            rn=task.rn,
+                        )
+                    )
+
+            has_more = page.page.has_more
+            scope_status = "running" if has_more else "completed"
+            continuation = self._continuation_from_page(
+                [post.pid for post in page.objs], cursor, has_more=has_more
+            )
+            committed = await self.datastore.record_research_checkpoint(
+                run_id=run_id,
+                task_key=research_posts_task_key(task.tid, task.generation),
+                page_number=page_number,
+                task_type="full_scan_posts",
+                scope_type="thread_replies",
+                tid=task.tid,
+                fid=task.fid or page.forum.fid,
+                fname=task.fname or page.forum.fname,
+                status="completed",
+                scope_status=scope_status,
+                attempts=attempts,
+                has_more=has_more,
+                next_page=page_number + 1 if has_more else None,
+                total_pages=page.page.total_page,
+                reported_count=page.page.total_count,
+                reported_count_missing_reason=(
+                    "not_provided_by_aiotieba_posts_page" if page.page.total_count == 0 else None
+                ),
+                page_item_count=len(page.objs),
+                continuation_json=continuation,
+                generation=task.generation,
+                session=session,
+            )
+            if not committed:
+                return False, []
+            if not has_more:
+                await self.datastore.remove_pending_thread_scan_in_session(session, task.tid)
+
+        if not task.backfill:
+            for post in posts:
+                await self.datastore.push_object_event("post", post)
+        for child_task in child_tasks:
+            await self.router.put(Task(priority=parent_priority, content=child_task))
+        return True, child_tasks
+
     async def handle(self, task_content: FullScanPostsTask):
         """处理扫描单个主题贴内容的任务。
 
@@ -425,20 +1178,47 @@ class FullScanPostsTaskHandler(TaskHandler):
         """
         tid = task_content.tid
         rn = task_content.rn
-        pn = 1
+        pn = task_content.start_page
         backfill = task_content.backfill
+        run_id = task_content.run_id or getattr(self.container, "research_run_id", None)
+        generation = task_content.generation
+        logical_key = research_posts_task_key(tid)
+        task_key = research_posts_task_key(tid, generation)
+        cursor: dict[str, object] = {}
+        scope_managed = run_id is not None and hasattr(self.datastore, "get_research_task_scope_state")
 
-        lock_key = f"tieba:scrapper:lock:tid:{tid}"
+        if scope_managed:
+            current_scope = await self.datastore.get_research_task_scope_state(run_id, logical_key)
+            if current_scope is None or current_scope[0] != generation:
+                return
+            if current_scope[1] == "completed":
+                await self._finalize_thread(tid, run_id=run_id, generation=generation)
+                return
+
+        if run_id and hasattr(self.datastore, "get_research_resume_state"):
+            resume_page, _scope_status, saved_cursor = await self.datastore.get_research_resume_state(run_id, task_key)
+            if resume_page is None:
+                if not scope_managed or current_scope[1] == "completed":
+                    await self._finalize_thread(tid, run_id=run_id if scope_managed else None, generation=generation)
+                    return
+                pn = 1
+            else:
+                pn = resume_page
+                cursor = saved_cursor or {}
+
+        lock_key = (
+            f"tieba:scrapper:lock:run:{run_id}:thread_replies:{tid}:g{generation}"
+            if scope_managed
+            else f"tieba:scrapper:lock:tid:{tid}"
+        )
 
         if not await self.try_acquire_lock(lock_key):
             self.log.debug("Could not acquire lock for tid={}. Another task may be processing it. Skipping.", tid)
             return
 
-        processed_num = 0
-
         try:
             while True:
-                page = await self.get_posts(
+                fetched = await self.get_posts(
                     tid,
                     pn,
                     rn=rn,
@@ -446,46 +1226,128 @@ class FullScanPostsTaskHandler(TaskHandler):
                     comment_sort_by_agree=False,
                     comment_rn=10,
                 )
+                page = self._dto(fetched.response)
 
-                if not page or not page.objs:
-                    self.log.debug("No posts found for tid={}, pn={}. Task finished.", tid, pn)
+                self._validate_terminal_metadata("post detail", pn, page.page.has_more, page.page.total_page)
+                if not page.objs:
+                    if self.research_enabled or not self._is_confirmed_empty(page.page, pn):
+                        raise PageIntegrityError(f"Unexpected empty post page for tid={tid} pn={pn}.")
+                    cursor = self._continuation_from_page([], cursor, has_more=False)
+                    if scope_managed:
+                        committed, _children = await self._commit_research_posts_page(
+                            task_content,
+                            page,
+                            fetched.response,
+                            page_number=pn,
+                            cursor=cursor,
+                            attempts=fetched.attempts,
+                        )
+                        if not committed:
+                            return
+                    else:
+                        await self._persist_research_page(fetched.response)
+                        await self._record_research_checkpoint(
+                            run_id=run_id,
+                            task_key=task_key,
+                            page_number=pn,
+                            task_type="full_scan_posts",
+                            scope_type="thread_replies",
+                            tid=tid,
+                            status="completed",
+                            scope_status="completed",
+                            attempts=fetched.attempts,
+                            has_more=False,
+                            total_pages=page.page.total_page,
+                            reported_count=page.page.total_count,
+                            reported_count_missing_reason=(
+                                "not_provided_by_aiotieba_posts_page" if page.page.total_count == 0 else None
+                            ),
+                            page_item_count=0,
+                            continuation_json=cursor,
+                        )
                     break
 
-                await self._process_posts_on_page(tid, page, backfill)
-                processed_num += len(page.objs)
+                self._validate_repeated_page(
+                    [post.pid for post in page.objs],
+                    cursor,
+                    has_more=page.page.has_more,
+                    scope=f"posts tid={tid}",
+                )
+                cursor = self._continuation_from_page(
+                    [post.pid for post in page.objs], cursor, has_more=page.page.has_more
+                )
+                if scope_managed:
+                    committed, _children = await self._commit_research_posts_page(
+                        task_content,
+                        page,
+                        fetched.response,
+                        page_number=pn,
+                        cursor=cursor,
+                        attempts=fetched.attempts,
+                    )
+                    if not committed:
+                        return
+                else:
+                    await self._persist_research_page(fetched.response)
+                    await self._process_posts_on_page(tid, page, backfill, research_response=fetched.response)
+                    await self._record_research_checkpoint(
+                        run_id=run_id,
+                        task_key=task_key,
+                        page_number=pn,
+                        task_type="full_scan_posts",
+                        scope_type="thread_replies",
+                        tid=tid,
+                        status="completed",
+                        scope_status="running" if page.page.has_more else "completed",
+                        attempts=fetched.attempts,
+                        has_more=page.page.has_more,
+                        next_page=pn + 1 if page.page.has_more else None,
+                        total_pages=page.page.total_page,
+                        reported_count=page.page.total_count,
+                        reported_count_missing_reason=(
+                            "not_provided_by_aiotieba_posts_page" if page.page.total_count == 0 else None
+                        ),
+                        page_item_count=len(page.objs),
+                        continuation_json=cursor,
+                    )
 
                 if not page.page.has_more:
                     self.log.debug("All pages processed for tid={}. Task finished.", tid)
                     break
-
-                if processed_num >= self.batch_size:
-                    await asyncio.sleep(0)
-                    processed_num = 0
-
                 pn += 1
 
             # 任务完成后：移除 pending_scan 标记
-            await self._finalize_thread(tid)
+            await self._finalize_thread(tid, run_id=run_id if scope_managed else None, generation=generation)
 
-        except UnretriableApiError as e:
-            if e.code == 4:
-                self.log.warning(
-                    "Thread tid={} may have been deleted (err_code=4). Clearing pending_scan marker and skipping.", tid
-                )
-                await self._finalize_thread(tid)
-            else:
-                self.log.exception("Failed to process ScanThreadTask for tid={}: {}", tid, e)
         except Exception as e:
-            self.log.exception("Failed to process ScanThreadTask for tid={}: {}", tid, e)
+            await self._record_detail_failure(
+                run_id=run_id,
+                task_key=task_key,
+                page_number=pn,
+                task_type="full_scan_posts",
+                scope_type="thread_replies",
+                tid=tid,
+                error=e,
+                continuation_json=cursor,
+                generation=generation if scope_managed else None,
+            )
+            self.log.error("Failed to process post pages for tid={} pn={} error={}", tid, pn, type(e).__name__)
         finally:
             await self.release_lock(lock_key)
 
-    async def _finalize_thread(self, tid: int) -> None:
+    async def _finalize_thread(
+        self, tid: int, *, run_id: str | None = None, generation: int | None = None
+    ) -> None:
         """移除 pending_scan 标记，表示该 thread 的全量扫描已完成。"""
-        await self.datastore.remove_pending_thread_scan(tid)
+        if run_id is None or generation is None:
+            await self.datastore.remove_pending_thread_scan(tid)
+        else:
+            await self.datastore.remove_pending_thread_scan(tid, run_id=run_id, generation=generation)
         self.log.debug("Removed pending_scan marker for tid={}.", tid)
 
-    async def _process_posts_on_page(self, tid: int, posts_page: PostsDTO, backfill: bool):
+    async def _process_posts_on_page(
+        self, tid: int, posts_page: PostsDTO, backfill: bool, *, research_response: Any = None
+    ):
         """处理单个页面上的所有回复。
 
         主要流程：
@@ -517,7 +1379,7 @@ class FullScanPostsTaskHandler(TaskHandler):
             comment_models = [Comment.from_dto(c) for c in post.comments]
             await self.datastore.save_items(comment_models)
 
-            if post.reply_num > 10 or len(post.comments) != post.reply_num:
+            if self.research_enabled or post.reply_num > 10 or len(post.comments) != post.reply_num:
                 await self.datastore.add_pending_comment_scan(
                     tid=tid,
                     pid=post.pid,
@@ -526,9 +1388,57 @@ class FullScanPostsTaskHandler(TaskHandler):
                     backfill=backfill,
                     task_kind="full",
                 )
-                comment_task = FullScanCommentsTask(tid=tid, pid=post.pid, backfill=backfill)
+                comment_task = FullScanCommentsTask(
+                    tid=tid,
+                    pid=post.pid,
+                    backfill=backfill,
+                    parent_kind="reply_post",
+                )
                 await self.router.put(Task(priority=priority, content=comment_task))
                 self.log.info("[{}吧] Scheduled FullScanCommentsTask for pid={} in tid={}", post.fname, post.pid, tid)
+
+        raw_thread = getattr(getattr(research_response, "raw", None), "thread", None)
+        try:
+            first_pid = int(getattr(raw_thread, "pid", 0) or 0)
+        except (TypeError, ValueError):
+            first_pid = 0
+        if first_pid <= 0:
+            first_floor = next((post for post in posts_page.objs if post.tid == tid and post.floor == 1), None)
+            try:
+                first_pid = int(getattr(first_floor, "pid", 0) or 0)
+            except (TypeError, ValueError):
+                first_pid = 0
+        if first_pid <= 0 and self.research_enabled and hasattr(self.datastore, "get_research_first_post_pids"):
+            stored_first_pids = await self.datastore.get_research_first_post_pids(tid)
+            if len(stored_first_pids) == 1:
+                first_pid = next(iter(stored_first_pids))
+        if self.research_enabled and first_pid > 0:
+            fid = int(getattr(raw_thread, "fid", 0) or 0)
+            fname = str(getattr(raw_thread, "fname", "") or "")
+            if fid <= 0 and posts_page.forum.fid > 0:
+                fid = posts_page.forum.fid
+            if not fname:
+                fname = posts_page.forum.fname
+            if fid > 0 and fname:
+                await self.datastore.add_pending_comment_scan(
+                    tid=tid,
+                    pid=first_pid,
+                    fid=fid,
+                    fname=fname,
+                    backfill=backfill,
+                    task_kind="full",
+                )
+                await self.router.put(
+                    Task(
+                        priority=priority,
+                        content=FullScanCommentsTask(
+                            tid=tid,
+                            pid=first_pid,
+                            backfill=backfill,
+                            parent_kind="first_post",
+                        ),
+                    )
+                )
 
 
 class IncrementalScanPostsTaskHandler(TaskHandler):
@@ -562,7 +1472,7 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
             return
 
         try:
-            latest_page = await self.get_posts(
+            latest_fetched = await self.get_posts(
                 tid,
                 pn=0xFFFF,
                 rn=rn,
@@ -571,6 +1481,8 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                 comment_sort_by_agree=False,
                 comment_rn=10,
             )
+            latest_page = self._dto(latest_fetched.response)
+            await self._persist_research_page(latest_fetched.response)
 
             if not latest_page or not latest_page.objs:
                 self.log.debug("No posts found for tid={}. Task finished.", tid)
@@ -660,7 +1572,7 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
             if pn == start_pn and initial_page_data:
                 posts_page = initial_page_data
             else:
-                posts_page = await self.get_posts(
+                fetched = await self.get_posts(
                     tid,
                     pn,
                     rn=rn,
@@ -668,6 +1580,8 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                     comment_sort_by_agree=False,
                     comment_rn=10,
                 )
+                posts_page = self._dto(fetched.response)
+                await self._persist_research_page(fetched.response)
 
             if not posts_page or not posts_page.objs:
                 self.log.warning("No posts found on tid={}, pn={}. Skipping page.", tid, pn)
@@ -683,7 +1597,7 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                 break
 
         if not found_new_content:
-            hot_page = await self.get_posts(
+            hot_fetched = await self.get_posts(
                 tid,
                 pn=1,
                 rn=rn,
@@ -692,6 +1606,8 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                 comment_sort_by_agree=False,
                 comment_rn=10,
             )
+            hot_page = self._dto(hot_fetched.response)
+            await self._persist_research_page(hot_fetched.response)
 
             if hot_page and hot_page.objs:
                 self.log.debug("Hot posts for tid={} found on page 1. Processing hot posts.", tid)
@@ -798,7 +1714,7 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                 await self.datastore.push_object_event("post", post)
                 self.log.debug("Pushed new post pid={} to ID queue or object stream.", post.pid)
 
-            if post.reply_num > 10 or len(post.comments) != post.reply_num:
+            if self.research_enabled or post.reply_num > 10 or len(post.comments) != post.reply_num:
                 await self.datastore.add_pending_comment_scan(
                     tid=post.tid,
                     pid=post.pid,
@@ -807,7 +1723,12 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                     backfill=backfill,
                     task_kind="full",
                 )
-                comment_task = FullScanCommentsTask(tid=post.tid, pid=post.pid, backfill=backfill)
+                comment_task = FullScanCommentsTask(
+                    tid=post.tid,
+                    pid=post.pid,
+                    backfill=backfill,
+                    parent_kind="reply_post",
+                )
                 await self.router.put(Task(priority=priority, content=comment_task))
                 self.log.info(
                     "[{}吧] Scheduled FullScanCommentsTask for new pid={} in tid={}",
@@ -859,13 +1780,24 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                     fid=post_data.fid,
                     fname=post_data.fname,
                     backfill=backfill,
-                    task_kind="incremental",
+                    task_kind="full" if self.research_enabled else "incremental",
+                    refresh_research_run_id=(
+                        getattr(self.container, "research_run_id", None) if self.research_enabled else None
+                    ),
                 )
-                update_task_content = IncrementalScanCommentsTask(
-                    tid=post_data.tid,
-                    pid=post_data.pid,
-                    backfill=backfill,
-                )
+                if self.research_enabled:
+                    update_task_content = FullScanCommentsTask(
+                        tid=post_data.tid,
+                        pid=post_data.pid,
+                        backfill=backfill,
+                        parent_kind="reply_post",
+                    )
+                else:
+                    update_task_content = IncrementalScanCommentsTask(
+                        tid=post_data.tid,
+                        pid=post_data.pid,
+                        backfill=backfill,
+                    )
                 await self.router.put(Task(priority=priority, content=update_task_content))
                 self.log.info(
                     "[{}吧] Scheduled IncrementalScanCommentsTask for updated pid={}",
@@ -918,53 +1850,289 @@ class FullScanCommentsTaskHandler(TaskHandler):
     负责处理ScanCommentsTask类型的任务，全量扫描指定回复下的所有楼中楼。
     """
 
+    async def _commit_research_comments_page(
+        self,
+        task: FullScanCommentsTask,
+        page: CommentsDTO,
+        response: Any,
+        *,
+        page_number: int,
+        cursor: dict[str, object],
+        attempts: int,
+    ) -> bool:
+        from ..research.persistence import persist_research_page
+
+        run_id = task.run_id or getattr(self.container, "research_run_id", None)
+        parent_logical_key = research_posts_task_key(task.tid)
+        logical_key = research_comments_task_key(task.tid, task.pid)
+        await self.ensure_users(page.objs)
+        await self._prepare_research_page(response)
+
+        async with self.datastore.async_sessionmaker() as session, session.begin():
+            parent = await self.datastore.get_research_task_scope_for_update(
+                session, run_id, parent_logical_key
+            )
+            if parent is None or (
+                task.parent_generation is not None and parent.generation != task.parent_generation
+            ):
+                return False
+            scope = await self.datastore.get_research_task_scope_for_update(session, run_id, logical_key)
+            if (
+                scope is None
+                or scope.generation != task.generation
+                or scope.parent_generation != parent.generation
+            ):
+                return False
+
+            await persist_research_page(self.datastore.async_sessionmaker, response, session=session)
+            await self.datastore.save_items_in_session(
+                session,
+                [Comment.from_dto(comment) for comment in page.objs],
+            )
+            has_more = page.page.has_more
+            scope_status = "running" if has_more else "completed"
+            continuation = self._continuation_from_page(
+                [comment.cid for comment in page.objs], cursor, has_more=has_more
+            )
+            committed = await self.datastore.record_research_checkpoint(
+                run_id=run_id,
+                task_key=research_comments_task_key(task.tid, task.pid, task.generation),
+                page_number=page_number,
+                task_type="full_scan_comments",
+                scope_type="post_comments",
+                tid=task.tid,
+                parent_pid=task.pid,
+                parent_kind=task.parent_kind,
+                fid=task.fid or page.forum.fid,
+                fname=task.fname or page.forum.fname,
+                status="completed",
+                scope_status=scope_status,
+                attempts=attempts,
+                has_more=has_more,
+                next_page=page_number + 1 if has_more else None,
+                total_pages=page.page.total_page,
+                reported_count=page.page.total_count,
+                reported_count_missing_reason=(
+                    "zero_presence_unverified_in_parsed_object" if page.page.total_count == 0 else None
+                ),
+                page_item_count=len(page.objs),
+                continuation_json=continuation,
+                generation=task.generation,
+                session=session,
+            )
+            if committed and not has_more:
+                await self.datastore.remove_pending_comment_scan_in_session(
+                    session, task.tid, task.pid, task_kind="full"
+                )
+            return committed
+
     async def handle(self, task_content: FullScanCommentsTask):
-        """处理扫描单个回复下的楼中楼的任务。
-
-        主要流程：
-        1. 获取楼中楼的第一页数据以确定总页数
-        2. 逐页扫描直至所有楼中楼都被处理完毕
-
-        Args:
-            task_content: ScanPostCommentsTask实例，包含帖子ID和回复ID。
-        """
         tid = task_content.tid
         pid = task_content.pid
         backfill = task_content.backfill
+        parent_kind = task_content.parent_kind
+        run_id = task_content.run_id or getattr(self.container, "research_run_id", None)
+        generation = task_content.generation
+        logical_key = research_comments_task_key(tid, pid)
+        task_key = research_comments_task_key(tid, pid, generation)
+        pn = task_content.start_page
+        cursor: dict[str, object] = {}
+        scope_managed = run_id is not None and hasattr(self.datastore, "get_research_task_scope_state")
+
+        if self.research_enabled and parent_kind is None and hasattr(self.datastore, "get_research_first_post_pids"):
+            first_post_pids = await self.datastore.get_research_first_post_pids(tid)
+            parent_kind = "first_post" if pid in first_post_pids else "reply_post"
+        task_content = dataclasses.replace(task_content, parent_kind=parent_kind)
+        if scope_managed:
+            current_scope = await self.datastore.get_research_task_scope_state(run_id, logical_key)
+            parent_scope = await self.datastore.get_research_task_scope_state(
+                run_id, research_posts_task_key(tid)
+            )
+            if (
+                current_scope is None
+                or current_scope[0] != generation
+                or parent_scope is None
+                or current_scope[2] != parent_scope[0]
+                or (task_content.parent_generation is not None and task_content.parent_generation != parent_scope[0])
+            ):
+                return
+            task_content = dataclasses.replace(task_content, parent_generation=parent_scope[0])
+            if current_scope[1] == "completed":
+                await self._finalize_comment_scan(tid, pid, run_id=run_id, generation=generation)
+                return
+        if run_id and hasattr(self.datastore, "get_research_resume_state"):
+            resume_page, _scope_status, saved_cursor = await self.datastore.get_research_resume_state(run_id, task_key)
+            if resume_page is None:
+                if not scope_managed or current_scope[1] == "completed":
+                    await self._finalize_comment_scan(
+                        tid,
+                        pid,
+                        run_id=run_id if scope_managed else None,
+                        generation=generation if scope_managed else None,
+                    )
+                    return
+                pn = 1
+            else:
+                pn = resume_page
+                cursor = saved_cursor or {}
+
+        lock_key = (
+            f"tieba:scrapper:lock:run:{run_id}:{logical_key}:g{generation}:pg{task_content.parent_generation}"
+            if scope_managed
+            else f"tieba:scrapper:lock:pid:{tid}:{pid}"
+        )
+        if not await self.try_acquire_lock(lock_key):
+            return
 
         try:
-            initial_page_data = await self.get_comments(tid, pid, pn=1)
-
-            if not initial_page_data or not initial_page_data.objs:
-                await self._finalize_comment_scan(tid, pid)
-
-                self.log.debug("Post pid={} in tid={} has no comments or has been deleted. Task finished.", pid, tid)
-                return
-
-            self.log.debug(
-                "Scanning comments for pid={}, tid={}. Total pages: {}.", pid, tid, initial_page_data.page.total_page
-            )
-
-            await self._scan_comment_pages(tid, pid, initial_page_data, backfill)
-
-            await self._finalize_comment_scan(tid, pid)
-            self.log.debug("Finished comment scan for pid={} in tid={}.", pid, tid)
-        except UnretriableApiError as e:
-            if e.code == 4:
-                self.log.warning(
-                    "Post pid={} or thread tid={} may have been deleted (err_code=4). Stopping comment scan.",
-                    pid,
-                    tid,
+            while True:
+                fetched = await self.get_comments(tid, pid, pn)
+                page = self._dto(fetched.response)
+                self._validate_terminal_metadata(
+                    "comment detail", pn, page.page.has_more, page.page.total_page
                 )
-                await self._finalize_comment_scan(tid, pid)
-            else:
-                self.log.exception("Failed to process ScanPostCommentsTask for pid={}, tid={}: {}", pid, tid, e)
-        except Exception as e:
-            self.log.exception("Failed to process ScanPostCommentsTask for pid={}, tid={}: {}", pid, tid, e)
 
-    async def _finalize_comment_scan(self, tid: int, pid: int) -> None:
+                if not page.objs:
+                    if not self._is_confirmed_empty(page.page, pn):
+                        raise PageIntegrityError(f"Unexpected empty comment page for tid={tid} pid={pid} pn={pn}.")
+                    if scope_managed:
+                        committed = await self._commit_research_comments_page(
+                            task_content,
+                            page,
+                            fetched.response,
+                            page_number=pn,
+                            cursor={},
+                            attempts=fetched.attempts,
+                        )
+                        if not committed:
+                            return
+                    else:
+                        await self._persist_research_page(fetched.response)
+                        await self._record_research_checkpoint(
+                            run_id=run_id,
+                            task_key=task_key,
+                            page_number=pn,
+                            task_type="full_scan_comments",
+                            scope_type="post_comments",
+                            tid=tid,
+                            parent_pid=pid,
+                            parent_kind=parent_kind,
+                            fid=page.forum.fid,
+                            status="completed",
+                            scope_status="completed",
+                            attempts=fetched.attempts,
+                            has_more=False,
+                            total_pages=page.page.total_page,
+                            reported_count=page.page.total_count,
+                            reported_count_missing_reason=(
+                                "zero_presence_unverified_in_parsed_object" if page.page.total_count == 0 else None
+                            ),
+                            page_item_count=0,
+                            continuation_json={},
+                        )
+                    break
+
+                self._validate_repeated_page(
+                    [comment.cid for comment in page.objs],
+                    cursor,
+                    has_more=page.page.has_more,
+                    scope=f"comments tid={tid} parent_pid={pid}",
+                )
+                cursor = self._continuation_from_page(
+                    [comment.cid for comment in page.objs], cursor, has_more=page.page.has_more
+                )
+                if scope_managed:
+                    committed = await self._commit_research_comments_page(
+                        task_content,
+                        page,
+                        fetched.response,
+                        page_number=pn,
+                        cursor=cursor,
+                        attempts=fetched.attempts,
+                    )
+                    if not committed:
+                        return
+                else:
+                    await self._persist_research_page(fetched.response)
+                    await self._process_comments_on_page(pid, pn, page, backfill)
+                    await self._record_research_checkpoint(
+                        run_id=run_id,
+                        task_key=task_key,
+                        page_number=pn,
+                        task_type="full_scan_comments",
+                        scope_type="post_comments",
+                        tid=tid,
+                        parent_pid=pid,
+                        parent_kind=parent_kind,
+                        fid=page.forum.fid,
+                        status="completed",
+                        scope_status="running" if page.page.has_more else "completed",
+                        attempts=fetched.attempts,
+                        has_more=page.page.has_more,
+                        next_page=pn + 1 if page.page.has_more else None,
+                        total_pages=page.page.total_page,
+                        reported_count=page.page.total_count,
+                        reported_count_missing_reason=(
+                            "zero_presence_unverified_in_parsed_object" if page.page.total_count == 0 else None
+                        ),
+                        page_item_count=len(page.objs),
+                        continuation_json=cursor,
+                    )
+                if not page.page.has_more:
+                    break
+                pn += 1
+                if pn % 5 == 0:
+                    await asyncio.sleep(0)
+
+            await self._finalize_comment_scan(
+                tid,
+                pid,
+                run_id=run_id if scope_managed else None,
+                generation=generation,
+            )
+            self.log.debug("Finished comment scan for pid={} in tid={}.", pid, tid)
+        except Exception as e:
+            await self._record_detail_failure(
+                run_id=run_id,
+                task_key=task_key,
+                page_number=pn,
+                task_type="full_scan_comments",
+                scope_type="post_comments",
+                tid=tid,
+                parent_pid=pid,
+                parent_kind=parent_kind,
+                error=e,
+                continuation_json=cursor,
+                generation=generation if scope_managed else None,
+            )
+            self.log.error(
+                "Failed to process comment pages for tid={} parent_pid={} pn={} error={}",
+                tid,
+                pid,
+                pn,
+                type(e).__name__,
+            )
+        finally:
+            await self.release_lock(lock_key)
+
+    async def _finalize_comment_scan(
+        self,
+        tid: int,
+        pid: int,
+        *,
+        run_id: str | None = None,
+        generation: int | None = None,
+    ) -> None:
         """移除 pending_comment_scan 标记，表示该评论扫描任务已完成。"""
-        await self.datastore.remove_pending_comment_scan(tid, pid)
+        if run_id is None or generation is None:
+            await self.datastore.remove_pending_comment_scan(tid, pid)
+        else:
+            await self.datastore.remove_pending_comment_scan(
+                tid,
+                pid,
+                run_id=run_id,
+                generation=generation,
+            )
         self.log.debug("Removed pending_comment_scan marker for tid={}, pid={}", tid, pid)
 
     async def _scan_comment_pages(self, tid: int, pid: int, initial_page_data: CommentsDTO, backfill: bool):
@@ -1058,7 +2226,9 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
         backfill = task_content.backfill
 
         try:
-            comments_page = await self.get_comments(tid, pid)
+            comments_fetched = await self.get_comments(tid, pid)
+            comments_page = self._dto(comments_fetched.response)
+            await self._persist_research_page(comments_fetched.response)
 
             if not comments_page or not comments_page.objs:
                 self.log.debug("No comments found for pid={} in tid={}. Task finished.", pid, tid)
@@ -1111,7 +2281,9 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
             if pn == 1:
                 comments_page = initial_page_data
             else:
-                comments_page = await self.get_comments(tid, pid, pn)
+                fetched = await self.get_comments(tid, pid, pn)
+                comments_page = self._dto(fetched.response)
+                await self._persist_research_page(fetched.response)
 
             if not comments_page or not comments_page.objs:
                 self.log.warning("No comments found on pid={}, pn={}. Stopping scan.", pid, pn)
@@ -1251,7 +2423,7 @@ class DeepScanTaskHandler(TaskHandler):
         for pn in pages:
             self.log.debug("DeepScan: Scanning tid={}, pn={}.", tid, pn)
 
-            posts_page = await self.get_posts(
+            fetched = await self.get_posts(
                 tid,
                 pn,
                 rn=30,
@@ -1259,6 +2431,8 @@ class DeepScanTaskHandler(TaskHandler):
                 comment_sort_by_agree=False,
                 comment_rn=10,
             )
+            posts_page = self._dto(fetched.response)
+            await self._persist_research_page(fetched.response)
 
             if not posts_page or not posts_page.objs:
                 self.log.warning("DeepScan: No posts found on tid={}, pn={}.", tid, pn)
@@ -1319,20 +2493,28 @@ class DeepScanTaskHandler(TaskHandler):
                     post.reply_num,
                 )
 
-                if post.reply_num > 10 or len(post.comments) != post.reply_num:
+                if self.research_enabled or post.reply_num > 10 or len(post.comments) != post.reply_num:
                     await self.datastore.add_pending_comment_scan(
                         tid=post.tid,
                         pid=post.pid,
                         fid=post.fid,
                         fname=post.fname,
                         backfill=False,
-                        task_kind="incremental",
+                        task_kind="full" if self.research_enabled else "incremental",
                     )
-                    update_task = IncrementalScanCommentsTask(
-                        tid=post.tid,
-                        pid=post.pid,
-                        backfill=False,
-                    )
+                    if self.research_enabled:
+                        update_task = FullScanCommentsTask(
+                            tid=post.tid,
+                            pid=post.pid,
+                            backfill=False,
+                            parent_kind="reply_post",
+                        )
+                    else:
+                        update_task = IncrementalScanCommentsTask(
+                            tid=post.tid,
+                            pid=post.pid,
+                            backfill=False,
+                        )
                     await self.router.put(Task(priority=Priority.MEDIUM, content=update_task))
                     self.log.info(
                         "DeepScan: Scheduled IncrementalScanCommentsTask for pid={} in tid={}.",
