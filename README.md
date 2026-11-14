@@ -1,273 +1,210 @@
-<div align="center">
+# tieba-research-crawler
 
-# TiebaScraper
+本项目从 [TiebaMeow/TiebaScraper](https://github.com/TiebaMeow/TiebaScraper) 延伸，使用 `aiotieba` 访问贴吧接口，并保留上游历史与 [MIT 许可](LICENSE)中的版权声明。项目面向本机研究采集，保存原始用户 ID、昵称和帖子内容，不做匿名化。
 
-_基于 [aiotieba](https://github.com/lumina37/aiotieba) 的高性能百度贴吧异步爬虫工具，支持实时监控和历史数据回溯。_
+> **当前状态（2026-11-14）**：研究扩展已推送，合成回归、专用 PostgreSQL scope 竞态和独立审查通过。有限真实主题/楼中楼样本、主入口列表 checkpoint 的 SIGINT/同 run 恢复，以及七类 CSV/manifest 的三次真实导出已验证；这不代表完整详情队列或全吧采集完成。超过 10 页运行和备份恢复仍待验收。
 
-</div>
+## 采集范围和隐私
 
-## 功能特性
+- 主题、首楼、一级回复、楼中楼、作者资料、媒体引用和页级检查点保存在配置的本机 PostgreSQL。
+- 帖子和用户 ID、昵称及正文按接口原值保存。CSV 也会保留这些内容；只应在本机查看和备份。
+- 公开 GitHub 仓库用于源码、非敏感配置模板和文档。不要提交数据库、CSV、日志、截图、Cookie、BDUSS、`config.toml` 或 `.env`。
+- 可选登录只在启用吧内资料补充时使用，默认关闭。登录值只保存在本机忽略的凭据文件；不要把凭据贴进聊天、Issue、命令参数或 IDE 配置。
+- 字段来源、样本边界和未证实语义见[字段来源审计](docs/FIELD_SOURCE_AUDIT.md)。架构说明见[数据与运行架构](docs/ARCHITECTURE.md)。
 
-- **三种运行模式可选**：
-  - **实时监控模式**: 持续监控指定贴吧首页的最新内容
-  - **历史数据回溯模式**: 抓取指定贴吧的历史数据
-  - **混合模式**: 同时运行实时监控和历史数据回溯
-- **高性能、高可靠**：
-  - 基于 asyncio/uvloop 的全异步架构
-  - 同时支持速率限制和并发控制
-  - 内置重试与防 429 雪崩保护机制
-  - 支持 PostgreSQL 数据库分区存储
-  - 支持使用 Redis 进行缓存优化
-- **可扩展性**：
-  - 合理的表结构设计，支持高效存储与查询大量数据
-  - 通过 WebSocket/Redis 支持高度可自定义的实时内容审查
-  - 实时监控模式支持动态添加或删除监控的贴吧
-  - 支持通过 Prometheus 监控爬虫相关指标
-  - 与 TiebaMeow 工具集无缝集成
+## 本机环境
 
-## 环境要求
+需要 Python 3.12 或更新版本、[uv](https://docs.astral.sh/uv/) 和一套可连接的 PostgreSQL。项目不要求购买 API、云数据库或云服务器；程序直接连接本机 PostgreSQL。默认 `consumer.transport = "none"`、`cache.backend = "memory"`，不需要 Docker、Redis、TimescaleDB 或额外云服务。访问贴吧需要本机网络能够连接其公开接口。
 
-- [uv](https://docs.astral.sh/uv/)
-- [PostgreSQL](https://www.postgresql.org/) 14+
-- （可选）[TimescaleDB](https://github.com/timescale/timescaledb)
-- （可选）[Redis](https://redis.io/) 6.0+
+### 安装 PostgreSQL 并创建数据库
 
-## 安装依赖
+从 [PostgreSQL 官方下载页](https://www.postgresql.org/download/)选择适合操作系统的原生安装方式，启动本机 PostgreSQL 服务。之后在终端创建项目数据库；将用户名替换为本机已有的数据库角色：
 
-```shell
+```sh
+createdb -W -h localhost -p 5432 -U YOUR_POSTGRES_USER tieba_data
+```
+
+`-W` 会在终端提示数据库密码。不要把密码写到命令行或提交到仓库。
+
+### 安装项目
+
+```sh
+git clone https://github.com/efjuemie/tieba-research-crawler.git
+cd tieba-research-crawler
 uv sync
+cp config.example.toml config.toml
 ```
 
-`uv` 会自动下载合适的 Python 版本并安装所有依赖。对于 Linux 系统，将自动同时安装并在运行时尝试使用 `uvloop`。
+Windows PowerShell 复制配置：
 
-## 参数配置
+```powershell
+Copy-Item config.example.toml config.toml
+```
 
-1. 复制配置文件模板
+编辑本机 `config.toml`：
 
-   ```bash
-   # Linux / macOS
-   cp config.example.toml config.toml
-   # Windows (PowerShell)
-   Copy-Item config.example.toml config.toml
-   ```
+- 在 `[tieba]` 的 `forums` 中填要采集的贴吧名，格式不要带末尾的“吧”。
+- 在 `[database]` 中填本机 PostgreSQL 的主机、端口、用户名、密码和 `db_name`。把模板里的示例账号密码换成本机设置。
+- 保持 `partition_enabled = false`、`consumer.transport = "none"` 和 `cache.backend = "memory"`，即可使用标准 PostgreSQL 单机运行。
+- `[research] enabled` 默认为 `true`；`fetch_user_forum_info` 默认为 `false`。需要用户吧内快照时再按“登录与用户快照”一节启用。
 
-2. 编辑 `config.toml` 文件，根据注释填写相应的配置项
+首次启动时，程序会创建缺失的基础表和研究扩展表。`create_all` 不会替已有表执行通用的增列迁移。对已有数据库升级前先做本机备份。
 
-3. （可选）使用分组配置，可以为不同的分组设置不同的调度周期
+## 开始采集
 
-4. 为 `TiebaScraper` 创建一个单独的数据库（名称可以自定义）：
+从项目根目录运行历史回溯：
 
-   ```sql
-   CREATE DATABASE tieba_data;
-   ```
+```sh
+uv run python main.py --mode backfill
+```
 
-5. 推荐单独为 `TiebaScraper` 创建一个用户：
+每次不带 `--resume` 都会在数据库建立一个新的研究 run。回溯按主题创建时间从新到旧读取普通主题流和精华流，每条流从第 1 页开始。`[tieba] max_backfill_pages = 0` 表示不设页数上限；设置为正数时，该数限制本次运行每条流读取的页数。
 
-   ```sql
-   CREATE USER your_username WITH PASSWORD 'your_password';
-   GRANT ALL PRIVILEGES ON DATABASE tieba_data TO your_username;
-   \c tieba_data
-   GRANT ALL PRIVILEGES ON SCHEMA public TO your_username;
-   GRANT CREATE ON SCHEMA public TO your_username;
-   ```
+运行 `hybrid` 时会同时启动周期首页监控和一次历史回溯。周期监控按回复时间读取首页；回溯仍使用创建时间排序，并从普通流和精华流各自第 1 页开始。两种列表各有独立调度，不共用页码。
 
-### 数据库分区配置（可选）
+```sh
+uv run python main.py --mode hybrid
+```
 
-如果你的数据量不大（单表量级在百万行以下），可以不启用分区。请注意，我们将爬取到的所有数据存到了 `thread`、`post`、`comment` 三张表中。
+调度器逐页等待工作器确认后再投递下一页，并在贴吧间轮转。线程接口连续返回后续页时，`max_backfill_pages = 0` 会继续翻页，直到接口确认结束或当前流进入暂停/失败状态。
 
-如果你希望对数据进行分区存储，以避免单表数据量过大，可以使用 `TimescaleDB` 扩展来管理 PostgreSQL 数据库中的分区表。
+### 请求频率
 
-首先，请确保配置文件中的 `partition_enabled` 选项设置为 `true`：
+默认 `[rate_limit] global_rps = 0.2`，约每 5 秒最多发出一次研究客户端请求。所有通过本程序 `ResearchClient` 的请求共用这一个预算，包括帖子、回复、评论和可选用户资料查询。`threads_rps`、`posts_rps`、`comments_rps` 还分别限制对应接口；调整单接口值不会提高全局上限。该默认值只是项目本机的限速配置，不代表贴吧官方承诺的安全频率。
+
+### 恢复已有 run
+
+进程启动时会显示数据库中的 `run_id`。同一论坛范围、同一运行模式要继续原 run 时，执行：
+
+```sh
+uv run python main.py --mode backfill --resume
+```
+
+如需精确选择 run：
+
+```sh
+uv run python main.py --mode backfill --resume --run-id YOUR_RUN_ID
+```
+
+`--run-id` 必须和 `--resume` 一起使用。`--resume` 选择当前论坛范围下最新的可恢复 run；没有匹配的 run 时程序会报错，不会自动另开新 run。回溯列表在重启后会重放最近一个已完成的非终止页一次，以应对顶部内容变化；内容行按 ID 幂等更新。检查点记录列表、帖子详情和评论页状态，导出的质量报告会显示未完成、暂停和计数差异。
+
+本机主入口的一次真实演练验证了列表 checkpoint 的 SIGINT/同 run 恢复：已完成的第 1 页会在重启时重放，run 状态保留为 `interrupted`。该结果不验证详情 scope 完成、IDE GUI 停止或长页端到端行为。进程退出码 0 不等于 run 已正常完成；请查看数据库 run 状态与 checkpoint，不要强制结束进程或删除 checkpoint。
+
+## 登录与用户快照
+
+吧内等级、头衔和角色快照来自 `get_user_forum_info`，反映查询时的资料，不代表发帖时的历史状态。默认 `fetch_user_forum_info = false`，不会读账号文件或打开登录页面。
+
+需要采集时，在 `config.toml` 设置：
 
 ```toml
-partition_enabled = true
-```
-
-并根据你的数据量合理设置 p_interval 的值（如 "3 months"），以确保单个分区不会太大。
-
-然后请确保 PostgreSQL 数据库已安装 `TimescaleDB` 扩展。可以参考[官方文档](https://www.tigerdata.com/docs/self-hosted/latest/install)进行安装，推荐直接使用官方 Docker 镜像 `timescale/timescaledb:latest-pg17`。
-
-## 使用方法
-
-### 三种运行模式
-
-你可以在以下三种模式中选择适合你场景的模式运行：
-
-#### 实时监控模式
-
-实时监控模式下，程序将定期扫描指定贴吧的首页，并根据配置将获取到的新内容推送到消费者队列中。
-
-```bash
-uv run main.py
-```
-
-#### 历史数据回溯模式
-
-历史数据回溯模式下，程序将根据用户定义的深度抓取指定贴吧的历史数据。
-
-```bash
-uv run main.py --mode backfill
-```
-
-#### 混合模式
-
-混合模式下，程序将同时运行实时监控和历史数据回溯。混合模式的历史数据回溯任务将从第2页开始抓取。
-
-```bash
-uv run main.py --mode hybrid
-```
-
-### 内容审查
-
-当程序运行在实时监控模式或混合模式时，你可以在 `config.toml` 中配置通过 WebSocket/Redis 将内容推送到审查服务进行处理。你可以在 [examples](./examples) 目录下找到消费者示例和反序列化示例。
-
-开启推送后，程序会推送完整序列化后的对象，你可以直接获得完整数据，并可通过 [tiebameow](https://github.com/TiebaMeow/tiebameow/blob/main/src/tiebameow/serializer/serializer.py) 提供的反序列化函数反序列化得到完整的 `tiebameow` DTO 对象。DTO 对象的定义请参考 [tiebameow/models/dto.py](https://github.com/TiebaMeow/tiebameow/blob/main/src/tiebameow/models/dto.py)。
-
-TiebaMeow 提供了一个基于 NoneBot2 的 QQ 机器人 [TiebaManageBot](https://github.com/TiebaMeow/TiebaManageBot)，你可以使用它提供的无缝集成来快速配置简单的内容审查服务。你也可以使用任何你喜欢的技术栈来实现审查服务，只要它能够连接到 WebSocket/Redis 并处理消息即可。
-
-### Prometheus 监控
-
-`TiebaScraper` 内置了 Prometheus 监控指标，可在配置文件中启用：
-
-```toml
-[metrics]
+[research]
 enabled = true
-port = 8001
+fetch_user_forum_info = true
+account_file = "secrets/baidu-account.json"
 ```
 
-你可以在 [examples](./examples) 目录下找到 Prometheus 和 Grafana 的配置示例。
+若使用浏览器扫码，安装可选依赖并启动独立登录窗口：
 
-### 动态添加/删除贴吧
-
-运行于实时监控模式时，`TiebaScraper` 支持动态添加或删除监控的贴吧。你可以选择通过 WebSocket 连接或 Redis Stream 命令来实现。动态添加的任何贴吧配置都会被自动持久化到 `config.toml` 文件中，确保重启后依然有效。
-
-#### 通过 WebSocket
-
-发送以下 JSON 格式的消息：
-
-- 添加贴吧：
-
-  ```json
-  {
-    "type": "add_forum",
-    "fname": "贴吧名",
-    "group": "分组名（可选）"
-  }
-  ```
-
-- 删除贴吧：
-
-  ```json
-  {
-    "type": "remove_forum",
-    "fname": "贴吧名"
-  }
-  ```
-
-#### 通过 Redis Stream
-
-向配置的请求 Stream（默认 `scraper:tieba:cmd:req`）添加消息。
-
-- **Input**：添加消息字段 `payload`，值为 JSON 字符串。
-
-  ```bash
-  # Redis 命令行示例
-  XADD scraper:tieba:cmd:req * payload '{"id": "req_1", "type": "add_forum", "fname": "原神", "group": "game"}'
-  ```
-
-  - `id`: (可选) 请求 ID，将回传给响应。
-  - `type`: 指令类型。
-  - `fname`: 贴吧名。
-  - `group`: (可选) 分组名。
-
-- **Output**：监听响应 Stream（默认 `scraper:tieba:cmd:res`）。
-
-  ```json
-  {
-    "ref_id": "req_1",
-    "ok": true,
-    "msg": "Added successfully"
-  }
-  ```
-
-如果不指定分组，动态添加的贴吧将会使用全局默认的调度周期运行。
-
-## Docker 部署
-
-### 使用 docker-compose
-
-1. **准备配置文件**:
-
-   复制 Docker 环境配置文件模板：
-
-   ```bash
-   # Linux / macOS
-   cp config.docker.example.toml config.toml
-   # Windows (PowerShell)
-   Copy-Item config.docker.example.toml config.toml
-   ```
-
-   然后，根据你的需求编辑 `config.toml` 文件。**请注意**，在 Docker 环境中，应用容器需要通过服务名（`postgres` 和 `redis`）来访问数据库和 Redis，因此请确保主机名配置正确。`config.docker.example.toml` 已预设了正确的主机名。
-
-   你也可以使用环境变量来传递配置参数，环境变量将会优先于配置文件生效，详情请参考 `.env.example` 中的注释。
-
-2. **启动服务**:
-
-   在项目根目录下运行以下命令：
-
-   ```bash
-   docker compose up -d
-   ```
-
-   该命令会从 Docker Hub 拉取 `tiebameow/tiebascraper` 和 `timescale/timescaledb:latest-pg17` 镜像，并启动应用、PostgreSQL（已预装 `TimescaleDB`）和 Redis 服务。
-
-3. **查看日志**:
-
-   ```bash
-   docker compose logs -f app
-   ```
-
-4. **切换运行模式**:
-
-   默认情况下，应用以 `periodic`（实时监控）模式运行。如果你需要切换模式，可以运行以下命令：
-
-   ```bash
-   docker compose run --rm app --mode backfill
-   ```
-
-5. **停止服务**:
-
-   ```bash
-   docker compose down
-   ```
-
-### 其他注意事项
-
-- 可以根据需要使用已有的 PostgreSQL 和 Redis 实例，修改 `config.toml` 中的连接信息并删除 `docker-compose.yml` 中对应的服务定义即可。
-- 若需外部访问 WebSocket，请在配置中将 `websocket.host` 设置为 `0.0.0.0` 并在 `docker-compose.yml` 中映射端口。
-
-## 项目结构
-
-```text
-.
-├── examples/               # 示例代码（消费者实现等）
-├── src/
-│   ├── core/               # 核心架构模块
-│   │   ├── config.py       # 配置加载与 Pydantic 模型定义
-│   │   ├── container.py    # 依赖注入容器 (IoC)，管理 DB/Redis/Client 生命周期
-│   │   ├── datastore.py    # 数据持久化逻辑 (PostgreSQL/TimescaleDB)
-│   │   ├── initialize.py   # 应用初始化流程
-│   │   ├── metrics.py      # Prometheus 监控指标
-│   │   ├── publisher.py    # 消息推送 (Redis/WebSocket)
-│   │   └── ws_server.py    # WebSocket 服务端实现
-│   ├── scraper/            # 爬虫业务逻辑
-│   │   ├── queue.py        # 任务优先级队列
-│   │   ├── scheduler.py    # 任务调度器 (周期性/回溯模式)
-│   │   ├── tasks.py        # 任务定义 (Task 数据类)
-│   │   └── worker.py       # 任务执行器 (Worker)
-│   └── utils/              # 通用工具函数
-├── tests/                  # 测试用例
-├── config.toml             # 配置文件
-├── main.py                 # 程序入口
-└── pyproject.toml          # 项目依赖与构建配置
+```sh
+uv sync --group login
+uv run playwright install chromium
+uv run python -m src.research login --browser --account-file secrets/baidu-account.json
 ```
+
+在打开的百度官方页面由用户手动扫码。程序使用临时浏览器上下文，不读取本机既有浏览器个人资料。若采集程序因未登录或凭据失效暂停，它会等待本机账号文件更新；登录命令成功保存后，采集程序会验证认证并继续。
+
+不安装浏览器也可以用隐藏输入提示保存 BDUSS 或 Cookie header：
+
+```sh
+uv run python -m src.research login --account-file secrets/baidu-account.json
+```
+
+凭据不会通过命令参数传入，也不会写进日志；默认账号文件权限为仅当前用户可读。不要把 Cookie 或 BDUSS 发给任何人。
+
+## 导出本机 CSV
+
+先暂停采集，再运行导出，避免导出期间数据库内容和质量检查点继续变化：
+
+```sh
+uv run python -m src.research export
+```
+
+默认写入 `exports/` 下一个新的批次目录。每次导出都会生成唯一目录与文件名，文件名前缀含 `all-runs`、导出时间（Asia/Shanghai）和唯一批次 ID；已有批次不会覆盖。目录内包含七个 UTF-8 with BOM CSV：
+
+- `threads`
+- `posts`
+- `comments`
+- `users`
+- `user_forum_snapshots`
+- `media_assets`
+- `crawl_quality_report`
+
+另有一个 manifest，记录文件名、记录数和验证状态，不包含帖子内容、用户 ID 或登录凭据。文件权限为仅当前用户可读写。实体 CSV 导出数据库中的**全部 run**，也会保留没有研究扩展记录的旧基础行，并标记其来源未经研究字段核实。研究扩展中为 `NULL` 的字段保持 `NULL`，不会用旧 ORM 的零值补齐。
+
+可以用 `--output` 指定本机输出根目录：
+
+```sh
+uv run python -m src.research export --output exports
+```
+
+`--run-id` 只筛选 `crawl_quality_report` 中的 checkpoint，并作为批次命名上下文；其余六类实体 CSV 仍导出数据库全部 run。批次名称和 manifest 会标明全库范围，不会把这次导出误称为单 run 数据。
+
+```sh
+uv run python -m src.research export --run-id YOUR_RUN_ID
+```
+
+CSV 保留原始 ID、昵称和正文。实体行数、唯一 ID、回复父子关系和 CSV 行数会在写入后校验；manifest 的实体验证通过不代表平台数据已经完整。没有 checkpoint 时，质量证据状态为 `unknown_not_tested`。
+
+已完成三次真实数据库 CLI 导出。三个批次均生成不同的时间戳加 UUID 目录，旧批次保留且未被覆盖。最终批次的六类实体 CSV 覆盖全数据库，行数与 SQL 查询及 manifest 一致：`threads=89`、`posts=2`、`comments=50`、`users=80`、`user_forum_snapshots=119`、`media_assets=31`；manifest 的 `entity_scope=all_database_rows`、`validation_status=passed`，`crawl_quality_report` 覆盖全部 runs 共 98 行。前两次命令带有 comments run 的 `--run-id`，其质量报告各有 2 行。备份恢复尚未验证。
+
+## VS Code 与 PyCharm
+
+打开项目根目录 `tieba-research-crawler`，选择项目 `.venv` 中的 Python 解释器。VS Code 的共享启动配置、PyCharm 运行配置、数据库连接设置和本机恢复步骤见[本机 IDE 运行指南](docs/IDE_SETUP.md)。该文档说明如何选择回溯、恢复或导出配置；公共 IDE 配置中不要存密码或账号凭据。
+
+## 本机备份与恢复
+
+以下命令把自定义格式的 PostgreSQL 备份放入被 Git 忽略的 `data/` 目录。将用户名和数据库名替换为 `config.toml` 中的值：
+
+```sh
+mkdir -p data/backups
+pg_dump --format=custom --password --host=localhost --port=5432 --username=YOUR_POSTGRES_USER --dbname=tieba_data --file=data/backups/tieba_data.dump
+```
+
+先创建空的恢复目标，再执行恢复：
+
+```sh
+createdb --password --host=localhost --port=5432 --username=YOUR_POSTGRES_USER tieba_data_restore
+pg_restore --password --host=localhost --port=5432 --username=YOUR_POSTGRES_USER --dbname=tieba_data_restore data/backups/tieba_data.dump
+```
+
+命令选项见 PostgreSQL 官方手册：[createdb](https://www.postgresql.org/docs/current/app-createdb.html)、[pg_dump](https://www.postgresql.org/docs/current/app-pgdump.html)、[pg_restore](https://www.postgresql.org/docs/current/app-pgrestore.html)。不要把数据库备份或 CSV 上传到 GitHub。
+
+## 公开仓库的安全检查
+
+`origin` 指向本项目公开仓库，`upstream` 指向 TiebaScraper 上游仓库。提交前先检查文件清单、暂存区与忽略规则：
+
+```sh
+git status --short
+git diff --cached --name-only
+git ls-files
+git check-ignore -v config.toml .env data/backups/tieba_data.dump exports/example/threads.csv logs/example.log references/example.png secrets/baidu-account.json
+git diff --cached --check
+```
+
+忽略规则不会移除已经跟踪的文件，也不能阻止 `git add -f`。只暂存经过确认的路径，不要用 `git add -A`：
+
+```sh
+git add README.md docs/ARCHITECTURE.md docs/DEVELOPMENT_LOG.md docs/FIELD_SOURCE_AUDIT.md
+git diff --cached --name-only
+git diff --cached --check
+```
+
+VS Code 的共享 `.vscode/launch.json` 已由仓库跟踪；不要在其中加入数据库密码或登录资料。用户私有 IDE 配置、数据、数据库、导出、截图和凭据留在本机。
+
+## 项目记录
+
+- [架构与数据边界](docs/ARCHITECTURE.md)
+- [字段来源与验证范围](docs/FIELD_SOURCE_AUDIT.md)
+- [开发阶段记录](docs/DEVELOPMENT_LOG.md)
+- [本机 IDE 运行指南](docs/IDE_SETUP.md)
+- 上游项目：[TiebaMeow/TiebaScraper](https://github.com/TiebaMeow/TiebaScraper)

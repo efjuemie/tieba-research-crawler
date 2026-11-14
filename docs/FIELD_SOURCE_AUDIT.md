@@ -1,93 +1,79 @@
-# 字段来源审计（静态源码初版）
+# 字段来源与验证范围
 
 审计日期：2026-11-14
 
-审计范围：已安装的 `aiotieba==4.8.2`、`tiebameow==0.5.0`，以及 TiebaScraper 当前工作区源码。
+代码范围：当前工作树、`aiotieba==4.8.2`、`tiebameow==0.5.0`。本地参考截图只用于 UI 线索；公开仓库不包含截图、真实帖子正文、用户标识、原始属地值或登录资料。
 
-## 证据边界
+## 证据等级
 
-本文件只记录源码中声明的字段、转换路径和当前 ORM 列。没有发起贴吧 API 请求，也没有检查真实 API 响应样本；所有响应证据栏均据此标注。截图只说明网页能显示相应控件或文本，不作为 API 字段证据。未在本文复制或公开截图中的帖文正文、用户标识或图片内容。
+- **源码**：在已安装库或本项目代码中核对过属性与转换路径。
+- **合成**：用合成对象验证项目 mapper、数据库写入或导出，不代表贴吧实际响应。
+- **有限线上样本**：已执行并在此记录样本数和结果，不公开原始 ID、字段值或正文。
+- **未验证**：字段语义、跨页完整性或更大样本覆盖仍未知。
 
-状态含义：
+`observed_at` 表示本次接口响应/观察时间，不能代替内容创建时间，也不能描述旧帖发表时的用户资料。
 
-- **A**：源码有 API/DTO 到 ORM 的字段映射；不代表已经以真实响应验证字段非空或语义。
-- **B**：源码中有 API/DTO 字段，但当前 ORM 没有对应持久化列，或只有未规范化的内容片段。
-- **C**：可由另一个源码接口请求取得，需额外请求；真实请求结果未验证。
-- **D**：确认原始 API 有字段而当前解析层丢弃。当前初审未找到可满足目标字段的确定 D 证据。
-- **E**：网页可见，当前 API/DTO 路径或映射语义未证实。
-- **F**：当前公开 API/DTO/ORM 代码路径没有该字段；这只表示当前代码不可用，不证明百度服务端绝不返回。
+## 主题帖、首楼和计数
 
-## 主题帖（`thread`，含首楼）
+| 字段 | 来源路径 | 当前保存位置 | 证据与限制 |
+|---|---|---|---|
+| `tid/fid/fname/title/create_time/last_time` | `get_threads` 的 `ThreadDTO`；`get_posts` raw `Posts.thread: Thread_p` 提供首楼部分字段 | 基础表 + `research_thread`，记录 `create_time_raw/last_time_raw/source_api/observed_at` | 源码与合成映射已核对。`create_time` 是主题创建时间，`last_time` 是最后回复时间，二者不可互换。 |
+| `first_pid/body_text/contents_raw` | `get_posts` raw `Posts.thread`，并与返回的 floor 1 `Post` 配对 | `research_thread.first_pid/body_text/contents_raw`；`research_content_observation` 保存 `thread_first_post` owner 水位 | floor 1 不作为普通 `research_post` 行。列表新记录不会清掉详情正文；旧详情仅在内容水位被接受时补写详情独有字段。完整实时样本仍未验证。 |
+| `reply_count/agree_count/disagree_count/view_count/share_count` | `get_threads` 与 `get_posts` raw thread 的计数属性 | `research_thread` 规范列和 source payload | 计数是响应时点的值。接口报告数与真实回复总数/页面展示口径的差异尚未完成全量对账。 |
+| `collect_count` | `get_posts` raw `Posts.thread.collect_num`；`get_threads` 不提供该列 | `research_thread.collect_count`；raw 解析值保留在 `source_payload_json["counts"]["collect_count"]` | 合成映射和 PostgreSQL 水位回归已覆盖非零与零值。没有字段 presence 证据的 raw `0` 规范列写 `NULL`，缺失原因标记 `zero_presence_unverified_in_parsed_object`。没有据网页数字补值。 |
+| 主题状态和作者动态属性 | `get_threads` 列表字段；`get_posts` raw thread / author 字段 | `research_thread` 保存支持的 `thread_type`、状态、作者、互动和属地列 | 只更新响应来源支持的字段；共享字段使用更新时点，详情独有字段由内容观测水位控制。分享帖自身内容缺失时不把分享来源正文冒充首楼正文。 |
+| `share_origin/vote_info` | aiotieba raw `Thread_p` 声明 | 当前研究表未定义对应规范列 | raw 类型字段存在不等于本项目已经映射、持久化或验证该数据；目前不用于补造首楼正文。 |
 
-| field_name | scope | API endpoint | aiotieba path | tiebameow DTO path | ORM column | response evidence (non-sensitive) | availability | source_time_semantics | change_required | risk |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `tid`, `fid`, `fname` | thread | `get_threads` | `Client.get_threads` | `ThreadsDTO.objs[].tid/fid/fname` | `Thread.tid/fid`; `Forum.fid/fname` | 仅源码字段声明；无线上响应样本 | A | `create_time` 与标识分开，见下行 | 复用基础列 | `fname` 存在 `forum` 表，不在 `thread` 行 |
-| `first_pid` | thread / first post | `get_posts`（也见 `get_threads`） | `Posts.thread.pid` | `ThreadDTO.pid`；`get_posts_dto` 返回的 `PostsDTO` 不暴露 raw `.thread` | 无 | aiotieba `Posts` 定义 `thread: Thread_p`，tiebameow DTO 转换结果只含 `objs/page/forum`；无真实响应样本 | B | 帖子创建时点需与 `tid` 分开 | 从同次 `get_posts` raw response 读取首楼 ID 并保存 | worker 过滤 `floor == 1` 的回复，首楼当前没有独立 `post` 行 |
-| `title`, `body_text`, `contents_raw` | thread / first post | `get_posts` raw thread；`get_threads` DTO | `Posts.thread.title/contents/text` | `ThreadDTO.title/contents/text`；`PostsDTO` 丢弃 raw `.thread` | `Thread.title/text/contents`（仅列表 DTO 转换路径） | raw `Thread_p` 暴露首楼 `title/contents/text`；列表 DTO 也有内容路径；无真实响应样本 | B | 属于主题帖首楼内容；是否完整未在线验证 | 将 raw `Posts.thread` 纳入项目转换层并确认内容完整性 | 分享帖 `is_share=true` 时 raw 首楼 `contents` 为空，内容位于 `share_origin` |
-| `create_time`, `last_time`, `scraped_at` | thread | `get_threads` | `Thread.create_time/last_time` | `ThreadDTO.create_time/last_time` | `Thread.create_time/last_time/scrape_time` | 源码定义 timezone-aware datetime，并映射到 ORM | A | `create_time` 是主题帖创建时间；`last_time` 是最后回复时间；`scrape_time` 是采集时间 | 补充字段来源与采集时间说明；当前未保留原始 API 时间戳表示 | 排序研究必须使用 `create_time`，不能用 `last_time` 替代 |
-| `author_user_id`, `author_user_name`, `author_nickname`, `portrait` | thread author | `get_threads` | `Thread.author` | `ThreadDTO.author.user_id/user_name/nick_name_new/portrait` | `Thread.author_id`; `User.user_id/user_name/nick_name/portrait` | 只有类型与映射代码；无用户记录样本 | A | 作者资料是采集时可见资料；昵称和 portrait 会变化 | 保留原始 ID；为变动属性加观察时间 | `user_id` 与 `tieba_uid` 不同，不能互换 |
-| `forum_level`, `global_growth_level` | thread author | `get_threads` | `Thread.author.level/glevel` | `ThreadUserDTO.level/glevel` | 仅 `Thread.author_level` 保存 `level` | DTO 声明两字段；ORM 映射只写 `author_level=level` | B | 消息对象上的值是该次响应值，不是旧帖发布时的历史快照保证 | 扩展表分别保存 `level` 与 `glevel` | 不能仅凭 UI `Lv.x` 或 SVG `#level_4` 判定两字段语义 |
-| `role_type`, `role_name`, `role_badge_id/url` | thread author | `get_threads`; 用户资料见下表 | `ThreadUserDTO.is_bawu/icons` | `ThreadDTO.author.is_bawu/icons` | 无 | DTO 有布尔值和字符串列表；未验证其图标映射 | B/E | 页面角色与徽章可能随时间变化 | 保存原始 `is_bawu/icons`；角色名称/徽章映射待 API 或 DOM 证据 | 布尔“吧务”不能替代具体身份名称或图标语义 |
-| `reply_count`, `agree_count`, `disagree_count`, `view_count`, `share_count` | thread | `get_threads` | `Thread` | `ThreadDTO.reply_num/agree_num/disagree_num/view_num/share_num` | 仅 `Thread.reply_num` 保存 | DTO 有计数字段；ORM 只映射 `reply_num` | B | 计数是采集时的动态值；reply 总数不等于实际一级楼层数或楼中楼数 | 扩展列保存其余原值；另做数量口径对照 | API 计数与页面显示语义尚未做真实样例核对 |
-| `collect_count` | thread | `get_posts` raw thread | `Posts.thread.collect_num` | `get_posts_dto` 转换后无 thread-level 字段 | 无 | aiotieba `Thread_p` 声明并从 `thread_proto.collect_num` 赋值；DTO/ORM 未保存；无真实响应样本 | B | 计数是该次帖子详情响应值 | 在项目转换层从 raw `.thread.collect_num` 保存 | 不从网页数字补造；应记录采集时点 |
-| `thread_type`, `is_top`, `is_good`, `is_livepost`, `is_hide`, `is_share` | thread | `get_threads`; `get_posts` raw thread | `Thread`; `Posts.thread.type/is_share` | 同名 `ThreadDTO` 中有部分状态；`PostsDTO` 丢弃 raw `.thread` | 无 | DTO/raw 源码声明字段；ORM 未保存 | B | 状态为采集时观察值 | 扩展列保留原始状态与 raw share fields | 当前 `ThreadsTaskHandler` 过滤 `is_livepost`，会缩小目标总体；分享帖结构不同 |
-| `share_origin`, `vote_info` | thread / shared or poll content | `get_posts` raw thread | `Posts.thread.share_origin/vote_info` | `PostsDTO` 不暴露 raw `.thread` | 无 | raw `Thread_p` 声明字段；未检查真实样本 | B | 内容和状态取自帖子详情响应时点 | 扩展保存结构化内容与缺失原因 | 分享帖自己的 `contents` 为空时，不能误写原帖内容为分享者正文 |
+`tiebameow` 的 `get_posts_dto` 转换只返回 `PostsDTO.objs/page/forum`，不会保留 raw `Posts.thread`。项目通过 `ResearchClient` 的 `ResearchPage` 同次保留 raw 与 DTO，不需再发一条请求取得 `collect_num` 或首楼属性。
 
-## 一级回复（`post`）
+分页报告数与主题/父楼的回复报告数是不同来源。`aiotieba==4.8.2` 的 `Page_t` 和 `Page_c` 有 `total_count`，但上游 DTO 转换没有保留该值；项目 `ResearchClient` 在 `get_threads`、`get_comments` 转换后从 raw page 复制它。`get_posts` 的 `Page_p` 没有 `total_count`，其 DTO 默认 `0` 不能当作接口报告值；相关页 checkpoint 标记 `not_provided_by_aiotieba_posts_page`。数值为 `0` 时仍按字段 presence 规则区分可验证报告与未验证值。
 
-| field_name | scope | API endpoint | aiotieba path | tiebameow DTO path | ORM column | response evidence (non-sensitive) | availability | source_time_semantics | change_required | risk |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `pid`, `tid`, `fid`, `fname`, `floor`, `create_time` | post | `get_posts` | `Client.get_posts` | `PostDTO.pid/tid/fid/fname/floor/create_time` | `Post.pid/tid/fid/floor/create_time`; `Forum.fname` | 仅 DTO 和 ORM 声明/映射；无真实页响应 | A | `create_time` 为该楼层创建时间 | 复用基础列 | `pid` 与 `tid` 是不同层级 ID |
-| `text`, `contents_raw` | post | `get_posts` | `Post.contents` | `PostDTO.text/contents` | `Post.text/contents` | DTO 纯文本由内容片段派生，ORM 保存文本和 JSON 片段 | A | 回复自身创建时间见 `create_time` | 核验片段类型序列化与真实内容完整性 | 原始片段结构含 @、图片等，不应只导出纯文本 |
-| `author_user_id`, `user_name`, `nickname`, `portrait` | post author | `get_posts` | `Post.author` | `PostDTO.author.*` | `Post.author_id`; `User.*` | 基础身份列由 `User.from_dto` 写入 | A | 作者档案是采集时资料 | 身份保留；变动信息宜加观察时点 | 昵称不是稳定唯一标识 |
-| `forum_level`, `global_growth_level`, `ip` | post author | `get_posts` | `Post.author.level/glevel/ip` | `PostUserDTO.level/glevel/ip` | 仅 `Post.author_level` 保存 `level` | DTO 有字段；ORM 未保存 `glevel`、`ip` | B | 均为响应时点属性 | 扩展保存原值并标明采集时间 | DTO 字段名 `ip` 与网页显示的属地文案是否同义未验证 |
-| `is_thread_author`, `agree_count`, `disagree_count`, `subreply_count_reported` | post | `get_posts` | `Post` | `PostDTO.is_thread_author/agree_num/disagree_num/reply_num` | 仅 `Post.reply_num` 保存 | DTO 有字段；ORM 丢失其余字段 | B | 计数与标志为采集时响应值 | 扩展列；保存报告数与实际评论数分别统计 | `reply_num` 不代表已采到的 comment 数 |
-| `post_url` | post | 可按 `tid/pid` 构造；未见 DTO 字段 | 无 | 无 | 无 | 只由标识可生成；未核查页面 URL 规则 | E | 不适用 | 后续统一生成并验证 | 不能写成 API 返回字段 |
+## 一级回复与楼中楼
 
-## 二级回复（`comment`）
+| 范围 | 来源路径 | 当前保存位置 | 边界 |
+|---|---|---|---|
+| 一级回复 | `get_posts` raw `Posts.objs[]` / `Post`，含 `pid/tid/fid/floor/create_time/contents/author/counts` | `research_post`；媒体片段写入 `research_media_asset` | `research_post` 保存首楼以外的楼层。首楼 ID、正文和评论报告数留在 `research_thread`。 |
+| 楼中楼 | 独立 `get_comments(tid, pid, page)` 的 raw `Comment` | `research_comment`，保留 `cid/tid/parent_post_pid` 和 `reply_to_user_id/reply_to_id_raw` | `get_posts` 带回的有限附带 comments 不代表完整楼中楼分页，也不会替代独立 `get_comments` 扫描。真实多页完整率未验证。 |
+| 回复目标 | `Comment.reply_to_id` | 非零解析值原样保留；`0` 写入 `reply_to_id_raw`，规范目标为 `NULL` 并记录 `aiotieba_zero_sentinel` | 该字段是目标用户 ID，不是被回复 comment ID。解析器的 `0` 是 sentinel，不能据此断言 API 明确返回数值零。 |
+| 首楼楼中楼父楼报告数 | `get_posts` 匹配到的 floor 1 raw `Post.reply_num` | `research_thread.source_payload_json["first_post"]`，包含 raw 值、规范值、来源和观察时间 | 不与 `ResearchThread.reply_count` 混用。没有 presence 证据的 parsed `0` 规范值为 `NULL`。质量报告优先使用该评论 scope 当前代最近有可信报告数的完成 checkpoint；没有时才回退此父楼值。 |
+| 评论作者等级/属地 | 独立 `get_comments` 的 `UserInfo_c` | `research_comment` 对该接口未提供的 `glevel/ip` 留空并记录缺失原因 | raw 附带 comments 的 `UserInfo_p` 有更丰富字段，但它不是全量来源，当前不会用它填充独立评论记录。 |
 
-| field_name | scope | API endpoint | aiotieba path | tiebameow DTO path | ORM column | response evidence (non-sensitive) | availability | source_time_semantics | change_required | risk |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `cid`, `tid`, `pid`, `fid`, `fname`, `create_time`, `text`, `contents_raw`, `author_user_id` | comment | `get_comments`; `get_posts` 可附带有限评论 | `Client.get_comments`; `Posts.objs[].comments` | `CommentDTO.cid/tid/pid/fid/fname/create_time/text/contents/author_id` | `Comment.cid/tid/pid/fid/create_time/text/contents/author_id`; `Forum.fname` | DTO 有分页信息与字段声明，ORM 映射保存；无真实响应样本 | A | `create_time` 是楼中楼回复创建时间 | 复用基础列并以独立 `get_comments` 分页作为全量来源 | 附带 `comments` 数量受 `comment_rn` 限制，不等于全量 |
-| `reply_to_user_id` / `reply_to_id` | comment target | `get_comments`; `get_posts` 附带 comments | `Comment.reply_to_id` | `CommentDTO.reply_to_id` | `Comment.reply_to_id` | aiotieba parser 默认设为 `0`，仅在内容首片段为 `回复 ` 且 protobuf 第二片段带非零 uid 时解析；tiebameow 把数值写入 ORM；无真实样本 | B | 非零值是回复创建时解析出的目标用户；`0` 是 parser sentinel，不是已证实目标 | 原样保留非零值；`0` 转为 NULL 并记录 `missing_reason='aiotieba_zero_sentinel'` | 不可当作被回复 comment ID；缺失值不可按楼层作者补造 |
-| `floor`, `is_thread_author`, `agree_count`, `disagree_count` | comment | `get_comments` | `Comment` | `CommentDTO.floor/is_thread_author/agree_num/disagree_num` | 无对应列 | DTO 有声明；当前 ORM 未写入 | B | 楼层与互动字段属于响应时点 | 扩展列 | 评论互动数与帖子回复数不可混用 |
-| `author_user_name`, `nickname`, `portrait`, `forum_level` | comment author | `get_comments` | `Comment.author` | `CommentDTO.author.user_name/nick_name_new/portrait/level` | `User.*`; `Comment.author_level` | 基础身份与 `level` 映射存在 | A | 作者资料/等级为响应时点属性 | 保留原始用户 ID 和动态观察时间 | `CommentUserDTO` 没有 `glevel`/`ip` 字段声明 |
-| `global_growth_level`, `ip_location_text` | comment author | `get_posts` 附带 comments；独立 `get_comments` | raw 附带 `Comment_p.user: UserInfo_p`；独立接口的 `Comment.user: UserInfo_c` | `CommentUserDTO` 无 `glevel/ip` | 无 | raw 附带路径 `UserInfo_p` 声明这些字段；独立分页 `UserInfo_c` 不声明；无真实响应样本 | D | raw 附带作者属性是响应时点值 | 若保留附带值，解析层需保留；独立分页无此字段时保持 NULL | 附带 comments 不是全量来源；不能替代独立 `get_comments` 分页 |
+楼层、点赞/反对数、作者标识和内容片段均保留来源与响应观察时间。父子关系在导出前由 SQL 检查；回复数与已采集唯一 ID 数分别统计。
 
-## 用户资料与吧内动态快照
+## 用户、吧内快照与属地
 
-| field_name | scope | API endpoint | aiotieba path | tiebameow DTO path | ORM column | response evidence (non-sensitive) | availability | source_time_semantics | change_required | risk |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `user_id`, `user_name`, `nickname`, `portrait` | user | `get_threads/get_posts/get_comments` 作者信息 | `UserInfo_t` / 作者对象 | `BaseUserDTO.user_id/user_name/nick_name_new/portrait` | `User.user_id/user_name/nick_name/portrait` | DTO 与 `User.from_dto` 映射代码可见；未检查真实用户数据 | A | `User` 是当前覆盖式身份表，无首次/最近观察时间 | 增加首次/最近观察时间或独立快照 | 当前同一用户昵称变化会覆盖旧值 |
-| `tieba_uid`, `global_growth_level` | user | `anyid2user_info` / user info | `UserInfo` | `UserInfoDTO.tieba_uid/glevel` | 无 | DTO 声明且 `anyid2user_info_dto` 可调用；无结果样本 | B/C | 当前查询时的资料，不代表发帖时历史属性 | 增加扩展列或用户快照 | `tieba_uid` 与 `user_id` 必须分别保留 |
-| `forum_level`, `forum_level_name`, `role_name` | user/forum snapshot | `get_user_forum_info` | `UserForumInfo.level/level_name/role_name` | 当前无对应 DTO；客户端公开 aiotieba 返回类型 | 无 | 源码注释说明该接口强制要求有效 BDUSS；未做登录请求 | C | 仅能表示观察时点，不能回填历史帖子创建时状态 | 用户已选择稍后通过官方登录补采；由后续模块接入并保存 `observed_at/source` | 当前未读取 BDUSS；登录凭据需由用户在本机安全配置 |
-| `role_type` / `bawu_type` | user/forum snapshot | 未确认 | 安装版 `UserForumInfo` 无 `bawu_type` 属性 | 无 | 无 | 已检查的接口 DTO 只有 `role_name`，没有 `bawu_type` | E/F | 角色需带观察时点 | 不映射到未证实字段；待 API/页面结构证据 | 不能把 `is_bawu` 布尔值当作角色枚举 |
-| `role_badge_id`, `role_badge_url` | user/content appearance | 未确认 | 作者对象 `icons` 是 `list[str]` | `ThreadUserDTO/PostUserDTO/CommentUserDTO.icons` | 无 | DTO 声明 `icons`；未验证其中值与页面徽章的对应关系 | E | 徽章/装饰随观察时点变化 | 保留原始 icon 值后再做有证据映射 | 截图中的 `#level_4` SVG 与等级/角色没有已证实关联 |
-| `ip_location_text`, `ip_location_source`, `ip_location_observed_at` | author / post | `get_posts` 作者信息；user info | `PostUserDTO.ip`; `UserInfoDTO.ip` | `PostDTO.author.ip` / `UserInfoDTO.ip` | 无 | 源码只有名为 `ip` 的值，网页截图显示属地标签；无 API 原始响应 | E | 应记录帖子/资料来源和采集时间 | 核实 `ip` 是否为页面地区标签；评论作者另行处理 | 该字段若可得是展示属地，不是实际网络 IP 地址 |
+| 字段组 | 来源路径 | 当前保存位置 | 证据与限制 |
+|---|---|---|---|
+| 用户 ID、用户名、昵称、portrait、`tieba_uid` | `get_threads/get_posts/get_comments` 作者对象 | `research_user` 最新身份行与每条内容的作者 ID | `user_id` 与 `tieba_uid` 是不同标识。用户名、昵称、portrait 会变化。 |
+| 吧内 `forum_level/forum_level_name/role_name` | 启用登录后的 `get_user_forum_info`；内容接口作者对象也可能提供 `forum_level` | `research_user_forum_snapshot`，按用户、贴吧、来源和观察时间记录 | `get_user_forum_info` 的映射明确将 `is_bawu`、`icons` 留空并记录为接口未提供；内容作者对象单独提供这些字段时才映射。`role_type` 或徽章 ID 不从图标猜测。 |
+| 作者 `is_bawu/icons` | `get_threads/get_posts/get_comments` 返回的内容作者对象（仅在该对象暴露时） | 对应内容行及由内容接口生成的 `research_user_forum_snapshot` | 不来自 `get_user_forum_info`；不同内容接口的作者对象字段并不完全相同，缺失时保持空值并记录原因。 |
+| 帖子作者 `ip_location_text` | `get_posts` 的 `PostUserDTO.ip` 或 raw thread author `.ip` | `research_post` / `research_thread` 的属地列，另保存来源路径和观察时间 | 10 条有界作者样本中，字段非空且为中文地域文本 10/10；IPv4/IPv6 字面值 0/10。只把非 IP 字面值当属地文本写入；原始 `ip` 不写入 source payload。该样本不能证明其他接口、其他用户或历史位置。 |
+| 评论作者 `ip_location_text/glevel` | 独立 `get_comments` 的 `UserInfo_c` 未声明这些字段 | 缺失时保持 `NULL` 并写原因 | 不用作者头像、截图或附带 comments 推断。 |
 
-## 媒体与完整性记录
+用户在百度官方页面手动登录后，进行过一次有界 `get_user_forum_info` 检查：状态 `available`，请求和响应用户匹配，`forum_level`、`level_name`、`role_name` 均非空。只验证这一当前响应，不代表所有用户都可查询，也不回填旧帖发表时的身份。原始账号值未写入仓库或本文件。
 
-| field_name | scope | API endpoint | aiotieba path | tiebameow DTO path | ORM column | response evidence (non-sensitive) | availability | source_time_semantics | change_required | risk |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `contents_raw` / image fragment (`src`, `big_src`, `origin_src`, `hash`, dimensions) | thread/post/comment media | `get_threads/get_posts/get_comments` | `Contents_t` / `FragImage` | `contents` 中的图片片段 | `Thread/Post/Comment.contents` JSONB | aiotieba 源码声明图片 URL/hash/尺寸；ORM 保存片段字段；无线上样本/序列化 round-trip 测试 | A/B | 与所属内容同时采集 | 为每个媒体片段建立规范化记录并核对落库 | HTML `img.src` 只作页面线索；不下载媒体二进制 |
-| `video_id`, video URL/cover/duration/dimensions | thread/post/comment media | 内容接口；稳定 ID 未确认 | `FragVideo` 暴露 `src/cover_src/duration/width/height/view_num` | DTO 内容片段（实际转换/持久化需用合成对象验证） | 仅 `contents` JSONB；无 `media_asset` | 类字段结构可见；未检查真实响应 | B/E | 媒体与所属内容采集时点相关 | 保存原始 URL 与片段；稳定 ID 不可解析时保持 NULL | 不从 URL 任意截取并命名为官方 video ID |
-| `media_asset` (`owner_type/id/position/source_api/observed_at`) | media relation | 内容接口 | contents fragments | Thread/Post/Comment DTO `contents` | 无独立表 | 目标契约，不是上游现有模型 | B | 记录本次观察时间 | 项目扩展层新增关联表 | 一条内容可能包含多张图/多个资源，不能只存首个 |
-| `page.total_page/total_count/has_more`, page checkpoint | scan quality | 三个列表接口 | `Page_t` | `PageInfoDTO` | 无逐页记录表；另有 `pending_thread_scan`、`pending_comment_scan` | DTO 提供页信息；本地仅有两类 pending ORM，不是页快照 | B | 表示请求当时分页状态 | 在项目层持久化成功/失败页与检查点 | 空页或页码位移不能仅凭 DTO 自动宣告全量完成 |
-| `reported_reply_num`, actual unique `pid/cid` counts, `count_mismatch` | crawl quality | posts/comments | `Post.reply_num`, comment IDs | `PostDTO.reply_num`, `CommentDTO.cid` | 有回复数及实体行；无质量报告列/表 | 字段和 ID 路径可见；未执行真实数量对账 | B | 报告数和实际采集数要分别保留采集时点 | 增加逐 `(tid,pid)` 的扫描状态与数量审计 | 差异不能自动解释为漏采或完整 |
+### 有界真实内容样本
 
-## 截图核对（仅 UI 证据）
+- 一个小主题的 `get_posts` 请求读取一页并以终止状态完成；raw/DTO 含首楼和一条普通一级回复两个楼层 ID，数据库分别保存首楼和一条 `research_post`，checkpoint 为 `completed`。该次同时生成 4 条用户吧内快照。主题 `reply_num` 报告为 2，而保存的唯一普通一级回复为 1；差异原因和字段口径未知。
+- 一条楼中楼扫描跨两页返回 30+20 个唯一评论，共 50 条且均已持久化。两页各自的 raw、DTO 和 checkpoint `total_count` 均为 51；质量报告现显示 51 对 50、`count_mismatch=true`。未确定差异原因。第二页独立 DTO ID 指纹未保留，因此不能声称已对全部 ID 做独立逐项验证；两页 raw/DTO 的数量一致。该结果只代表此 scope。
 
-- 图 1 的“最新 / 发布”是排序目标的页面证据。`ThreadSortType.CREATE` 可经 `get_threads` 参数传递，但当前 `ThreadsTaskHandler` 调用没有传 `sort`；跨页排序尚未在线验证。
-- 图 2 的 `Lv.x`、徽章和 `#level_4` SVG sprite 是不同 UI 结构；源码 DTO 的 `level`/`glevel` 有独立字段，但它们到界面文字/图标的映射仍未验证。
-- 图 3 可见角色文字与图像徽章；网页资源不证明 API 有结构化 `role_type` 或角色徽章 ID。
-- 图 4 可见图片资源 URL；API 源码声明图片片段 URL/hash，但真实响应与当前 ORM JSONB 的完整性尚未验证。
-- 图 5 可见属地样式文本；DTO 的 `ip` 字段与该标签是否等价未验证，也不代表要采集真实 IP 地址。
-- 图 6 可见回复/点赞/收藏等数字；源码 raw `Posts.thread` 声明 `collect_num`，但 `get_posts_dto` 当前转换丢弃该字段；UI 与 API 的计数语义仍未做真实样例核对。
-- 图 7 显示折叠楼中楼与展开入口；当前 worker 通过 `get_posts(..., comment_rn=10)` 附带有限评论，并有独立 `get_comments` 接口。真实多页样本与全量性未测。
+## 媒体、checkpoint 与质量报告
 
-## 当前实现事实与扩展建议
+- 详情响应中的内容片段映射到 `research_media_asset`：`get_posts` 的首楼（需匹配到 floor 1 `Post`）和普通一级回复，以及独立 `get_comments` 返回的评论；`get_threads` 列表响应不会直接写媒体行。已映射的片段保留 owner 类型、ID、位置、片段类型、URL/hash/尺寸、来源及观察时间；不下载媒体文件。图片字段在库源码中有声明；真实媒体样本的完整性尚未现场验证，不能据此声称媒体覆盖完整。视频稳定 ID 仍未确认。
+- `research_content_observation(owner_type, owner_id)` 只由完整内容响应推进。thread 首楼 owner 为 `thread_first_post/tid`，普通 post 与独立 comment 的 owner 分别为 `post/pid`、`comment/cid`。空媒体集合也有水位，避免较旧页面恢复已删除的媒体引用。
+- `research_run` 记录每次研究运行；`research_checkpoint` 按 run/task/page 保存页码、分页状态、游标、报告数、错误类型与 scope 状态。`crawl_quality_report` 对详情 scope 汇总报告数、成功/失败页、唯一记录数、差异和原因。楼中楼 scope 优先采用当前代最近一个报告数可信的完成 checkpoint；无可信 checkpoint 时，首楼回退 `research_thread.source_payload_json["first_post"]["subreply_count_reported"]`，普通回复楼回退 `research_post.subreply_count_reported`。评论质量计数不会回退到主题总回复数；一级回复对账使用主题回复报告数和保存的唯一一级回复数。列表流的分页状态仍由 `thread_list` checkpoint 保存。
+- manifest 的实体导出校验与采集完整性是分开的结果。没有 checkpoint 时，质量证据为 `unknown_not_tested`；存在 checkpoint 也不证明平台上的所有数据都已抓取。
 
-- `src/scraper/worker.py` 的线程扫描没有设置 `ThreadSortType.CREATE`，并过滤 `is_livepost`；回复页请求以 `comment_rn=10` 附带评论，再通过 pending comment task 进入独立扫描。这些是当前源码事实，不是现场数据结论。
-- 不修改 `.venv/site-packages` 中的 `tiebameow` / `aiotieba`。建议在本项目新增 `src/research` 扩展模型/查询层，用一对一扩展表保存 DTO 已有但基础 ORM 缺失的互动计数、状态与作者属性；另建 `user_forum_snapshot`、`media_asset`、分页/质量检查点表。扩展表保留源字段名、原始 ID、采集时间和缺失原因。
-- user/forum 的 level 和 role 是当前时点资料。`get_user_forum_info` 的源码要求 BDUSS；用户已选择稍后通过官方登录补采。本审计没有读取登录凭据，也未调用该接口；后续由负责模块实现本机安全配置和实测。
-- 暂未识别真实回复/图片/视频响应，因此字段可得性、跨页完整性、实际非空率和 UI 语义映射均为未验证。
+当前实现回归为全仓 236 passed、10 个默认门控用例 skipped；质量 SQL 定向用例 17 passed；专用 PostgreSQL scope 双事务锁竞态两种顺序 2 passed。Ruff、compileall、diff-check 通过。三次真实 CLI 导出各生成唯一批次且未覆盖旧文件；最终批次六类实体 CSV 的全数据库行数与 SQL/manifest 一致，`entity_scope=all_database_rows`、`validation_status=passed`，全 runs 质量报告为 98 行。备份恢复尚未验证。导出校验不能证明平台数据完整。
+
+## 截图仅提供 UI 线索
+
+七张本机截图显示了排序、等级、角色文字/图标、媒体、属地、计数和折叠评论等页面元素。截图没有作为公开文件发布。页面控件本身不能证明接口字段、protobuf presence、计数口径或历史状态。
+
+## 当前未验证项
+
+- 超过两页的真实 CREATE 跨页排序、服务端页数变化与全吧终止条件。
+- 超过 10 页真实运行、真实一级回复/楼中楼完整分页和数量对账。
+- 多类型真实媒体片段、分享帖和投票内容的 raw 到数据库完整性。
+- 详情队列完成与详情 checkpoint 恢复、IDE GUI 停止、进程崩溃后的现场恢复，以及备份恢复。
+- `ip` 地域文本与具体网页 UI 地区标签的一一映射；当前结论只限于上述 10 条接口字段样本。
