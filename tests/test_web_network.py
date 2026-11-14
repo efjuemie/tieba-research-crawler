@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+import json
+from urllib.parse import urlencode
+
+import pytest
+
+from src.research.web_fallback.identity import Target, make_request_context
+from src.research.web_fallback.network import extract_nested_floor
+
+TID = "81001"
+FID = "120"
+POST_ID = "45002"
+CID = "9007199254740993"
+AUTHOR_ID = "77003"
+
+
+def _target(**changes) -> Target:
+    values = {
+        "target_type": "comment",
+        "target_id": CID,
+        "tid": TID,
+        "fid": FID,
+        "cid": CID,
+        "parent_post_pid": POST_ID,
+        "author_user_id": AUTHOR_ID,
+        "author_portrait": "tb.1.synthetic",
+        "requested_fields": (
+            "author_user_name",
+            "author_nickname",
+            "author_portrait",
+            "ip_location_text",
+            "agree_count",
+            "disagree_count",
+            "reply_count",
+            "global_growth_level",
+            "forum_level",
+            "forum_level_name",
+        ),
+    }
+    values.update(changes)
+    return Target(**values)
+
+
+def _context(target: Target | None = None, *, post_id: str = POST_ID, fid: str = FID):
+    target = target or _target()
+    return make_request_context(
+        target,
+        page_url=f"https://tieba.baidu.com/p/{TID}?pn=1",
+        request_url="https://tieba.baidu.com/c/f/pb/nestedFloor?tbs=secret&sign=secret&token=secret",
+        request_method="POST",
+        post_data=f"thread_id={TID}&post_id={post_id}&fid={fid}&offset=40",
+        context_id="request-capture-1",
+    )
+
+
+def _payload(
+    *,
+    cid: str = CID,
+    author_id=AUTHOR_ID,
+    nested_author_id=AUTHOR_ID,
+    fid: str = FID,
+    ip_address: str = "黑龙江",
+    error_code: int = 0,
+):
+    forum_schema = "tiebaapp://forum/level?" + urlencode({"params": json.dumps({"forumId": int(FID)})})
+    return {
+        "error_code": error_code,
+        "data": {
+            "post_list": [
+                {
+                    "id": int(cid),
+                    "fid": int(fid),
+                    "author_id": author_id,
+                    "author": {
+                        "id": nested_author_id,
+                        "name": "synthetic-user",
+                        "name_show": "重复昵称",
+                        "portrait": "tb.1.synthetic",
+                        "ip_address": ip_address,
+                        "level_id": 0,
+                        "user_growth": {"level_id": 6},
+                    },
+                    "agree": {"agree_num": 0, "disagree_num": 0},
+                    "user_show_info": {
+                        "feed_head": {
+                            "main_data": [
+                                {
+                                    "custom": {
+                                        "style": "forum_level",
+                                        "data": json.dumps({"level_id": "8", "level_name": "本吧头衔"}),
+                                    },
+                                    "schema": forum_schema,
+                                }
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+    }
+
+
+def _extract(payload, *, target: Target | None = None, context=None, status=200):
+    target = target or _target()
+    return extract_nested_floor(
+        target,
+        payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False),
+        context or _context(target),
+        response_status=status,
+    )
+
+
+def test_nested_floor_uses_python_raw_json_ids_and_explicit_zero_presence():
+    result = _extract(_payload())
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+    assert candidates["author_nickname"].raw_value == "重复昵称"
+    assert candidates["ip_location_text"].raw_value == "黑龙江"
+    assert candidates["agree_count"].raw_value == 0
+    assert candidates["agree_count"].normalized_value == 0
+    assert candidates["disagree_count"].normalized_value == 0
+    assert candidates["global_growth_level"].normalized_value == 6
+    assert candidates["forum_level"].normalized_value == 8
+    assert candidates["forum_level_name"].normalized_value == "本吧头衔"
+    assert candidates["agree_count"].source_url == "https://tieba.baidu.com/c/f/pb/nestedFloor"
+    assert candidates["author_nickname"].identity.request_offset == "40"
+    assert candidates["author_nickname"].identity.context_id == "request-capture-1"
+    assert candidates["author_nickname"].identity.author_user_id == AUTHOR_ID
+    assert candidates["author_nickname"].identity.fid == FID
+    assert "request_fid" in candidates["author_nickname"].identity.match_methods
+    assert "response_fid" in candidates["author_nickname"].identity.match_methods
+    assert "author_nickname" not in result.field_outcomes
+    assert result.field_outcomes["reply_count"] == {
+        "status": "not_tested",
+        "reason": "not_observed_in_response",
+    }
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "reason"),
+    [
+        ({"cid": "9007199254740994"}, "cid_missing_from_response"),
+        ({"author_id": "77004", "nested_author_id": "77004"}, "response_author_id_mismatch"),
+        ({"author_id": "77003", "nested_author_id": "77004"}, "response_author_id_disagreement"),
+        ({"fid": "121"}, "response_fid_mismatch"),
+    ],
+)
+def test_nested_floor_identity_mismatch_never_emits_candidates(kwargs, reason):
+    result = _extract(_payload(**kwargs))
+
+    assert result.identity_verified is False
+    assert result.reason == reason
+    assert result.candidates == ()
+
+
+@pytest.mark.parametrize(
+    ("error_code", "reason"),
+    [(1, "response_error_code_nonzero"), (-1, "response_error_code_nonzero")],
+)
+def test_nonzero_nested_floor_error_code_blocks_matching_response_candidate(error_code, reason):
+    result = _extract(_payload(error_code=error_code))
+
+    assert result.status == "dom_changed"
+    assert result.reason == reason
+    assert result.identity_verified is False
+    assert result.candidates == ()
+
+
+def test_missing_or_invalid_nested_floor_error_code_is_not_treated_as_success():
+    payload = _payload()
+    del payload["error_code"]
+    missing = _extract(payload)
+    invalid = _extract({**payload, "error_code": "0"})
+
+    assert missing.reason == "response_error_code_missing"
+    assert invalid.reason == "invalid_response_error_code"
+    assert missing.candidates == invalid.candidates == ()
+
+
+@pytest.mark.parametrize("missing", ["author_id", "author.id"])
+@pytest.mark.parametrize("value", ["missing", None])
+def test_both_response_author_ids_are_required(missing, value):
+    payload = _payload()
+    item = payload["data"]["post_list"][0]
+    field = item if missing == "author_id" else item["author"]
+    key = "author_id" if missing == "author_id" else "id"
+    if value == "missing":
+        del field[key]
+    else:
+        field[key] = None
+
+    result = _extract(payload)
+
+    assert result.status == "identity_unverified"
+    assert result.reason == "response_author_id_missing"
+    assert result.candidates == ()
+    assert result.field_outcomes["author_nickname"]["status"] == "identity_unverified"
+
+
+def test_missing_network_fids_use_only_the_known_tid_fid_binding_method():
+    target = _target()
+    payload = _payload()
+    item = payload["data"]["post_list"][0]
+    del item["fid"]
+    context = make_request_context(
+        target,
+        page_url=f"https://tieba.baidu.com/p/{TID}",
+        request_url="https://tieba.baidu.com/c/f/pb/nestedFloor",
+        request_method="POST",
+        post_data=f"thread_id={TID}&post_id={POST_ID}&offset=40",
+    )
+
+    result = _extract(payload, target=target, context=context)
+
+    assert result.identity_verified is True
+    evidence = result.candidates[0].identity
+    assert evidence.fid == FID
+    assert "known_api_tid_fid_binding" in evidence.match_methods
+    assert "request_fid" not in evidence.match_methods
+    assert "response_fid" not in evidence.match_methods
+
+
+def test_wrong_request_parent_or_thread_context_rejects_response():
+    target = _target()
+    wrong_parent = _context(target, post_id="45003")
+    result = _extract(_payload(), target=target, context=wrong_parent)
+
+    assert result.status == "identity_unverified"
+    assert result.reason == "request_post_id_mismatch"
+    assert result.candidates == ()
+
+
+def test_bare_ip_address_is_not_an_ip_location_candidate():
+    result = _extract(_payload(ip_address="192.0.2.8"))
+
+    assert result.status == "ok"
+    assert "ip_location_text" not in {candidate.field_name for candidate in result.candidates}
+
+
+def test_region_label_that_contains_a_bare_ip_is_not_a_location_candidate():
+    result = _extract(_payload(ip_address="IP属地：192.0.2.8"))
+
+    assert "ip_location_text" not in {candidate.field_name for candidate in result.candidates}
+
+
+def test_duplicate_identity_json_keys_are_rejected():
+    target = _target()
+    context = _context(target)
+    text = '{"data":{"post_list":[{"id":9007199254740993,"id":9007199254740994}]}}'
+
+    result = extract_nested_floor(target, text, context)
+
+    assert result.status == "identity_unverified"
+    assert result.reason == "duplicate_json_key"
+    assert result.candidates == ()
+
+
+def test_missing_count_fields_are_not_filled_with_zero():
+    payload = _payload()
+    del payload["data"]["post_list"][0]["agree"]["disagree_num"]
+
+    result = _extract(payload)
+    fields = {candidate.field_name for candidate in result.candidates}
+
+    assert "agree_count" in fields
+    assert "disagree_count" not in fields
+
+
+def test_generic_author_level_zero_is_not_used_as_forum_or_growth_level():
+    payload = _payload()
+    payload["data"]["post_list"][0]["author"].pop("user_growth")
+
+    result = _extract(payload)
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+
+    assert "global_growth_level" not in candidates
+    assert candidates["forum_level"].normalized_value == 8
