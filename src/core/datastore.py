@@ -54,6 +54,27 @@ PRIMARY_KEY_MAP = {
     User: {"user_id"},
 }
 
+RESEARCH_RUN_RESUMABLE_STATUSES = (
+    "running",
+    "interrupted",
+    "incomplete",
+    "paused_auth",
+    "paused_rate_limit",
+    "paused_limit",
+    "blocked",
+)
+
+
+def _research_scope_key(forums: list[tuple[int, str]]) -> str:
+    normalized_forums = sorted({(int(fid), fname) for fid, fname in forums})
+    scope_payload = {
+        "forums": normalized_forums,
+        "sort_mode": "create",
+        "sampling_scope": "all_accessible_threads_and_replies",
+        "checkpoint_version": 1,
+    }
+    return hashlib.sha256(json.dumps(scope_payload, separators=(",", ":")).encode()).hexdigest()
+
 
 async def iter_crawl_quality_summaries(
     async_sessionmaker_: async_sessionmaker,
@@ -175,29 +196,13 @@ class DataStore:
     ) -> str:
         """Create a durable run or reopen the latest compatible incomplete run."""
         normalized_forums = sorted({(int(fid), fname) for fid, fname in forums})
-        scope_payload = {
-            "forums": normalized_forums,
-            "sort_mode": "create",
-            "sampling_scope": "all_accessible_threads_and_replies",
-            "checkpoint_version": 1,
-        }
-        scope_key = hashlib.sha256(json.dumps(scope_payload, separators=(",", ":")).encode()).hexdigest()
+        scope_key = _research_scope_key(normalized_forums)
         now = datetime.now(UTC)
         async with self.async_sessionmaker() as session:
             if resume:
                 statement = select(ResearchRun).where(
                         ResearchRun.scope_key == scope_key,
-                        ResearchRun.status.in_(
-                            (
-                                "running",
-                                "interrupted",
-                                "incomplete",
-                                "paused_auth",
-                                "paused_rate_limit",
-                                "paused_limit",
-                                "blocked",
-                            )
-                        ),
+                        ResearchRun.status.in_(RESEARCH_RUN_RESUMABLE_STATUSES),
                     )
                 if run_id is not None:
                     statement = statement.where(ResearchRun.run_id == run_id)
@@ -223,6 +228,39 @@ class DataStore:
                 session.add(run)
             await session.commit()
             return run.run_id
+
+    async def load_research_run_for_drain(self, run_id: str, forums: list[tuple[int, str]]) -> str:
+        """Load an existing run only when its persisted forum scope matches."""
+        scope_key = _research_scope_key(forums)
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(
+                select(ResearchRun.status, ResearchRun.scope_key).where(ResearchRun.run_id == run_id)
+            )
+            run = result.one_or_none()
+        if run is None:
+            raise ValueError(f"Research run {run_id} does not exist.")
+        if run.scope_key != scope_key:
+            raise ValueError(f"Research run {run_id} does not match the current forum scope.")
+        if run.status != "completed" and run.status not in RESEARCH_RUN_RESUMABLE_STATUSES:
+            raise ValueError(f"Research run {run_id} is not resumable from status {run.status!r}.")
+        return run.status
+
+    async def resume_research_run_for_drain(self, run_id: str, expected_status: str) -> bool:
+        """Activate a validated run for drain, recording completed-run reopenings."""
+        if expected_status == "completed":
+            reason = "drain_reopened_completed_run"
+        elif expected_status in RESEARCH_RUN_RESUMABLE_STATUSES:
+            reason = None
+        else:
+            return False
+        async with self.async_sessionmaker() as session:
+            result = await session.execute(
+                update(ResearchRun)
+                .where(ResearchRun.run_id == run_id, ResearchRun.status == expected_status)
+                .values(status="running", reason=reason, last_checked=datetime.now(UTC))
+            )
+            await session.commit()
+            return bool(result.rowcount)
 
     async def set_research_run_status(self, run_id: str, status: str, reason: str | None = None) -> None:
         async with self.async_sessionmaker() as session:
@@ -663,32 +701,51 @@ class DataStore:
         responsible_fids: set[int],
         *,
         batch_size: int = 500,
+        tid: int | None = None,
+        limit: int | None = None,
     ) -> AsyncIterator[list[ResearchTaskScope]]:
-        """Yield current non-completed detail scopes in bounded, comments-first batches."""
+        """Yield current non-completed detail scopes in bounded, comments-first batches.
+
+        Optional ``tid`` and ``limit`` filters are applied by SQL. ``limit`` is
+        shared across both scope types and preserves the existing comments-first
+        ordering.
+        """
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
+        if tid is not None and tid < 1:
+            raise ValueError("tid must be positive")
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
         if not responsible_fids:
             return
+        yielded = 0
         for scope_type in ("post_comments", "thread_replies"):
+            if limit is not None and yielded >= limit:
+                break
             last_key = ""
             while True:
+                query_limit = batch_size if limit is None else min(batch_size, limit - yielded)
                 async with self.async_sessionmaker() as session:
+                    filters = [
+                        ResearchTaskScope.run_id == run_id,
+                        ResearchTaskScope.scope_type == scope_type,
+                        ResearchTaskScope.status != "completed",
+                        ResearchTaskScope.fid.in_(responsible_fids),
+                        ResearchTaskScope.logical_task_key > last_key,
+                    ]
+                    if tid is not None:
+                        filters.append(ResearchTaskScope.tid == tid)
                     result = await session.execute(
                         select(ResearchTaskScope)
-                        .where(
-                            ResearchTaskScope.run_id == run_id,
-                            ResearchTaskScope.scope_type == scope_type,
-                            ResearchTaskScope.status != "completed",
-                            ResearchTaskScope.fid.in_(responsible_fids),
-                            ResearchTaskScope.logical_task_key > last_key,
-                        )
+                        .where(*filters)
                         .order_by(ResearchTaskScope.logical_task_key)
-                        .limit(batch_size)
+                        .limit(query_limit)
                     )
                     rows = list(result.scalars().all())
                 if not rows:
                     break
                 last_key = rows[-1].logical_task_key
+                yielded += len(rows)
                 yield rows
 
     async def adopt_legacy_research_scopes(self, run_id: str, responsible_fids: set[int]) -> None:

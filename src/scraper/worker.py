@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import random
 import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Literal
@@ -67,6 +68,15 @@ class FetchedPage:
 
 class PageIntegrityError(ValueError):
     """Raised when a returned API page does not match the requested scope."""
+
+
+def _retry_delay(wait_seconds: float, attempt: int) -> float:
+    """Return a bounded exponential delay with light jitter for ordinary retries."""
+    if wait_seconds <= 0:
+        return 0.0
+    cap = 30.0
+    delay = min(wait_seconds * (2 ** min(max(attempt - 1, 0), 32)), cap)
+    return min(delay * random.uniform(0.9, 1.1), cap)
 
 
 class TaskHandler(ABC):
@@ -363,7 +373,7 @@ class TaskHandler(ABC):
                 if attempt >= attempt_limit:
                     raise
                 wait_seconds = getattr(self.container.config, "research_retry_wait_seconds", 0.5)
-                await asyncio.sleep(wait_seconds * attempt)
+                await asyncio.sleep(_retry_delay(wait_seconds, attempt))
 
         raise RuntimeError("Research API retry loop exited without a response.")
 

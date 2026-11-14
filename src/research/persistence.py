@@ -13,7 +13,7 @@ from itertools import starmap
 from typing import TYPE_CHECKING, Any
 
 from aiotieba.enums import ThreadType
-from sqlalchemy import case, delete, select
+from sqlalchemy import and_, case, delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from tiebameow.models.orm import Post as BasePost
@@ -32,7 +32,16 @@ from .models import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from .client import ResearchPage, ResearchUserForumInfo
+    from .client import ResearchPage, ResearchUserBawuInfo, ResearchUserForumInfo, ResearchUserProfileInfo
+
+SIGNED_BIGINT_MAX = (1 << 63) - 1
+_RESEARCH_USER_LAST_KNOWN_FIELDS = (
+    "user_name",
+    "nickname",
+    "portrait",
+    "tieba_uid",
+    "global_growth_level",
+)
 
 
 @dataclass(slots=True)
@@ -89,7 +98,7 @@ async def _persist_research_records(session: Any, records: ResearchRecords) -> d
             )
         )
 
-    await _upsert_rows(session, ResearchUser, _dedupe(records.users, ("user_id",)))
+    await _upsert_research_users(session, records.users)
     await _upsert_rows(
         session,
         UserForumSnapshot,
@@ -132,6 +141,8 @@ def build_research_records(page: ResearchPage) -> ResearchRecords:
     if page.raw is None:
         if page.source_api == "aiotieba.get_user_forum_info":
             return _records_from_user_forum_page(page)
+        if page.source_api in {"aiotieba.get_user_info", "aiotieba.get_bawu_info"}:
+            return ResearchRecords()
         raise ValueError(f"Missing raw response for {page.source_api}.")
 
     if page.source_api == "aiotieba.get_threads":
@@ -142,6 +153,10 @@ def build_research_records(page: ResearchPage) -> ResearchRecords:
         return _records_from_comments_page(page)
     if page.source_api == "aiotieba.get_user_forum_info":
         return _records_from_user_forum_page(page)
+    if page.source_api == "aiotieba.get_user_info":
+        return _records_from_user_profile_page(page)
+    if page.source_api == "aiotieba.get_bawu_info":
+        return _records_from_bawu_page(page)
     raise ValueError(f"Unsupported research source: {page.source_api}.")
 
 
@@ -185,7 +200,7 @@ def _records_from_threads_page(page: ResearchPage) -> ResearchRecords:
             author_user_name=_optional_text(getattr(user, "user_name", None)),
             author_nickname=_optional_text(_nickname(user)),
             author_portrait=_optional_text(getattr(user, "portrait", None)),
-            author_tieba_uid=_positive_id(getattr(user, "tieba_uid", None)),
+            author_tieba_uid=_safe_tieba_uid(getattr(user, "tieba_uid", None), "author_tieba_uid", missing),
             forum_level=_protobuf_int_field(getattr(user, "level", None), "forum_level", missing),
             global_growth_level=_protobuf_int_field(getattr(user, "glevel", None), "global_growth_level", missing),
             is_bawu=_optional_bool(getattr(user, "is_bawu", None)),
@@ -328,7 +343,7 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
                 author_user_name=_optional_text(getattr(raw_user, "user_name", None)),
                 author_nickname=_optional_text(_nickname(raw_user)),
                 author_portrait=_optional_text(getattr(raw_user, "portrait", None)),
-                author_tieba_uid=_positive_id(getattr(raw_user, "tieba_uid", None)),
+                author_tieba_uid=_safe_tieba_uid(getattr(raw_user, "tieba_uid", None), "author_tieba_uid", missing),
                 forum_level=_protobuf_int_field(getattr(raw_user, "level", None), "forum_level", missing),
                 global_growth_level=_protobuf_int_field(
                     getattr(raw_user, "glevel", None), "global_growth_level", missing
@@ -417,7 +432,7 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
                 author_user_name=_optional_text(getattr(user, "user_name", None)),
                 author_nickname=_optional_text(_nickname(user)),
                 author_portrait=_optional_text(getattr(user, "portrait", None)),
-                author_tieba_uid=_positive_id(getattr(user, "tieba_uid", None)),
+                author_tieba_uid=_safe_tieba_uid(getattr(user, "tieba_uid", None), "author_tieba_uid", missing),
                 thread_author_user_id=thread_author_id,
                 forum_level=_protobuf_int_field(getattr(user, "level", None), "forum_level", missing),
                 global_growth_level=_protobuf_int_field(getattr(user, "glevel", None), "global_growth_level", missing),
@@ -503,7 +518,7 @@ def _records_from_comments_page(page: ResearchPage) -> ResearchRecords:
                 author_user_name=_optional_text(getattr(user, "user_name", None)),
                 author_nickname=_optional_text(_nickname(user)),
                 author_portrait=_optional_text(getattr(user, "portrait", None)),
-                author_tieba_uid=_positive_id(getattr(user, "tieba_uid", None)),
+                author_tieba_uid=_safe_tieba_uid(getattr(user, "tieba_uid", None), "author_tieba_uid", missing),
                 forum_level=_protobuf_int_field(getattr(user, "level", None), "forum_level", missing),
                 global_growth_level=_protobuf_int_field(getattr(user, "glevel", None), "global_growth_level", missing),
                 is_bawu=_optional_bool(getattr(user, "is_bawu", None)),
@@ -560,6 +575,7 @@ def _records_from_user_forum_page(page: ResearchPage) -> ResearchRecords:
     raw = page.raw
     raw_user = getattr(raw, "user", None) if raw is not None else None
     missing = dict(dto.missing_reasons)
+    tieba_uid = _safe_tieba_uid(dto.tieba_uid, "tieba_uid", missing)
     for field_name, reason in {
         "global_growth_level": "not_exposed_by_get_user_forum_info_4_8_2",
         "is_bawu": "not_exposed_by_get_user_forum_info_4_8_2",
@@ -581,6 +597,7 @@ def _records_from_user_forum_page(page: ResearchPage) -> ResearchRecords:
         "level": _int_value(getattr(raw, "level", None)) if raw is not None else None,
         "level_name": _optional_text(getattr(raw, "level_name", None)) if raw is not None else None,
         "role_name": _optional_text(getattr(raw, "role_name", None)) if raw is not None else None,
+        "tieba_uid": _raw_tieba_uid(dto.tieba_uid),
     }
     records.user_forum_snapshots.append(
         UserForumSnapshot(
@@ -602,8 +619,94 @@ def _records_from_user_forum_page(page: ResearchPage) -> ResearchRecords:
             ip_location_text=None,
             ip_location_source=None,
             status=dto.status,
-            tieba_uid=dto.tieba_uid,
+            tieba_uid=tieba_uid,
             source_payload_json=source_payload,
+            missing_reasons_json=missing,
+        )
+    )
+    return records
+
+
+def _records_from_user_profile_page(page: ResearchPage) -> ResearchRecords:
+    records = ResearchRecords()
+    dto: ResearchUserProfileInfo = page.dto
+    raw = page.raw
+    response_user_id = _positive_id(getattr(raw, "user_id", None))
+    if dto.status != "available" or response_user_id != dto.user_id or dto.response_user_id != dto.user_id:
+        return records
+
+    missing = dict(dto.missing_reasons)
+    tieba_uid = _safe_tieba_uid(getattr(raw, "tieba_uid", None), "tieba_uid", missing)
+    global_growth_level = _protobuf_int_field(
+        getattr(raw, "glevel", None), "global_growth_level", missing
+    )
+    records.users.append(
+        ResearchUser(
+            user_id=dto.user_id,
+            user_name=_identity_text(getattr(raw, "user_name", None)),
+            nickname=_optional_text(_nickname(raw)),
+            portrait=_identity_text(getattr(raw, "portrait", None)),
+            tieba_uid=tieba_uid,
+            global_growth_level=global_growth_level,
+            first_observed_at=page.observed_at,
+            last_observed_at=page.observed_at,
+            source_api=page.source_api,
+            observed_at=page.observed_at,
+            source_payload_json=_user_profile_payload(raw),
+            missing_reasons_json=missing,
+        )
+    )
+    return records
+
+
+def _records_from_bawu_page(page: ResearchPage) -> ResearchRecords:
+    records = ResearchRecords()
+    dto: ResearchUserBawuInfo = page.dto
+    matched = dto.status == "available" and dto.response_user_id == dto.user_id and dto.is_bawu is True
+    not_listed = dto.status == "not_listed" and dto.response_user_id is None
+    if not matched and not not_listed:
+        return records
+
+    missing = dict(dto.missing_reasons)
+    for field_name in (
+        "portrait",
+        "display_name",
+        "forum_level",
+        "forum_level_name",
+        "global_growth_level",
+        "tieba_uid",
+        "icons",
+        "ip_location_text",
+    ):
+        missing.setdefault(field_name, "not_exposed_by_get_bawu_info_4_8_2")
+    records.user_forum_snapshots.append(
+        UserForumSnapshot(
+            user_id=dto.user_id,
+            fid=dto.fid,
+            source_api=page.source_api,
+            observed_at=page.observed_at,
+            response_user_id=dto.response_user_id,
+            fname=None,
+            portrait=None,
+            display_name=None,
+            forum_level=None,
+            global_growth_level=None,
+            forum_level_name=None,
+            is_bawu=True if matched else None,
+            role_name=dto.role_name if matched else None,
+            role_type=dto.role_type if matched else None,
+            icons=None,
+            ip_location_text=None,
+            ip_location_source=None,
+            status="available" if matched else "not_listed",
+            tieba_uid=None,
+            source_payload_json={
+                "observation_scope": "current_forum_bawu_roster",
+                "fid": dto.fid,
+                "role_type": dto.role_type,
+                "role_name": dto.role_name,
+                "listed": matched,
+            },
             missing_reasons_json=missing,
         )
     )
@@ -957,7 +1060,117 @@ def _utc_datetime(value: datetime) -> datetime:
     return (value.replace(tzinfo=UTC) if value.tzinfo is None else value).astimezone(UTC)
 
 
-async def _upsert_rows(session: Any, model: type, rows: list[Any]) -> None:
+async def _upsert_research_users(session: Any, rows: list[ResearchUser]) -> None:
+    rows = _merge_research_user_batch(rows)
+    if not rows:
+        return
+
+    rows_by_user_id: dict[int, list[ResearchUser]] = {}
+    for row in rows:
+        rows_by_user_id.setdefault(row.user_id, []).append(row)
+
+    for observation_index in range(max(map(len, rows_by_user_id.values()))):
+        batch = [
+            user_rows[observation_index]
+            for user_rows in rows_by_user_id.values()
+            if len(user_rows) > observation_index
+        ]
+        await _upsert_research_user_batch(session, batch)
+
+
+async def _upsert_research_user_batch(session: Any, rows: list[ResearchUser]) -> None:
+    returned_rows = await _upsert_rows(
+        session,
+        ResearchUser,
+        rows,
+        returning_fields=("user_id", "observed_at", *_RESEARCH_USER_LAST_KNOWN_FIELDS),
+    )
+    for row in rows:
+        final = returned_rows[row.user_id]
+        if _utc_datetime(final["observed_at"]) != _utc_datetime(row.observed_at):
+            continue
+
+        retained = {}
+        for field_name in _RESEARCH_USER_LAST_KNOWN_FIELDS:
+            incoming_value = getattr(row, field_name)
+            if not _research_user_field_present(incoming_value) and _research_user_field_present(
+                final[field_name]
+            ):
+                retained[field_name] = "retained_last_known_due_to_missing_current_observation"
+        if retained:
+            missing = dict(row.missing_reasons_json or {})
+            retained_reasons = missing.get("retained_last_known")
+            retained_reasons = dict(retained_reasons) if isinstance(retained_reasons, dict) else {}
+            retained_reasons.update(retained)
+            missing["retained_last_known"] = retained_reasons
+            await session.execute(
+                update(ResearchUser)
+                .where(
+                    ResearchUser.user_id == row.user_id,
+                    ResearchUser.observed_at == row.observed_at,
+                )
+                .values(missing_reasons_json=missing)
+            )
+
+
+def _merge_research_user_batch(rows: list[ResearchUser]) -> list[ResearchUser]:
+    grouped: dict[tuple[int, datetime], list[tuple[int, ResearchUser]]] = {}
+    for index, row in enumerate(rows):
+        key = (row.user_id, _utc_datetime(row.observed_at))
+        grouped.setdefault(key, []).append((index, row))
+
+    merged_rows = []
+    for observations in grouped.values():
+        _, latest = max(
+            observations,
+            key=lambda item: (_utc_datetime(item[1].observed_at), item[0]),
+        )
+        merged = ResearchUser(**_row_values(latest))
+        first = min(observations, key=lambda item: _utc_datetime(item[1].first_observed_at))[1]
+        last = max(observations, key=lambda item: _utc_datetime(item[1].last_observed_at))[1]
+        merged.first_observed_at = first.first_observed_at
+        merged.last_observed_at = last.last_observed_at
+
+        retained = {}
+        for field_name in _RESEARCH_USER_LAST_KNOWN_FIELDS:
+            latest_value = getattr(latest, field_name)
+            candidates = [
+                item
+                for item in observations
+                if _research_user_field_present(getattr(item[1], field_name))
+            ]
+            if candidates:
+                _, newest_value = max(
+                    candidates,
+                    key=lambda item: (_utc_datetime(item[1].observed_at), item[0]),
+                )
+                setattr(merged, field_name, getattr(newest_value, field_name))
+                if not _research_user_field_present(latest_value):
+                    retained[field_name] = "retained_last_known_due_to_missing_current_observation"
+            else:
+                setattr(merged, field_name, None)
+
+        missing = dict(latest.missing_reasons_json or {})
+        missing.pop("retained_last_known", None)
+        if retained:
+            missing["retained_last_known"] = retained
+        merged.missing_reasons_json = missing
+        merged_rows.append(merged)
+
+    return sorted(merged_rows, key=lambda row: (row.user_id, _utc_datetime(row.observed_at)))
+
+
+def _research_user_field_present(value: Any) -> bool:
+    return value is not None and not (isinstance(value, str) and not value.strip())
+
+
+async def _upsert_rows(
+    session: Any,
+    model: type,
+    rows: list[Any],
+    *,
+    returning_fields: tuple[str, ...] = (),
+) -> dict[int, Any] | None:
     if not rows:
         return
     values = [_row_values(row) for row in rows]
@@ -996,10 +1209,25 @@ async def _upsert_rows(session: Any, model: type, rows: list[Any]) -> None:
                 is_current = statement.excluded.observed_at >= observed_column
             else:
                 is_current = True
-            updates[name] = case((is_current, excluded_value), else_=existing_value)
+            if model is ResearchUser and name in _RESEARCH_USER_LAST_KNOWN_FIELDS:
+                is_present = excluded_value.is_not(None)
+                if name in {"user_name", "nickname", "portrait"}:
+                    is_present = and_(is_present, excluded_value != "")
+                current_or_last_known = case(
+                    (is_present, excluded_value),
+                    else_=existing_value,
+                )
+                updates[name] = case((is_current, current_or_last_known), else_=existing_value)
+            else:
+                updates[name] = case((is_current, excluded_value), else_=existing_value)
 
     statement = statement.on_conflict_do_update(index_elements=list(primary_key), set_=updates)
+    if returning_fields:
+        statement = statement.returning(*(table.c[name] for name in returning_fields))
+        result = await session.execute(statement)
+        return {row["user_id"]: row for row in result.mappings().all()}
     await session.execute(statement)
+    return None
 
 
 def _append_user_observations(
@@ -1019,14 +1247,18 @@ def _append_user_observations(
     user_name = _optional_text(getattr(user, "user_name", None))
     nickname = _optional_text(_nickname(user))
     portrait = _optional_text(getattr(user, "portrait", None))
-    tieba_uid = _positive_id(getattr(user, "tieba_uid", None))
+    tieba_uid = _safe_tieba_uid(getattr(user, "tieba_uid", None), "author_tieba_uid", missing)
+    global_growth_level = _protobuf_int_field(
+        getattr(user, "glevel", None), "global_growth_level", missing
+    )
     records.users.append(
         ResearchUser(
             user_id=user_id,
-            user_name=user_name,
+            user_name=_identity_text(user_name),
             nickname=nickname,
-            portrait=portrait,
+            portrait=_identity_text(portrait),
             tieba_uid=tieba_uid,
+            global_growth_level=global_growth_level,
             first_observed_at=page.observed_at,
             last_observed_at=page.observed_at,
             source_api=page.source_api,
@@ -1062,7 +1294,7 @@ def _append_user_observations(
     if not hasattr(user, "icons"):
         snapshot_missing["icons"] = "not_exposed_by_content_endpoint"
     if tieba_uid is None:
-        snapshot_missing["tieba_uid"] = "not_exposed_by_content_endpoint"
+        snapshot_missing.setdefault("tieba_uid", "not_exposed_by_content_endpoint")
 
     records.user_forum_snapshots.append(
         UserForumSnapshot(
@@ -1236,16 +1468,44 @@ def _user_payload(user: Any) -> dict[str, Any] | None:
         "portrait",
         "user_name",
         "nick_name_new",
+        "nick_name_old",
         "level",
         "glevel",
         "is_bawu",
         "icons",
-        "tieba_uid",
     )
     payload = {name: _jsonable(getattr(user, name)) for name in names if hasattr(user, name)}
+    if hasattr(user, "tieba_uid"):
+        raw_tieba_uid = user.tieba_uid
+        payload["tieba_uid"] = _raw_tieba_uid(raw_tieba_uid)
+        if _int_value(raw_tieba_uid) is not None and _int_value(raw_tieba_uid) > SIGNED_BIGINT_MAX:
+            payload["tieba_uid_raw"] = str(raw_tieba_uid)
     if ip_location_text := _ip_location_text(user):
         payload["ip_location_text"] = ip_location_text
     return payload
+
+
+def _user_profile_payload(user: Any) -> dict[str, Any]:
+    payload = {
+        "observation_scope": "current_profile",
+        "api_type": type(user).__name__,
+    }
+    for name in ("user_id", "user_name", "nick_name_new", "nick_name_old", "portrait", "glevel"):
+        if hasattr(user, name):
+            payload[name] = _jsonable(getattr(user, name))
+    if hasattr(user, "tieba_uid"):
+        raw_tieba_uid = user.tieba_uid
+        payload["tieba_uid"] = _raw_tieba_uid(raw_tieba_uid)
+        if _int_value(raw_tieba_uid) is not None and _int_value(raw_tieba_uid) > SIGNED_BIGINT_MAX:
+            payload["tieba_uid_raw"] = str(raw_tieba_uid)
+    return payload
+
+
+def _raw_tieba_uid(value: Any) -> int | str | None:
+    integer = _int_value(value)
+    if integer is not None and integer > SIGNED_BIGINT_MAX:
+        return str(value)
+    return _jsonable(value)
 
 
 def _ip_location_text(user: Any) -> str | None:
@@ -1275,13 +1535,16 @@ def _missing_user_reasons(user: Any, source_api: str, *, record: Any = None) -> 
     reasons: dict[str, str] = {}
     if _author_user_id(record, user) is None:
         reasons["author_user_id"] = "aiotieba_zero_sentinel"
-    if not _optional_text(getattr(user, "user_name", None)):
+    if not _identity_text(getattr(user, "user_name", None)):
         reasons["author_user_name"] = "not_returned_by_source"
-    if not _optional_text(_nickname(user)):
+    if not _identity_text(_nickname(user)):
         reasons["author_nickname"] = "not_returned_by_source"
-    if not _optional_text(getattr(user, "portrait", None)):
+    if not _identity_text(getattr(user, "portrait", None)):
         reasons["author_portrait"] = "not_returned_by_source"
-    if _positive_id(getattr(user, "tieba_uid", None)) is None:
+    tieba_uid = _int_value(getattr(user, "tieba_uid", None))
+    if tieba_uid is not None and tieba_uid > SIGNED_BIGINT_MAX:
+        reasons["author_tieba_uid"] = "outside_signed_bigint_range"
+    elif _positive_id(tieba_uid) is None:
         reasons["author_tieba_uid"] = "not_returned_by_content_endpoint"
     for source_name, field_name in (("level", "forum_level"), ("glevel", "global_growth_level")):
         if not hasattr(user, source_name):
@@ -1424,15 +1687,18 @@ def _has_content_data(contents: Any) -> bool:
 def _nickname(user: Any) -> Any:
     if user is None:
         return None
-    return getattr(user, "nick_name_new", getattr(user, "nick_name", None))
+    for name in ("nick_name_new", "nick_name_old", "nick_name"):
+        if value := _identity_text(getattr(user, name, None)):
+            return value
+    return None
 
 
 def _author_user_id(record: Any, user: Any) -> int | None:
-    if record is not None:
-        value = _positive_id(getattr(record, "author_id", None))
-        if value is not None:
-            return value
-    return _positive_id(getattr(user, "user_id", None))
+    record_id = _positive_id(getattr(record, "author_id", None)) if record is not None else None
+    user_id = _positive_id(getattr(user, "user_id", None)) if user is not None else None
+    if record_id is not None and user_id is not None and record_id != user_id:
+        raise ValueError("Record author ID and parsed user ID disagree; refusing to persist identity.")
+    return record_id or user_id
 
 
 def _epoch_datetime(value: Any) -> datetime | None:
@@ -1474,6 +1740,18 @@ def _positive_id(value: Any) -> int | None:
     return integer if integer is not None and integer > 0 else None
 
 
+def _safe_tieba_uid(value: Any, field_name: str, missing: dict[str, str]) -> int | None:
+    integer = _int_value(value)
+    if integer is None or integer <= 0:
+        if integer == 0:
+            missing.setdefault(field_name, "zero_presence_unverified_in_parsed_object")
+        return None
+    if integer > SIGNED_BIGINT_MAX:
+        missing[field_name] = "outside_signed_bigint_range"
+        return None
+    return integer
+
+
 def _positive_int(value: Any) -> int | None:
     return _positive_id(value)
 
@@ -1483,6 +1761,11 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = str(value)
     return text or None
+
+
+def _identity_text(value: Any) -> str | None:
+    text = _optional_text(value)
+    return text if text is not None and text.strip() else None
 
 
 def _optional_bool(value: Any) -> bool | None:

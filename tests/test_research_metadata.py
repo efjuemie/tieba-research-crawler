@@ -401,6 +401,258 @@ async def test_user_forum_lookup_uses_shared_run_cache():
 
 
 @pytest.mark.asyncio
+async def test_sparse_user_observation_retains_last_known_values_and_latest_raw_missing_reason():
+    engine, sessionmaker_ = _sqlite_research_sessionmaker()
+    try:
+        user_id = 123456789012345678
+        first_time = datetime(2025, 1, 1, tzinfo=UTC)
+        second_time = datetime(2025, 1, 2, tzinfo=UTC)
+        first_user = _synthetic_user(user_id=user_id)
+        first_user.glevel = 7
+        first_page = _get_threads_page(
+            987654321012345678,
+            987654321012345679,
+            first_user,
+            first_time,
+            title="first observation",
+            reply_count=1,
+            last_time=1_750_000_001,
+        )
+        sparse_user = SimpleNamespace(
+            user_id=user_id,
+            user_name=" \t",
+            nick_name_new=" ",
+            nick_name_old="\n",
+            portrait="\t",
+            tieba_uid=0,
+            level=0,
+            glevel=0,
+            is_bawu=False,
+            icons=[],
+        )
+        second_page = _get_threads_page(
+            987654321012345678,
+            987654321012345679,
+            sparse_user,
+            second_time,
+            title="second observation",
+            reply_count=2,
+            last_time=1_750_000_002,
+        )
+
+        await persist_research_page(sessionmaker_, first_page)
+        await persist_research_page(sessionmaker_, second_page)
+
+        with Session(engine) as session:
+            user = session.get(ResearchUser, user_id)
+            assert user is not None
+            assert user.user_name == "synthetic-user"
+            assert user.nickname == "合成昵称"
+            assert user.portrait == "synthetic-portrait"
+            assert user.tieba_uid == 987654321098765432
+            assert user.global_growth_level == 7
+            assert user.first_observed_at == first_time.replace(tzinfo=None)
+            assert user.last_observed_at == second_time.replace(tzinfo=None)
+            assert user.observed_at == second_time.replace(tzinfo=None)
+            assert user.source_api == "aiotieba.get_threads"
+            assert user.source_payload_json["user_name"] == " \t"
+            assert user.source_payload_json["nick_name_new"] == " "
+            assert user.source_payload_json["tieba_uid"] == 0
+            assert user.missing_reasons_json["retained_last_known"] == {
+                "user_name": "retained_last_known_due_to_missing_current_observation",
+                "nickname": "retained_last_known_due_to_missing_current_observation",
+                "portrait": "retained_last_known_due_to_missing_current_observation",
+                "tieba_uid": "retained_last_known_due_to_missing_current_observation",
+                "global_growth_level": "retained_last_known_due_to_missing_current_observation",
+            }
+            assert user.missing_reasons_json["author_user_name"] == "not_returned_by_source"
+            assert user.missing_reasons_json["author_nickname"] == "not_returned_by_source"
+            assert user.missing_reasons_json["author_portrait"] == "not_returned_by_source"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_same_page_rich_then_sparse_user_observations_keep_rich_fields():
+    engine, sessionmaker_ = _sqlite_research_sessionmaker()
+    try:
+        user_id = 123456789012345678
+        observed_at = datetime(2025, 1, 1, tzinfo=UTC)
+        rich = _synthetic_user(user_id=user_id)
+        rich.glevel = 7
+        sparse = SimpleNamespace(
+            user_id=user_id,
+            user_name="",
+            nick_name_new="",
+            nick_name_old="",
+            portrait="",
+            tieba_uid=0,
+            level=0,
+            glevel=0,
+            is_bawu=False,
+            icons=[],
+        )
+        page = _get_posts_page(
+            987654321012345678,
+            987654321012345679,
+            rich,
+            observed_at,
+            Contents("synthetic first post"),
+            reply_contents=Contents("synthetic reply"),
+        )
+        page.raw.thread.user = rich
+        page.raw.objs[0].user = rich
+        page.raw.objs[1].user = sparse
+        page.raw.objs[1].author_id = user_id
+        assert len(build_research_records(page).users) == 2
+
+        await persist_research_page(sessionmaker_, page)
+
+        with Session(engine) as session:
+            user = session.get(ResearchUser, user_id)
+            assert user is not None
+            assert user.user_name == "synthetic-user"
+            assert user.nickname == "合成昵称"
+            assert user.portrait == "synthetic-portrait"
+            assert user.tieba_uid == 987654321098765432
+            assert user.global_growth_level == 7
+            assert user.source_payload_json["user_name"] == ""
+            assert user.missing_reasons_json["retained_last_known"]["nickname"]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_older_user_observation_updates_first_seen_but_not_latest_values_or_payload():
+    engine, sessionmaker_ = _sqlite_research_sessionmaker()
+    try:
+        user_id = 123456789012345678
+        old_time = datetime(2025, 1, 1, tzinfo=UTC)
+        new_time = datetime(2025, 1, 2, tzinfo=UTC)
+        newer_user = _synthetic_user(user_id=user_id)
+        newer_user.user_name = "newer-name"
+        newer_page = _get_threads_page(
+            987654321012345678,
+            987654321012345679,
+            newer_user,
+            new_time,
+            title="newer observation",
+            reply_count=2,
+            last_time=1_750_000_002,
+        )
+        older_user = _synthetic_user(user_id=user_id)
+        older_user.user_name = "older-name"
+        older_page = _get_threads_page(
+            987654321012345678,
+            987654321012345679,
+            older_user,
+            old_time,
+            title="older observation",
+            reply_count=1,
+            last_time=1_750_000_001,
+        )
+
+        await persist_research_page(sessionmaker_, newer_page)
+        await persist_research_page(sessionmaker_, older_page)
+
+        with Session(engine) as session:
+            user = session.get(ResearchUser, user_id)
+            assert user is not None
+            assert user.user_name == "newer-name"
+            assert user.source_payload_json["user_name"] == "newer-name"
+            assert user.observed_at == new_time.replace(tzinfo=None)
+            assert user.first_observed_at == old_time.replace(tzinfo=None)
+            assert user.last_observed_at == new_time.replace(tzinfo=None)
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_tieba_uid_outside_signed_bigint_is_null_but_kept_as_raw_decimal_string():
+    engine, sessionmaker_ = _sqlite_research_sessionmaker()
+    try:
+        user = _synthetic_user()
+        raw_tieba_uid = 1 << 63
+        user.tieba_uid = raw_tieba_uid
+        page = _get_threads_page(
+            987654321012345678,
+            987654321012345679,
+            user,
+            datetime(2025, 1, 1, tzinfo=UTC),
+            title="synthetic overflow case",
+            reply_count=1,
+            last_time=1_750_000_001,
+        )
+
+        await persist_research_page(sessionmaker_, page)
+
+        with Session(engine) as session:
+            thread = session.get(ResearchThread, 987654321012345678)
+            research_user = session.get(ResearchUser, user.user_id)
+            assert thread is not None
+            assert research_user is not None
+            assert thread.author_tieba_uid is None
+            assert thread.missing_reasons_json["author_tieba_uid"] == "outside_signed_bigint_range"
+            assert research_user.tieba_uid is None
+            assert research_user.source_payload_json["tieba_uid"] == str(raw_tieba_uid)
+            assert research_user.source_payload_json["tieba_uid_raw"] == str(raw_tieba_uid)
+            assert research_user.missing_reasons_json["author_tieba_uid"] == "outside_signed_bigint_range"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entity", ["thread", "post", "comment"])
+async def test_mismatched_record_and_user_author_ids_fail_before_any_rows_are_written(entity):
+    engine, sessionmaker_ = _sqlite_research_sessionmaker()
+    try:
+        user = _synthetic_user(user_id=123456789012345678)
+        observed_at = datetime(2025, 1, 1, tzinfo=UTC)
+        if entity == "thread":
+            page = _get_threads_page(
+                987654321012345678,
+                987654321012345679,
+                user,
+                observed_at,
+                title="synthetic thread",
+                reply_count=1,
+                last_time=1_750_000_001,
+            )
+            page.raw.objs[0].author_id += 1
+        elif entity == "post":
+            page = _get_posts_page(
+                987654321012345678,
+                987654321012345679,
+                user,
+                observed_at,
+                Contents("first post"),
+                reply_contents=Contents("synthetic reply"),
+            )
+            page.raw.objs[1].author_id += 1
+        else:
+            page = _get_comments_page(
+                987654321012345678,
+                987654321012345680,
+                987654321012345679,
+                user,
+                observed_at,
+                Contents("synthetic comment"),
+            )
+            page.raw.objs[0].author_id += 1
+
+        with pytest.raises(ValueError, match="author ID and parsed user ID disagree"):
+            await persist_research_page(sessionmaker_, page)
+
+        with Session(engine) as session:
+            assert session.scalars(select(ResearchThread)).all() == []
+            assert session.scalars(select(ResearchPost)).all() == []
+            assert session.scalars(select(ResearchComment)).all() == []
+            assert session.scalars(select(ResearchUser)).all() == []
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_run_cache_does_not_cache_retryable_failures():
     cache = ResearchRunCache()
     calls = 0
@@ -552,8 +804,8 @@ def test_login_cli_does_not_echo_rejected_secret_argument(capsys):
 def test_export_cli_dispatches_output_and_run_id(tmp_path: Path, monkeypatch):
     calls = []
 
-    async def fake_run(output_dir, run_id):
-        calls.append((output_dir, run_id))
+    async def fake_run(output_dir, run_id, entity_scope):
+        calls.append((output_dir, run_id, entity_scope))
 
     monkeypatch.setattr(research_cli_module, "_run_export", fake_run)
     output_dir = tmp_path / "exports"
@@ -561,7 +813,7 @@ def test_export_cli_dispatches_output_and_run_id(tmp_path: Path, monkeypatch):
     result = research_main(["export", "--output", str(output_dir), "--run-id", "synthetic-run"])
 
     assert result == 0
-    assert calls == [(output_dir, "synthetic-run")]
+    assert calls == [(output_dir, "synthetic-run", "all")]
 
 
 @pytest.mark.asyncio
@@ -597,9 +849,9 @@ async def test_export_cli_orchestrates_additive_migration_quality_and_export(tmp
 
     batch_directory = tmp_path / "exports" / "all-runs_source-synthetic-run_20261114_120000_000000_export"
 
-    async def fake_export(received_sessions, output_dir, summaries, *, source_run_id):
+    async def fake_export(received_sessions, output_dir, summaries, *, source_run_id, entity_scope):
         rows = [row async for row in summaries]
-        calls.append(("export", received_sessions, output_dir, rows, source_run_id))
+        calls.append(("export", received_sessions, output_dir, rows, source_run_id, entity_scope))
         return {"threads": batch_directory / "threads_all-runs.csv"}
 
     monkeypatch.setattr(core_config, "Config", lambda: SimpleNamespace(database_url="synthetic-local-database"))
@@ -614,7 +866,7 @@ async def test_export_cli_orchestrates_additive_migration_quality_and_export(tmp
     assert calls == [
         ("migration", engine),
         ("quality", sessionmaker, "synthetic-run"),
-        ("export", sessionmaker, tmp_path / "exports", quality_rows, "synthetic-run"),
+        ("export", sessionmaker, tmp_path / "exports", quality_rows, "synthetic-run", "all"),
     ]
     assert result_directory == batch_directory
     assert engine.disposed is True

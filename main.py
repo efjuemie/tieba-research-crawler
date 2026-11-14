@@ -71,49 +71,12 @@ async def _recover_pending_tasks(
         await adopt_legacy(research_run_id, responsible_fids)
         recovered = 0
         async for scope_batch in pending_scopes(research_run_id, responsible_fids, batch_size=500):
-            for scope in scope_batch:
-                if scope.status == "completed":
-                    continue
-                if scope.fid not in responsible_fids:
-                    continue
-                if scope.tid is None:
-                    raise ValueError(f"Research task scope {scope.logical_task_key!r} has no thread ID.")
-
-                if scope.scope_type == "thread_replies" and scope.task_type == "full_scan_posts":
-                    content = FullScanPostsTask(
-                        tid=int(scope.tid),
-                        rn=scope.rn,
-                        backfill=scope.backfill,
-                        run_id=research_run_id,
-                        generation=scope.generation,
-                        fid=scope.fid,
-                        fname=scope.fname,
-                    )
-                    priority = Priority.BACKFILL_POSTS if scope.backfill else Priority.MEDIUM
-                elif scope.scope_type == "post_comments" and scope.task_type == "full_scan_comments":
-                    if scope.parent_pid is None:
-                        raise ValueError(f"Research comment scope {scope.logical_task_key!r} has no parent post ID.")
-                    content = FullScanCommentsTask(
-                        tid=int(scope.tid),
-                        pid=int(scope.parent_pid),
-                        backfill=scope.backfill,
-                        parent_kind=scope.parent_kind,
-                        run_id=research_run_id,
-                        generation=scope.generation,
-                        parent_generation=scope.parent_generation,
-                        fid=scope.fid,
-                        fname=scope.fname,
-                        rn=scope.rn,
-                    )
-                    priority = Priority.BACKFILL_POSTS if scope.backfill else Priority.LOW
-                else:
-                    raise ValueError(
-                        "Unsupported current research task scope: "
-                        f"scope_type={scope.scope_type!r}, task_type={scope.task_type!r}."
-                    )
-
-                await router.put(Task(priority=priority, content=content))
-                recovered += 1
+            recovered += await _enqueue_research_scope_batch(
+                router,
+                scope_batch,
+                responsible_fids,
+                research_run_id,
+            )
 
         if recovered:
             logger.info("Recovered current research task scopes: {}", recovered)
@@ -149,6 +112,79 @@ async def _recover_pending_tasks(
             recovered_threads,
             recovered_comments,
         )
+
+
+async def _enqueue_research_scope_batch(
+    router: QueueRouter,
+    scopes: list[Any],
+    responsible_fids: set[int],
+    research_run_id: str,
+) -> int:
+    """Enqueue only durable research detail scopes from the requested run."""
+    enqueued = 0
+    for scope in scopes:
+        if scope.status == "completed" or scope.fid not in responsible_fids:
+            continue
+        if scope.tid is None:
+            raise ValueError(f"Research task scope {scope.logical_task_key!r} has no thread ID.")
+
+        if scope.scope_type == "thread_replies" and scope.task_type == "full_scan_posts":
+            content = FullScanPostsTask(
+                tid=int(scope.tid),
+                rn=scope.rn,
+                backfill=scope.backfill,
+                run_id=research_run_id,
+                generation=scope.generation,
+                fid=scope.fid,
+                fname=scope.fname,
+            )
+            priority = Priority.BACKFILL_POSTS if scope.backfill else Priority.MEDIUM
+        elif scope.scope_type == "post_comments" and scope.task_type == "full_scan_comments":
+            if scope.parent_pid is None:
+                raise ValueError(f"Research comment scope {scope.logical_task_key!r} has no parent post ID.")
+            content = FullScanCommentsTask(
+                tid=int(scope.tid),
+                pid=int(scope.parent_pid),
+                backfill=scope.backfill,
+                parent_kind=scope.parent_kind,
+                run_id=research_run_id,
+                generation=scope.generation,
+                parent_generation=scope.parent_generation,
+                fid=scope.fid,
+                fname=scope.fname,
+                rn=scope.rn,
+            )
+            priority = Priority.BACKFILL_POSTS if scope.backfill else Priority.LOW
+        else:
+            raise ValueError(
+                "Unsupported current research task scope: "
+                f"scope_type={scope.scope_type!r}, task_type={scope.task_type!r}."
+            )
+
+        await router.put(Task(priority=priority, content=content))
+        enqueued += 1
+    return enqueued
+
+
+async def _snapshot_pending_research_scopes(
+    datastore: DataStore,
+    run_id: str,
+    responsible_fids: set[int],
+    *,
+    tid: int | None,
+    limit: int,
+) -> list[Any]:
+    """Freeze the initial selection before workers can create child scopes."""
+    scopes: list[Any] = []
+    async for scope_batch in datastore.iter_pending_research_task_scopes(
+        run_id,
+        responsible_fids,
+        batch_size=min(500, limit),
+        tid=tid,
+        limit=limit,
+    ):
+        scopes.extend(scope_batch)
+    return scopes
 
 
 async def _pending_scan_batches(
@@ -385,11 +421,18 @@ async def _prepare_research_run(
         research_run_cache.clear()
     logger.info("Research run started: {}", active_run_id)
 
+    await _prepare_research_auth(container, datastore, active_run_id)
+    return active_run_id
+
+
+async def _prepare_research_auth(container, datastore: DataStore, active_run_id: str) -> None:
+    config = container.config
+
     if not getattr(config, "fetch_user_forum_info", False):
         auth_ready = getattr(container, "research_auth_ready", None)
         if auth_ready is not None:
             auth_ready.set()
-        return active_run_id
+        return
 
     auth_ready = getattr(container, "research_auth_ready", None)
     if auth_ready is not None:
@@ -415,7 +458,163 @@ async def _prepare_research_run(
             await datastore.set_research_run_status(active_run_id, wait_error.status, wait_error.reason)
             raise
         await datastore.resume_research_run_if_status(active_run_id, "paused_auth")
-    return active_run_id
+
+
+async def drain_pending(
+    *,
+    run_id: str,
+    tid: int | None = None,
+    limit: int = 10,
+    max_seconds: int = 120,
+) -> int:
+    """Drain existing detail scopes for one run without scheduling thread-list requests.
+
+    ``limit`` applies to the initial set of durable scopes. Child comment scopes
+    created by a selected thread scope remain part of that work. A zero
+    ``max_seconds`` disables the deadline.
+    """
+    if not run_id:
+        raise ValueError("drain-pending requires an existing --run-id.")
+    if tid is not None and tid <= 0:
+        raise ValueError("--tid must be a positive integer.")
+    if limit < 1:
+        raise ValueError("--limit must be a positive integer.")
+    if max_seconds < 0:
+        raise ValueError("--max-seconds must be zero or a positive integer.")
+
+    container, router = await initialize_application(mode="backfill")
+    datastore: DataStore | None = None
+    worker_tasks: list[asyncio.Task] = []
+    active_run_id: str | None = None
+    try:
+        datastore = DataStore(container)
+        if not getattr(container.config, "research_enabled", False):
+            raise ValueError("drain-pending requires research.enabled=true.")
+        forums = [(int(forum.fid), str(forum.fname)) for forum in (container.forums or [])]
+        if not forums:
+            raise ValueError("Research backfill requires at least one initialized forum.")
+        run_status = await datastore.load_research_run_for_drain(run_id, forums)
+        responsible_fids = {int(forum.fid) for forum in (container.forums or [])}
+
+        # Select a fixed initial subset before starting workers. This keeps
+        # dynamic child scopes out of the user's initial --limit count.
+        selected = await _snapshot_pending_research_scopes(
+            datastore,
+            run_id,
+            responsible_fids,
+            tid=tid,
+            limit=limit,
+        )
+        if not selected:
+            logger.info("No pending research detail scopes selected; run status remains {}.", run_status)
+            return 0
+
+        if not await datastore.resume_research_run_for_drain(run_id, run_status):
+            raise RuntimeError(f"Research run {run_id} could not be activated from status {run_status!r}.")
+        active_run_id = run_id
+        container.research_run_id = active_run_id
+        research_run_cache = getattr(container, "research_run_cache", None)
+        if research_run_cache is not None:
+            research_run_cache.clear()
+        activation_reason = "drain_reopened_completed_run" if run_status == "completed" else None
+        logger.info(
+            "Research run selected for drain: {} (previous status={}, reason={}).",
+            active_run_id,
+            run_status,
+            activation_reason,
+        )
+        await _prepare_research_auth(container, datastore, active_run_id)
+
+        workers: list[Worker] = []
+        worker_id = 0
+        for lane, count in (
+            ("posts", container.config.worker_posts),
+            ("comments", container.config.worker_comments),
+        ):
+            for _ in range(count):
+                workers.append(
+                    Worker(
+                        worker_id,
+                        router.get_queue(lane),
+                        container,
+                        datastore,
+                        router,
+                        lane=lane,
+                    )
+                )
+                worker_id += 1
+
+        worker_tasks = [
+            asyncio.create_task(worker.run(), name=f"worker-{worker.lane}-{worker.worker_id}")
+            for worker in workers
+        ]
+        logger.info(
+            "Draining research run {}: initial_scopes={}, tid={}, limit={}, max_seconds={}",
+            active_run_id,
+            len(selected),
+            tid,
+            limit,
+            max_seconds,
+        )
+
+        async def enqueue_and_wait_idle() -> None:
+            await _enqueue_research_scope_batch(
+                router,
+                selected,
+                responsible_fids,
+                active_run_id,
+            )
+            await router.wait_idle()
+
+        try:
+            if max_seconds == 0:
+                await enqueue_and_wait_idle()
+            else:
+                async with asyncio.timeout(max_seconds):
+                    await enqueue_and_wait_idle()
+        except TimeoutError:
+            await datastore.set_research_run_status_if(
+                active_run_id,
+                {"running", "incomplete"},
+                "paused_limit",
+                "drain_max_seconds_reached",
+            )
+            logger.warning("drain-pending reached its {} second deadline.", max_seconds)
+        else:
+            status = await datastore.reconcile_research_run_status_after_drain(active_run_id)
+            logger.info("drain-pending finished; run status is {}.", status)
+
+        return len(selected)
+    except asyncio.CancelledError:
+        if datastore is not None and active_run_id is not None:
+            await datastore.set_research_run_status_if(
+                active_run_id,
+                {"running", "incomplete"},
+                "interrupted",
+                "drain_cancelled",
+            )
+        raise
+    except Exception as error:
+        if datastore is not None and active_run_id is not None:
+            await datastore.set_research_run_status_if(
+                active_run_id,
+                {"running"},
+                "incomplete",
+                f"drain_failed_{type(error).__name__}",
+            )
+        raise
+    finally:
+        for task in worker_tasks:
+            if not task.done():
+                task.cancel()
+        if worker_tasks:
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+        if datastore is not None:
+            try:
+                await datastore.close()
+            except Exception:
+                pass
+        await container.teardown()
 
 
 async def main(
@@ -574,26 +773,77 @@ def get_loop_factory():
 if __name__ == "__main__":
     import argparse
 
+    def positive_int(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError("must be an integer") from error
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("must be positive")
+        return parsed
+
+    def nonnegative_int(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError("must be an integer") from error
+        if parsed < 0:
+            raise argparse.ArgumentTypeError("must be zero or positive")
+        return parsed
+
     parser = argparse.ArgumentParser(description="Tieba Scraper Application")
+    parser.add_argument("command", nargs="?", choices=["drain-pending"])
     parser.add_argument(
         "--mode",
         choices=["periodic", "backfill", "hybrid"],
-        default="periodic",
-        help=("Running mode: 'periodic' for continuous monitoring, 'backfill' for historical data, 'hybrid' for both."),
+        help=(
+            "Running mode: 'periodic' for continuous monitoring, 'backfill' for historical data, "
+            "or 'hybrid' for both."
+        ),
     )
     parser.add_argument("--resume", action="store_true", help="resume the latest compatible research run")
-    parser.add_argument("--run-id", help="resume this exact research run; requires --resume")
+    parser.add_argument("--run-id", help="resume this exact run with --resume or drain-pending")
+    parser.add_argument("--tid", type=positive_int, help="limit drain-pending to this thread ID")
+    parser.add_argument(
+        "--limit",
+        type=positive_int,
+        help="drain-pending maximum initial detail scopes (default: 10; discovered child scopes are included)",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=nonnegative_int,
+        help="drain-pending detail-work deadline in seconds (default: 120; 0 means no deadline)",
+    )
     args = parser.parse_args()
-    if args.run_id and not args.resume:
-        parser.error("--run-id requires --resume")
+    if args.command == "drain-pending":
+        if not args.run_id:
+            parser.error("drain-pending requires --run-id for an existing research run")
+        if args.resume:
+            parser.error("drain-pending resumes the exact run named by --run-id; omit --resume")
+        if args.mode is not None:
+            parser.error("--mode cannot be combined with drain-pending")
+    else:
+        if args.run_id and not args.resume:
+            parser.error("--run-id requires --resume")
+        if args.tid is not None or args.limit is not None or args.max_seconds is not None:
+            parser.error("--tid, --limit, and --max-seconds are only valid with drain-pending")
 
     loop_factory = get_loop_factory()
 
     try:
+        if args.command == "drain-pending":
+            coroutine = drain_pending(
+                run_id=args.run_id,
+                tid=args.tid,
+                limit=args.limit if args.limit is not None else 10,
+                max_seconds=args.max_seconds if args.max_seconds is not None else 120,
+            )
+        else:
+            coroutine = main(args.mode or "periodic", resume=args.resume, run_id=args.run_id)
         if loop_factory is not None:
             with asyncio.Runner(loop_factory=loop_factory) as runner:
-                runner.run(main(args.mode, resume=args.resume, run_id=args.run_id))
+                runner.run(coroutine)
         else:
-            asyncio.run(main(args.mode, resume=args.resume, run_id=args.run_id))
+            asyncio.run(coroutine)
     except KeyboardInterrupt:
         logger.info("Application stopped by user.")

@@ -162,6 +162,7 @@ class ResearchUser(ResearchRecordMixin, Base):
     nickname: Mapped[str | None] = mapped_column(Text, nullable=True)
     portrait: Mapped[str | None] = mapped_column(Text, nullable=True)
     tieba_uid: Mapped[int | None] = mapped_column(BIGINT, nullable=True)
+    global_growth_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
     first_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

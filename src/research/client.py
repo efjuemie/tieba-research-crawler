@@ -8,13 +8,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
-from aiotieba.enums import PostSortType, ReqUInfo, ThreadSortType
+from aiotieba.enums import BawuType, PostSortType, ReqUInfo, ThreadSortType
 from tiebameow.client.tieba_client import Client, RetriableApiError, UnretriableApiError, with_ensure
 from tiebameow.parser import convert_aiotieba_comments, convert_aiotieba_posts, convert_aiotieba_threads
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from aiotieba.api._classdef.user import UserInfo
+    from aiotieba.api.get_bawu_info._classdef import BawuInfo
     from aiotieba.api.get_user_forum_info._classdef import UserForumInfo
     from tiebameow.models.dto import CommentsDTO, PostsDTO, ThreadsDTO
 
@@ -52,6 +54,44 @@ class ResearchUserForumInfo:
     error_code: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ResearchUserProfileInfo:
+    user_id: int
+    response_user_id: int | None
+    user_name: str | None
+    nickname: str | None
+    portrait: str | None
+    tieba_uid: int | None
+    global_growth_level: int | None
+    status: Literal["available", "unavailable", "blocked", "retryable_failure"]
+    missing_reasons: dict[str, str]
+    error_type: str | None = None
+    error_code: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchUserBawuInfo:
+    user_id: int
+    response_user_id: int | None
+    fid: int
+    role_type: str | None
+    role_name: str | None
+    is_bawu: bool | None
+    status: Literal["available", "not_listed", "unavailable", "blocked", "retryable_failure"]
+    missing_reasons: dict[str, str]
+    error_type: str | None = None
+    error_code: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchBawuRoster:
+    fid: int
+    status: Literal["available", "blocked", "retryable_failure"]
+    missing_reasons: dict[str, str]
+    error_type: str | None = None
+    error_code: int | None = None
+
+
 class ResearchRunCache:
     """Deduplicate forum-info lookups across workers within one crawl run."""
 
@@ -62,6 +102,8 @@ class ResearchRunCache:
         self._user_forum: OrderedDict[
             tuple[int, int], ResearchPage[object | None, ResearchUserForumInfo]
         ] = OrderedDict()
+        self._user_profiles: OrderedDict[int, ResearchPage[UserInfo | None, ResearchUserProfileInfo]] = OrderedDict()
+        self._bawu_rosters: OrderedDict[int, ResearchPage[BawuInfo | None, ResearchBawuRoster]] = OrderedDict()
         self._lock = asyncio.Lock()
 
     async def get_or_create(
@@ -80,9 +122,61 @@ class ResearchRunCache:
                     self._user_forum.popitem(last=False)
             return page
 
+    async def get_user_profile_or_create(
+        self,
+        user_id: int,
+        factory: Callable[[], Awaitable[ResearchPage[UserInfo | None, ResearchUserProfileInfo]]],
+    ) -> ResearchPage[UserInfo | None, ResearchUserProfileInfo]:
+        async with self._lock:
+            if page := self._user_profiles.get(user_id):
+                self._user_profiles.move_to_end(user_id)
+                return page
+            page = await factory()
+            if page.dto.status != "retryable_failure":
+                self._user_profiles[user_id] = page
+                if len(self._user_profiles) > self._max_entries:
+                    self._user_profiles.popitem(last=False)
+            return page
+
+    async def get_bawu_roster_or_create(
+        self,
+        fid: int,
+        factory: Callable[[], Awaitable[ResearchPage[BawuInfo | None, ResearchBawuRoster]]],
+    ) -> ResearchPage[BawuInfo | None, ResearchBawuRoster]:
+        async with self._lock:
+            if page := self._bawu_rosters.get(fid):
+                self._bawu_rosters.move_to_end(fid)
+                return page
+            page = await factory()
+            if page.dto.status != "retryable_failure":
+                self._bawu_rosters[fid] = page
+                if len(self._bawu_rosters) > self._max_entries:
+                    self._bawu_rosters.popitem(last=False)
+            return page
+
     def clear(self) -> None:
         """Start a new cache scope before a new crawl run."""
         self._user_forum.clear()
+        self._user_profiles.clear()
+        self._bawu_rosters.clear()
+
+
+_BAWU_ROLE_GROUPS = (
+    ("admin", BawuType.ADMIN.value, "大吧主"),
+    ("manager", BawuType.MANAGER.value, "小吧主"),
+    ("voice_editor", BawuType.VOICE_EDITOR.value, "语音小编"),
+    ("image_editor", BawuType.IMAGE_EDITOR.value, "图片小编"),
+    ("video_editor", BawuType.VIDEO_EDITOR.value, "视频小编"),
+    ("broadcast_editor", BawuType.BROADCAST_EDITOR.value, "广播小编"),
+    ("journal_chief_editor", BawuType.JOURNAL_CHIEF_EDITOR.value, "吧刊主编"),
+    ("journal_editor", BawuType.JOURNAL_EDITOR.value, "吧刊小编"),
+    ("profess_admin", BawuType.PROFESS_ADMIN.value, "职业吧主"),
+    ("fourth_admin", BawuType.FOURTH_ADMIN.value, "第四吧主"),
+)
+
+
+def _nonblank_profile_text(value: str | None) -> str | None:
+    return value if value and value.strip() else None
 
 
 class ResearchClient(Client):
@@ -173,6 +267,271 @@ class ResearchClient(Client):
             dto=dto,
             observed_at=datetime.now(UTC),
             source_api="aiotieba.get_comments",
+        )
+
+    async def get_user_info_research(
+        self,
+        user_id: int,
+        /,
+    ) -> ResearchPage[UserInfo | None, ResearchUserProfileInfo]:
+        """Fetch one current user profile, cached by the confirmed legacy user ID."""
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            return self._missing_user_profile_page(user_id, reason="invalid_user_id")
+
+        return await self.research_run_cache.get_user_profile_or_create(
+            user_id,
+            lambda: self._fetch_user_info_research(user_id),
+        )
+
+    async def _fetch_user_info_research(
+        self,
+        user_id: int,
+    ) -> ResearchPage[UserInfo | None, ResearchUserProfileInfo]:
+        try:
+            # glevel is returned by the OTHER profile field group; ALL is required
+            # to request it together with identity and tieba_uid in aiotieba 4.8.2.
+            raw = await self.get_user_info(user_id, require=ReqUInfo.ALL)
+        except UnretriableApiError as error:
+            return self._failed_user_profile_page(user_id, status="blocked", error=error)
+        except RetriableApiError as error:
+            return self._failed_user_profile_page(user_id, status="retryable_failure", error=error)
+
+        observed_at = datetime.now(UTC)
+        response_user_id = raw.user_id or None
+        identity_mismatch = response_user_id != user_id
+        missing: dict[str, str] = {}
+        if response_user_id is None:
+            missing["response_user_id"] = "aiotieba_zero_sentinel"
+        if identity_mismatch:
+            reason = "response_user_id_missing" if response_user_id is None else "response_user_id_mismatch"
+            missing.update(
+                dict.fromkeys(
+                    ("user_name", "nickname", "portrait", "tieba_uid", "global_growth_level"),
+                    reason,
+                )
+            )
+        else:
+            user_name = _nonblank_profile_text(raw.user_name)
+            nickname = _nonblank_profile_text(raw.nick_name_new) or _nonblank_profile_text(raw.nick_name_old)
+            portrait = _nonblank_profile_text(raw.portrait)
+            if user_name is None:
+                missing["user_name"] = "not_returned_by_get_user_info_4_8_2"
+            if nickname is None:
+                missing["nickname"] = "not_returned_by_get_user_info_4_8_2"
+            if portrait is None:
+                missing["portrait"] = "not_returned_by_get_user_info_4_8_2"
+            if not raw.tieba_uid:
+                missing["tieba_uid"] = "zero_presence_unverified_in_parsed_object"
+            if not raw.glevel:
+                missing["global_growth_level"] = "zero_presence_unverified_in_parsed_object"
+
+        dto = ResearchUserProfileInfo(
+            user_id=user_id,
+            response_user_id=response_user_id,
+            user_name=None if identity_mismatch else _nonblank_profile_text(raw.user_name),
+            nickname=None
+            if identity_mismatch
+            else (_nonblank_profile_text(raw.nick_name_new) or _nonblank_profile_text(raw.nick_name_old)),
+            portrait=None if identity_mismatch else _nonblank_profile_text(raw.portrait),
+            tieba_uid=None if identity_mismatch else (raw.tieba_uid or None),
+            global_growth_level=None if identity_mismatch else raw.glevel,
+            status="unavailable" if identity_mismatch else "available",
+            missing_reasons=missing,
+        )
+        return ResearchPage(
+            raw=raw,
+            dto=dto,
+            observed_at=observed_at,
+            source_api="aiotieba.get_user_info",
+        )
+
+    async def get_bawu_info_research(
+        self,
+        fid: int,
+        user_id: int,
+        /,
+    ) -> ResearchPage[BawuInfo | None, ResearchUserBawuInfo]:
+        """Project one exact user from a cached current forum bawu roster."""
+        if isinstance(fid, bool) or not isinstance(fid, int) or fid <= 0:
+            return self._missing_user_bawu_page(fid, user_id, reason="invalid_fid")
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            return self._missing_user_bawu_page(fid, user_id, reason="invalid_user_id")
+
+        roster_page = await self.research_run_cache.get_bawu_roster_or_create(
+            fid,
+            lambda: self._fetch_bawu_roster(fid),
+        )
+        if roster_page.raw is None:
+            dto = ResearchUserBawuInfo(
+                user_id=user_id,
+                response_user_id=None,
+                fid=fid,
+                role_type=None,
+                role_name=None,
+                is_bawu=None,
+                status=roster_page.dto.status,
+                missing_reasons=dict(roster_page.dto.missing_reasons),
+                error_type=roster_page.dto.error_type,
+                error_code=roster_page.dto.error_code,
+            )
+        else:
+            matches = []
+            for attribute, raw_role_type, role_name in _BAWU_ROLE_GROUPS:
+                if any(member.user_id == user_id for member in getattr(roster_page.raw, attribute, ())):
+                    matches.append((raw_role_type, role_name))
+            if matches:
+                dto = ResearchUserBawuInfo(
+                    user_id=user_id,
+                    response_user_id=user_id,
+                    fid=fid,
+                    role_type=",".join(role_type for role_type, _ in matches),
+                    role_name="、".join(role_name for _, role_name in matches),
+                    is_bawu=True,
+                    status="available",
+                    missing_reasons={},
+                )
+            else:
+                dto = ResearchUserBawuInfo(
+                    user_id=user_id,
+                    response_user_id=None,
+                    fid=fid,
+                    role_type=None,
+                    role_name=None,
+                    is_bawu=None,
+                    status="not_listed",
+                    missing_reasons={
+                        "is_bawu": "not_listed_in_observed_roster",
+                        "role_type": "not_listed_in_observed_roster",
+                        "role_name": "not_listed_in_observed_roster",
+                    },
+                )
+
+        return ResearchPage(
+            raw=roster_page.raw,
+            dto=dto,
+            observed_at=roster_page.observed_at,
+            source_api="aiotieba.get_bawu_info",
+        )
+
+    async def _fetch_bawu_roster(self, fid: int) -> ResearchPage[BawuInfo | None, ResearchBawuRoster]:
+        try:
+            raw = await self._get_bawu_info_by_fid(fid)
+        except UnretriableApiError as error:
+            return self._failed_bawu_roster_page(fid, status="blocked", error=error)
+        except RetriableApiError as error:
+            return self._failed_bawu_roster_page(fid, status="retryable_failure", error=error)
+        return ResearchPage(
+            raw=raw,
+            dto=ResearchBawuRoster(fid=fid, status="available", missing_reasons={}),
+            observed_at=datetime.now(UTC),
+            source_api="aiotieba.get_bawu_info",
+        )
+
+    @with_ensure
+    async def _get_bawu_info_by_fid(self, fid: int) -> BawuInfo:
+        return await super().get_bawu_info(fid)
+
+    @staticmethod
+    def _missing_user_profile_page(
+        user_id: int,
+        *,
+        reason: str,
+    ) -> ResearchPage[None, ResearchUserProfileInfo]:
+        return ResearchPage(
+            raw=None,
+            dto=ResearchUserProfileInfo(
+                user_id=user_id,
+                response_user_id=None,
+                user_name=None,
+                nickname=None,
+                portrait=None,
+                tieba_uid=None,
+                global_growth_level=None,
+                status="unavailable",
+                missing_reasons=dict.fromkeys(
+                    ("user_name", "nickname", "portrait", "tieba_uid", "global_growth_level"),
+                    reason,
+                ),
+            ),
+            observed_at=datetime.now(UTC),
+            source_api="aiotieba.get_user_info",
+        )
+
+    @classmethod
+    def _failed_user_profile_page(
+        cls,
+        user_id: int,
+        *,
+        status: Literal["blocked", "retryable_failure"],
+        error: RetriableApiError | UnretriableApiError,
+    ) -> ResearchPage[None, ResearchUserProfileInfo]:
+        reason = f"{type(error).__name__}:{error.code}"
+        page = cls._missing_user_profile_page(user_id, reason=reason)
+        return ResearchPage(
+            raw=None,
+            dto=ResearchUserProfileInfo(
+                user_id=user_id,
+                response_user_id=None,
+                user_name=None,
+                nickname=None,
+                portrait=None,
+                tieba_uid=None,
+                global_growth_level=None,
+                status=status,
+                missing_reasons=page.dto.missing_reasons,
+                error_type=type(error).__name__,
+                error_code=error.code,
+            ),
+            observed_at=page.observed_at,
+            source_api=page.source_api,
+        )
+
+    @staticmethod
+    def _missing_user_bawu_page(
+        fid: int,
+        user_id: int,
+        *,
+        reason: str,
+    ) -> ResearchPage[None, ResearchUserBawuInfo]:
+        return ResearchPage(
+            raw=None,
+            dto=ResearchUserBawuInfo(
+                user_id=user_id,
+                response_user_id=None,
+                fid=fid,
+                role_type=None,
+                role_name=None,
+                is_bawu=None,
+                status="unavailable",
+                missing_reasons={
+                    "is_bawu": reason,
+                    "role_type": reason,
+                    "role_name": reason,
+                },
+            ),
+            observed_at=datetime.now(UTC),
+            source_api="aiotieba.get_bawu_info",
+        )
+
+    @classmethod
+    def _failed_bawu_roster_page(
+        cls,
+        fid: int,
+        *,
+        status: Literal["blocked", "retryable_failure"],
+        error: RetriableApiError | UnretriableApiError,
+    ) -> ResearchPage[None, ResearchBawuRoster]:
+        return ResearchPage(
+            raw=None,
+            dto=ResearchBawuRoster(
+                fid=fid,
+                status=status,
+                missing_reasons={"role_type": f"{type(error).__name__}:{error.code}"},
+                error_type=type(error).__name__,
+                error_code=error.code,
+            ),
+            observed_at=datetime.now(UTC),
+            source_api="aiotieba.get_bawu_info",
         )
 
     async def get_user_forum_info_research(
