@@ -30,6 +30,23 @@ init_logger(
 GRACEFUL_SHUTDOWN_TIMEOUT = 60
 
 
+async def _cancel_and_reap_tasks(tasks: list[asyncio.Task], aggregate: asyncio.Future | None = None) -> None:
+    """Cancel internal tasks and consume both individual and aggregate results."""
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    if aggregate is not None:
+        if not aggregate.done():
+            aggregate.cancel()
+        try:
+            aggregate.result()
+        except BaseException:
+            pass
+
+
 async def _recover_pending_tasks(
     datastore: DataStore,
     router: QueueRouter,
@@ -103,8 +120,9 @@ async def _run_periodic_mode(scheduler: Scheduler, workers: list[Worker], router
     tasks.append(scheduler_task)
     tasks.extend(asyncio.create_task(w.run(), name=f"worker-{w.lane}-{w.worker_id}") for w in workers)
 
+    aggregate = asyncio.gather(*tasks)
     try:
-        await asyncio.shield(asyncio.gather(*tasks))
+        await asyncio.shield(aggregate)
     except asyncio.CancelledError:
         logger.info("Received shutdown signal. Starting graceful shutdown...")
 
@@ -142,6 +160,11 @@ async def _run_periodic_mode(scheduler: Scheduler, workers: list[Worker], router
 
         logger.info("Graceful shutdown completed.")
         raise
+    except Exception:
+        scheduler.stop()
+        raise
+    finally:
+        await _cancel_and_reap_tasks(tasks, aggregate)
 
 
 async def _run_hybrid_mode(scheduler: Scheduler, workers: list[Worker], router: QueueRouter) -> None:
@@ -164,8 +187,9 @@ async def _run_hybrid_mode(scheduler: Scheduler, workers: list[Worker], router: 
 
     tasks.extend(asyncio.create_task(w.run(), name=f"worker-{w.lane}-{w.worker_id}") for w in workers)
 
+    aggregate = asyncio.gather(*tasks)
     try:
-        await asyncio.shield(asyncio.gather(*tasks))
+        await asyncio.shield(aggregate)
     except asyncio.CancelledError:
         logger.info("Received shutdown signal in hybrid mode. Starting graceful shutdown...")
 
@@ -215,6 +239,11 @@ async def _run_hybrid_mode(scheduler: Scheduler, workers: list[Worker], router: 
 
         logger.info("Graceful shutdown completed.")
         raise
+    except Exception:
+        scheduler.stop()
+        raise
+    finally:
+        await _cancel_and_reap_tasks(tasks, aggregate)
 
 
 async def main(mode: Literal["periodic", "backfill", "hybrid"] = "periodic"):
@@ -289,6 +318,7 @@ async def main(mode: Literal["periodic", "backfill", "hybrid"] = "periodic"):
 
     except Exception as e:
         logger.exception("Application failed to start or run: {}", e)
+        raise
     finally:
         if monitor_task and not monitor_task.done():
             monitor_task.cancel()

@@ -20,7 +20,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Literal
 
-from aiotieba.enums import PostSortType
+from aiotieba.enums import PostSortType, ThreadSortType
 from tiebameow.client.tieba_client import UnretriableApiError
 from tiebameow.models.orm import Comment, Post, User
 from tiebameow.utils.logger import logger
@@ -42,6 +42,7 @@ from .tasks import (
     Priority,
     ScanThreadsTask,
     Task,
+    ThreadPageResult,
 )
 
 if TYPE_CHECKING:
@@ -257,66 +258,45 @@ class ThreadsTaskHandler(TaskHandler):
     获取主题贴列表并分别处理新旧主题贴。
     """
 
-    async def handle(self, task_content: ScanThreadsTask):
-        """处理扫描指定贴吧特定页码的任务。
-
-        主要流程：
-        1. 获取指定页码的主题贴列表
-        2. 过滤掉直播贴
-        3. 根据tid去重，分类新旧主题贴
-        4. 分别处理新旧主题贴
-
-        Args:
-            task_content: ScanThreadsTask实例，包含贴吧名、fid和页码信息。
-        """
+    async def handle(self, task_content: ScanThreadsTask) -> ThreadPageResult:
+        """Fetch one page; the backfill scheduler owns page continuation."""
         fname = task_content.fname
         pn = task_content.pn
-        rn = task_content.rn
         is_good = task_content.is_good
-        backfill = task_content.backfill
-        max_pages = task_content.max_pages
+        sort = ThreadSortType.CREATE if task_content.backfill else ThreadSortType.REPLY
+        threads_data = await self.get_threads(fname, pn=pn, rn=task_content.rn, sort=sort, is_good=is_good)
 
-        try:
-            threads_data = await self.get_threads(fname, pn=pn, rn=rn, is_good=is_good)
+        all_tids = [thread.tid for thread in threads_data.objs]
+        non_top_create_times = tuple(thread.create_time for thread in threads_data.objs if not thread.is_top)
+        if task_content.backfill and any(
+            earlier < later
+            for earlier, later in zip(non_top_create_times, non_top_create_times[1:], strict=False)
+        ):
+            raise ValueError(f"CREATE sort order is not descending for {fname} is_good={is_good} pn={pn}")
 
-            if not threads_data.objs:
-                self.log.debug("No threads found for {}吧, pn={}. Task finished.", fname, pn)
-                return
+        if not threads_data.objs:
+            self.log.debug("No threads found for {}吧, is_good={}, pn={}", fname, is_good, pn)
+        elif task_content.force:
+            new_tids = set(all_tids)
+            old_tids = set()
+            self.log.info("{}吧, pn={}: Force scan enabled. Processing {} threads as new.", fname, pn, len(all_tids))
+        else:
+            new_tids = await self.datastore.filter_new_ids("thread", all_tids)
+            old_tids = set(all_tids) - new_tids
+            self.log.debug("{}吧, pn={}: Found {} threads, {} are new.", fname, pn, len(all_tids), len(new_tids))
 
-            threads_data.objs = [t for t in threads_data.objs if not t.is_livepost]
-            all_tids = [t.tid for t in threads_data.objs]
+        if threads_data.objs:
+            await self._process_new_threads(threads_data, new_tids, task_content.backfill, task_content.force)
+            await self._process_old_threads(threads_data, old_tids, task_content.backfill)
 
-            if task_content.force:
-                new_tids = set(all_tids)
-                old_tids = set()
-                self.log.info(
-                    "{}吧, pn={}: Force scan enabled. Processing {} threads as new.", fname, pn, len(all_tids)
-                )
-            else:
-                new_tids = await self.datastore.filter_new_ids("thread", all_tids)
-                old_tids = set(all_tids) - new_tids
-                self.log.debug("{}吧, pn={}: Found {} threads, {} are new.", fname, pn, len(all_tids), len(new_tids))
-
-            await self._process_new_threads(threads_data, new_tids, backfill, task_content.force)
-
-            await self._process_old_threads(threads_data, old_tids, backfill)
-
-            if backfill and pn < max_pages and threads_data.page.has_more:
-                next_task_content = ScanThreadsTask(
-                    fid=task_content.fid,
-                    fname=fname,
-                    pn=pn + 1,
-                    rn=rn,
-                    is_good=is_good,
-                    backfill=backfill,
-                    max_pages=max_pages,
-                    force=task_content.force,
-                )
-                await self.router.put(Task(priority=Priority.BACKFILL_THREADS, content=next_task_content))
-                self.log.info("[{}吧] Scheduled backfill ScanThreadsTask, pn={}", fname, pn + 1)
-
-        except Exception as e:
-            self.log.exception("Failed to process ScanThreadsTask for {}吧, pn={}: {}", fname, pn, e)
+        return ThreadPageResult(
+            has_more=threads_data.page.has_more,
+            current_page=threads_data.page.current_page,
+            total_pages=threads_data.page.total_page,
+            total_count=threads_data.page.total_count,
+            tids=tuple(all_tids),
+            non_top_create_times=non_top_create_times,
+        )
 
     async def _process_new_threads(
         self,
@@ -361,7 +341,7 @@ class ThreadsTaskHandler(TaskHandler):
                 await self.datastore.push_object_event("thread", thread)
                 self.log.debug("Pushed new thread tid={} to ID queue or object stream.", thread.tid)
 
-            if thread.reply_num == 0:
+            if thread.reply_num == 0 and not backfill:
                 self.log.debug("Thread tid={} has no replies, saved metadata only.", thread.tid)
                 continue
 
@@ -1497,11 +1477,21 @@ class Worker:
 
         if handler:
             task_type = type(content).__name__
+            completion = getattr(content, "completion", None)
             with TASK_DURATION.labels(type=task_type).time():
                 try:
-                    await handler.handle(content)
-                except Exception:
+                    result = await handler.handle(content)
+                except asyncio.CancelledError:
+                    if completion is not None and not completion.done():
+                        completion.cancel()
+                    raise
+                except Exception as exc:
+                    if completion is not None and not completion.done():
+                        completion.set_exception(exc)
                     WORKER_ERRORS.labels(handler_type=task_type).inc()
                     raise
+                else:
+                    if completion is not None and not completion.done():
+                        completion.set_result(result)
         else:
             self.log.warning("Unknown task type: {}", type(content))

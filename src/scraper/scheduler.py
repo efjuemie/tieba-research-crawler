@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import deque
 from typing import TYPE_CHECKING, Literal
 
 from tiebameow.utils.logger import logger
 
 from ..core.metrics import BACKFILL_FORUMS_COUNT, PERIODIC_FORUMS_COUNT
-from .tasks import Priority, ScanThreadsTask, Task
+from .tasks import Priority, ScanThreadsTask, Task, ThreadPageResult
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -25,6 +26,14 @@ if TYPE_CHECKING:
 
     from ..core import Container
     from .router import QueueRouter
+
+
+class BackfillIncompleteError(RuntimeError):
+    """Raised when one or more backfill list streams could not be completed."""
+
+    def __init__(self, failures: list[str]) -> None:
+        self.failures = tuple(failures)
+        super().__init__(f"Backfill stopped with {len(failures)} incomplete list stream(s): {'; '.join(failures)}")
 
 
 class Scheduler:
@@ -277,11 +286,144 @@ class Scheduler:
 
         BACKFILL_FORUMS_COUNT.set(len(forums))
 
-        for forum in forums:
-            await self._schedule_backfill_homepage(forum, max_pages, is_good=False)
-            await self._schedule_backfill_homepage(forum, max_pages, is_good=True)
+        start_page = 2 if self.container.config.mode == "hybrid" else 1
+        streams = [(forum, is_good) for forum in forums for is_good in (False, True)]
+        pages = {(forum.fid, is_good): start_page for forum, is_good in streams}
+        scanned = dict.fromkeys(pages, 0)
+        last_create_time = dict.fromkeys(pages)
+        recent_fingerprints = {key: deque(maxlen=3) for key in pages}
+        failures: list[str] = []
+        limited: list[str] = []
+        active = list(streams)
 
-        logger.info("Backfill homepage tasks scheduled. Scheduler is exiting.")
+        while active and not self._stop_event.is_set():
+            for forum, is_good in tuple(active):
+                key = (forum.fid, is_good)
+                pn = pages[key]
+                if max_pages > 0 and scanned[key] >= max_pages:
+                    active.remove((forum, is_good))
+                    continue
+
+                try:
+                    result = await self._scan_backfill_page(forum, pn, max_pages, is_good)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} error={type(exc).__name__}"
+                    failures.append(failure)
+                    logger.error("Backfill list stream paused: {}", failure)
+                    active.remove((forum, is_good))
+                    continue
+
+                scanned[key] += 1
+                if result.current_page != pn:
+                    failure = (
+                        f"forum={forum.fname} is_good={is_good} requested_page={pn} "
+                        f"returned_page={result.current_page}"
+                    )
+                    failures.append(failure)
+                    logger.error("Backfill page metadata mismatch: {}", failure)
+                    active.remove((forum, is_good))
+                    continue
+                if result.total_pages < 0 or result.total_count < 0:
+                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} invalid_page_metadata"
+                    failures.append(failure)
+                    logger.error("Backfill page metadata is invalid: {}", failure)
+                    active.remove((forum, is_good))
+                    continue
+                if not result.tids and (result.total_count > 0 or result.has_more):
+                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} empty_page_with_inconsistent_metadata"
+                    failures.append(failure)
+                    logger.error("Backfill page is empty but metadata indicates more data: {}", failure)
+                    active.remove((forum, is_good))
+                    continue
+                if not result.tids and pn == start_page and (result.total_pages < 1 or result.total_count != 0):
+                    failure = (
+                        f"forum={forum.fname} is_good={is_good} pn={pn} "
+                        "empty_page_without_confirmed_empty_metadata"
+                    )
+                    failures.append(failure)
+                    logger.error("Backfill page is empty without confirmed terminal metadata: {}", failure)
+                    active.remove((forum, is_good))
+                    continue
+                if result.has_more and result.total_pages > 0 and pn >= result.total_pages:
+                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} has_more_beyond_total_pages"
+                    failures.append(failure)
+                    logger.error("Backfill page metadata is inconsistent: {}", failure)
+                    active.remove((forum, is_good))
+                    continue
+                if not result.has_more and result.total_pages > 0 and pn < result.total_pages:
+                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} terminal_page_before_total_pages"
+                    failures.append(failure)
+                    logger.error("Backfill page metadata is inconsistent: {}", failure)
+                    active.remove((forum, is_good))
+                    continue
+
+                fingerprint = result.tids
+                if result.has_more and fingerprint and fingerprint in recent_fingerprints[key]:
+                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} repeated_page_fingerprint"
+                    failures.append(failure)
+                    logger.error("Backfill stream repeated the same page: {}", failure)
+                    active.remove((forum, is_good))
+                    continue
+                if fingerprint:
+                    recent_fingerprints[key].append(fingerprint)
+
+                page_times = result.non_top_create_times
+                previous_oldest = last_create_time[key]
+                if page_times and previous_oldest is not None and page_times[0] > previous_oldest:
+                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} create_time_order_reversed"
+                    failures.append(failure)
+                    logger.error("Backfill CREATE order moved forward across pages: {}", failure)
+                    active.remove((forum, is_good))
+                    continue
+                if page_times:
+                    last_create_time[key] = page_times[-1]
+
+                if result.has_more:
+                    if max_pages > 0 and scanned[key] >= max_pages:
+                        limit_state = f"forum={forum.fname} is_good={is_good} status=paused_limit pages={max_pages}"
+                        limited.append(limit_state)
+                        logger.warning("Backfill stream paused at its configured page limit: {}", limit_state)
+                        active.remove((forum, is_good))
+                    else:
+                        pages[key] += 1
+                else:
+                    active.remove((forum, is_good))
+
+        if active and self._stop_event.is_set():
+            logger.warning(
+                "Backfill stopped before completing {} list stream(s); queued detail tasks remain recoverable.",
+                len(active),
+            )
+        logger.info(
+            "Backfill page producer stopped after scanning {} pages (paused_limit_streams={}).",
+            sum(scanned.values()),
+            len(limited),
+        )
+        if failures:
+            raise BackfillIncompleteError(failures)
+
+    async def _scan_backfill_page(self, forum: Forum, pn: int, max_pages: int, is_good: bool) -> ThreadPageResult:
+        """Queue one page and wait for its worker acknowledgement before continuing."""
+        completion = asyncio.get_running_loop().create_future()
+        task_content = ScanThreadsTask(
+            fid=forum.fid,
+            fname=forum.fname,
+            pn=pn,
+            backfill=True,
+            max_pages=max_pages,
+            is_good=is_good,
+            force=self.container.config.backfill_force_scan,
+            completion=completion,
+        )
+        task = Task(priority=Priority.BACKFILL_THREADS, content=task_content)
+        try:
+            await self.router.put(task)
+            return await completion
+        finally:
+            if not completion.done():
+                completion.cancel()
 
     async def _schedule_homepage_scans(self, forums: list[Forum], *, is_good: bool = False):
         """调度首页扫描任务（周期模式）。
@@ -295,34 +437,3 @@ class Scheduler:
             await self.router.put(task)
             section = "GOOD" if is_good else "NORMAL"
             logger.debug("Scheduled {} homepage scan for [{}吧] with priority=REALTIME", section, forum.fname)
-
-    async def _schedule_backfill_homepage(self, forum: Forum, max_pages: int, *, is_good: bool = False):
-        """为单个贴吧调度回溯任务的起点页面，由 Worker 递推后续页。
-
-        在 hybrid 模式下，从第 2 页开始，非 hybrid 模式则从第 1 页开始。
-
-        Args:
-            forum: 需要扫描的贴吧。
-            max_pages: 最大扫描页数。
-        """
-        start_pn = 2 if self.container.config.mode == "hybrid" else 1
-
-        task_content = ScanThreadsTask(
-            fid=forum.fid,
-            fname=forum.fname,
-            pn=start_pn,
-            backfill=True,
-            max_pages=max_pages,
-            is_good=is_good,
-            force=self.container.config.backfill_force_scan,
-        )
-        task = Task(priority=Priority.BACKFILL_THREADS, content=task_content)
-        await self.router.put(task)
-        section = "GOOD" if is_good else "NORMAL"
-        logger.debug(
-            "Scheduled BACKFILL [{}] start pn={} for [{}吧] with priority=BACKFILL_THREADS (max_pages={}).",
-            section,
-            start_pn,
-            forum.fname,
-            max_pages,
-        )

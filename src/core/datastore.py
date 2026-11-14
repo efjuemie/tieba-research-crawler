@@ -367,7 +367,7 @@ class DataStore:
         pending_scans = [
             PendingThreadScan(tid=dto.tid, fid=dto.fid, fname=dto.fname, backfill=backfill)
             for dto in thread_dtos
-            if dto.reply_num > 0
+            if dto.reply_num > 0 or backfill
         ]
 
         async with self.get_session() as session:

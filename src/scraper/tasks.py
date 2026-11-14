@@ -13,6 +13,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from asyncio import Future
     from datetime import datetime
 
 
@@ -82,6 +83,18 @@ class Task:
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
+class ThreadPageResult:
+    """Completion data returned to the backfill page producer."""
+
+    has_more: bool
+    current_page: int
+    total_pages: int
+    total_count: int
+    tids: tuple[int, ...]
+    non_top_create_times: tuple[datetime, ...]
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
 class ScanThreadsTask:
     """扫描指定贴吧的任务。
 
@@ -92,7 +105,7 @@ class ScanThreadsTask:
         rn: 每页条目数量，默认为30
         is_good: 是否为精华分区，默认为False
         backfill: 是否为回溯任务，默认为False
-        max_pages: 最大扫描页数，默认为100
+        max_pages: 每条列表流最大扫描页数，0 表示不设上限
         force: 是否强制扫描（忽略去重和更新检查），默认为False
     """
 
@@ -102,8 +115,9 @@ class ScanThreadsTask:
     rn: int = 30
     is_good: bool = False
     backfill: bool = False
-    max_pages: int = 100
+    max_pages: int = 0
     force: bool = False
+    completion: Future[ThreadPageResult] | None = dataclasses.field(default=None, compare=False, repr=False)
 
     @property
     def unique_key(self) -> tuple[int, int, bool]:

@@ -32,7 +32,7 @@ class TiebaConfig(BaseModel):
 
     forums: list[str] = []
     groups: list[ForumGroup] = []
-    max_backfill_pages: int = Field(100, gt=0)
+    max_backfill_pages: int = Field(0, ge=0)
     backfill_force_scan: bool = False
 
     @model_validator(mode="after")
@@ -206,7 +206,7 @@ class PydanticConfig(BaseSettings):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
-    tieba: TiebaConfig = Field(default_factory=lambda: TiebaConfig(max_backfill_pages=100))
+    tieba: TiebaConfig = Field(default_factory=lambda: TiebaConfig(max_backfill_pages=0))
     rate_limit: RateLimitConfig = Field(default_factory=lambda: RateLimitConfig())
     cache: CacheConfig = Field(
         default_factory=lambda: CacheConfig(backend="memory", max_size=100000, ttl_seconds=86400)

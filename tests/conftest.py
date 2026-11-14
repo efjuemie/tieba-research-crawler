@@ -113,6 +113,8 @@ def make_thread(
     reply_num: int = 1,
     user: ThreadUserDTO | None = None,
     is_livepost: bool = False,
+    is_top: bool = False,
+    create_time: datetime | None = None,
 ) -> ThreadDTO:
     """创建测试用的 ThreadDTO"""
     user = user or make_user(ThreadUserDTO)
@@ -129,7 +131,7 @@ def make_thread(
         title="t",
         contents=make_contents(),
         is_good=False,
-        is_top=False,
+        is_top=is_top,
         is_share=False,
         is_hide=False,
         is_livepost=is_livepost,
@@ -139,7 +141,7 @@ def make_thread(
         reply_num=reply_num,
         view_num=0,
         share_num=0,
-        create_time=datetime.fromtimestamp(1),
+        create_time=create_time or datetime.fromtimestamp(1),
         last_time=last_time,
         thread_type=0,
         tab_id=0,

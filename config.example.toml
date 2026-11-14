@@ -5,8 +5,8 @@ forums = [
   "forum_b",
   "forum_c"
 ]
-# 历史回溯模式最大页数
-max_backfill_pages = 100
+# 历史回溯模式每条列表流最大页数；0 表示持续回溯到服务端确认没有后续页
+max_backfill_pages = 0
 # 是否在回溯模式中强制扫描所有贴子
 backfill_force_scan = false
 

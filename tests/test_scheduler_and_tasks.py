@@ -1,6 +1,7 @@
 """调度器和任务模块测试。"""
 
 import asyncio
+from datetime import datetime
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -9,7 +10,7 @@ from conftest import DummyConfig, DummyContainer, DummyForum
 
 from src.scraper.queue import UniquePriorityQueue
 from src.scraper.router import QueueRouter
-from src.scraper.scheduler import Scheduler
+from src.scraper.scheduler import BackfillIncompleteError, Scheduler
 from src.scraper.tasks import (
     DeepScanTask,
     FullScanCommentsTask,
@@ -19,6 +20,7 @@ from src.scraper.tasks import (
     Priority,
     ScanThreadsTask,
     Task,
+    ThreadPageResult,
 )
 
 # ==================== Task 优先级测试 ====================
@@ -149,40 +151,147 @@ async def test_unique_priority_queue_cancelled_put_rolls_back_key():
 # ==================== Scheduler 测试 ====================
 
 
-@pytest.mark.asyncio
-async def test_scheduler_backfill_enqueue_start_page_hybrid():
-    """测试 hybrid 模式下回溯任务从第 2 页开始"""
-    router = QueueRouter()
-    container = DummyContainer(config=DummyConfig(mode="hybrid"), forums=[DummyForum(1, "bar")])
-    s = Scheduler(router, container)  # type: ignore[arg-type]
+async def _consume_backfill_pages(scheduler: Scheduler, on_page):
+    producer = asyncio.create_task(scheduler._run_backfill())
+    try:
+        while not producer.done():
+            try:
+                task = await asyncio.wait_for(scheduler.router.threads_queue.get(), timeout=0.2)
+            except TimeoutError:
+                break
+            try:
+                assert isinstance(task.content, ScanThreadsTask)
+                await on_page(task.content)
+            finally:
+                scheduler.router.threads_queue.task_done(task)
+        await producer
+    finally:
+        if not producer.done():
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
 
-    await s._schedule_backfill_homepage(
-        cast("Any", container.forums[0]), container.config.max_backfill_pages, is_good=False
+
+def _synthetic_page(content: ScanThreadsTask, *, tids: tuple[int, ...], times: tuple[int, ...], has_more: bool):
+    return ThreadPageResult(
+        has_more=has_more,
+        current_page=content.pn,
+        total_pages=content.pn + int(has_more),
+        total_count=len(tids),
+        tids=tids,
+        non_top_create_times=tuple(datetime.fromtimestamp(value) for value in times),
     )
 
-    task = await router.threads_queue.get()
-    assert isinstance(task.content, ScanThreadsTask)
-    assert task.content.pn == 2  # hybrid 模式从第 2 页开始
-    assert task.priority == Priority.BACKFILL_THREADS
+
+@pytest.mark.asyncio
+async def test_scheduler_round_robins_both_streams_and_starts_hybrid_at_page_two():
+    """unlimited mode runs finite normal/good pages in a fair, bounded sequence."""
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(config=DummyConfig(mode="hybrid", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
+    scheduler = Scheduler(router, container)  # type: ignore[arg-type]
+    requested: list[tuple[bool, int]] = []
+
+    async def acknowledge(content: ScanThreadsTask):
+        requested.append((content.is_good, content.pn))
+        result = _synthetic_page(
+            content,
+            tids=(content.pn + int(content.is_good) * 10,),
+            times=(100 - content.pn * 10,),
+            has_more=content.pn == 2,
+        )
+        assert content.max_pages == 0
+        assert content.completion is not None
+        content.completion.set_result(result)
+
+    await _consume_backfill_pages(scheduler, acknowledge)
+
+    assert requested == [(False, 2), (True, 2), (False, 3), (True, 3)]
 
 
 @pytest.mark.asyncio
-async def test_scheduler_backfill_enqueue_start_page_backfill():
-    """测试 backfill 模式下回溯任务从第 1 页开始"""
-    router = QueueRouter()
-    container = DummyContainer(config=DummyConfig(mode="backfill"), forums=[DummyForum(1, "bar")])
-    s = Scheduler(router, container)  # type: ignore[arg-type]
+async def test_scheduler_stream_failure_does_not_skip_good_stream():
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(config=DummyConfig(mode="backfill", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
+    scheduler = Scheduler(router, container)  # type: ignore[arg-type]
+    requested: list[bool] = []
 
-    await s._schedule_backfill_homepage(
-        cast("Any", container.forums[0]), container.config.max_backfill_pages, is_good=False
-    )
+    async def acknowledge(content: ScanThreadsTask):
+        requested.append(content.is_good)
+        assert content.completion is not None
+        if not content.is_good:
+            content.completion.set_exception(RuntimeError("synthetic list error"))
+        else:
+            content.completion.set_result(_synthetic_page(content, tids=(20,), times=(10,), has_more=False))
 
-    task = await router.threads_queue.get()
-    assert isinstance(task.content, ScanThreadsTask)
-    assert task.content.pn == 1  # backfill 模式从第 1 页开始
-    assert task.content.backfill is True
+    with pytest.raises(BackfillIncompleteError):
+        await _consume_backfill_pages(scheduler, acknowledge)
+
+    assert requested == [False, True]
 
 
+@pytest.mark.asyncio
+async def test_scheduler_duplicate_tid_overlap_does_not_stop_page_continuation():
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(config=DummyConfig(mode="backfill", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
+    scheduler = Scheduler(router, container)  # type: ignore[arg-type]
+    requested: list[tuple[bool, int]] = []
+
+    async def acknowledge(content: ScanThreadsTask):
+        requested.append((content.is_good, content.pn))
+        assert content.completion is not None
+        if content.is_good:
+            page = _synthetic_page(content, tids=(900,), times=(5,), has_more=False)
+        elif content.pn == 1:
+            page = _synthetic_page(content, tids=(1, 2), times=(20, 10), has_more=True)
+        else:
+            page = _synthetic_page(content, tids=(2, 3), times=(10, 5), has_more=False)
+        content.completion.set_result(page)
+
+    await _consume_backfill_pages(scheduler, acknowledge)
+
+    assert requested == [(False, 1), (True, 1), (False, 2)]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_cross_page_create_time_reversal_marks_stream_incomplete():
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(config=DummyConfig(mode="backfill", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
+    scheduler = Scheduler(router, container)  # type: ignore[arg-type]
+    requested: list[tuple[bool, int]] = []
+
+    async def acknowledge(content: ScanThreadsTask):
+        requested.append((content.is_good, content.pn))
+        assert content.completion is not None
+        if content.is_good:
+            page = _synthetic_page(content, tids=(900,), times=(5,), has_more=False)
+        else:
+            times = (20,) if content.pn == 1 else (21,)
+            page = _synthetic_page(content, tids=(content.pn,), times=times, has_more=True)
+        content.completion.set_result(page)
+
+    with pytest.raises(BackfillIncompleteError):
+        await _consume_backfill_pages(scheduler, acknowledge)
+
+    assert requested == [(False, 1), (True, 1), (False, 2)]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_finite_page_limit_is_reported_as_paused_limit():
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(config=DummyConfig(mode="backfill", max_backfill_pages=1), forums=[DummyForum(1, "bar")])
+    scheduler = Scheduler(router, container)  # type: ignore[arg-type]
+    requested: list[bool] = []
+
+    async def acknowledge(content: ScanThreadsTask):
+        requested.append(content.is_good)
+        assert content.completion is not None
+        content.completion.set_result(_synthetic_page(content, tids=(content.pn,), times=(10,), has_more=True))
+
+    await _consume_backfill_pages(scheduler, acknowledge)
+
+    assert requested == [False, True]
+
+
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_scheduler_homepage_scans():
     """测试首页扫描任务生成"""
@@ -214,27 +323,6 @@ async def test_scheduler_stop_event():
     assert not s.is_stopped
     s.stop()
     assert s.is_stopped
-
-
-@pytest.mark.asyncio
-async def test_scheduler_run_backfill_schedules_both_sections():
-    """测试回溯模式同时调度普通和精华分区"""
-    router = QueueRouter()
-    forums = [DummyForum(1, "bar")]
-    container = DummyContainer(config=DummyConfig(mode="backfill"), forums=forums)
-    s = Scheduler(router, container)  # type: ignore[arg-type]
-
-    await s._run_backfill()
-
-    # 应该有普通和精华两个任务
-    q = router.threads_queue
-    tasks = []
-    while not q.empty():
-        tasks.append(await q.get())
-
-    assert len(tasks) == 2
-    is_good_values = {t.content.is_good for t in tasks}
-    assert is_good_values == {True, False}
 
 
 @pytest.mark.asyncio

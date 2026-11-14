@@ -7,6 +7,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
+from aiotieba.enums import ThreadSortType
 from conftest import (
     make_comment,
     make_comments_response,
@@ -20,13 +21,16 @@ from tiebameow.models.orm import Thread as ThreadModel
 
 from src.core.lock import MemoryLockManager
 from src.scraper.router import QueueRouter
+from src.scraper.scheduler import Scheduler
 from src.scraper.tasks import (
     FullScanCommentsTask,
     FullScanPostsTask,
     IncrementalScanCommentsTask,
     IncrementalScanPostsTask,
+    Priority,
     ScanThreadsTask,
     Task,
+    ThreadPageResult,
 )
 from src.scraper.worker import (
     DeepScanTaskHandler,
@@ -93,6 +97,9 @@ async def test_threads_handler_new_threads_schedule_and_push():
 
     await handler.handle(ScanThreadsTask(fid=thread.fid, fname=thread.fname, pn=1))
 
+    tb_client.get_threads_dto.assert_awaited_once()
+    assert tb_client.get_threads_dto.await_args.kwargs["sort"] == ThreadSortType.REPLY
+
     # 新主题帖应该推送到对象流
     datastore.push_object_event.assert_awaited_once_with("thread", thread)
 
@@ -116,7 +123,10 @@ async def test_threads_handler_new_thread_zero_replies():
     thread = make_thread(tid=1, reply_num=0)
     threads_response = make_threads_response([thread])
 
-    tb_client = SimpleNamespace(get_threads_dto=AsyncMock(return_value=threads_response))
+    async def get_threads_dto(_fname: str, **kwargs):
+        return threads_response if not kwargs["is_good"] else make_threads_response([])
+
+    tb_client = SimpleNamespace(get_threads_dto=AsyncMock(side_effect=get_threads_dto))
     datastore = SimpleNamespace(
         filter_new_ids=AsyncMock(return_value={thread.tid}),
         save_items=AsyncMock(),
@@ -132,7 +142,7 @@ async def test_threads_handler_new_thread_zero_replies():
         router=router,
     )
 
-    await handler.handle(ScanThreadsTask(fid=thread.fid, fname=thread.fname, pn=1))
+    await handler.handle(ScanThreadsTask(fid=thread.fid, fname=thread.fname, pn=1, backfill=True))
 
     # 没有回复的主题帖也应通过原子方法保存元数据
     datastore.save_threads_and_pending_scans.assert_awaited_once()
@@ -140,12 +150,12 @@ async def test_threads_handler_new_thread_zero_replies():
     thread_dtos = atomic_call.args[0]
     assert thread_dtos is not None
     assert thread_dtos[0].tid == thread.tid
-    assert atomic_call.kwargs.get("backfill") is False
+    assert atomic_call.kwargs.get("backfill") is True
     assert atomic_call.kwargs.get("upsert_threads") is False
 
-    # 不应该生成 FullScanPostsTask
+    # 即使主题帖显示零回复，也要获取详情中的首楼完整正文。
     queued_tasks = _drain_router(router)
-    assert not any(isinstance(item.content, FullScanPostsTask) for item in queued_tasks)
+    assert any(isinstance(item.content, FullScanPostsTask) for item in queued_tasks)
 
 
 @pytest.mark.asyncio
@@ -223,50 +233,113 @@ async def test_threads_handler_old_thread_with_updates_skips_incremental_when_fu
 
 
 @pytest.mark.asyncio
-async def test_threads_handler_backfill_enqueues_next_page():
-    """测试 ThreadsTaskHandler 在回溯模式下生成下一页任务"""
-    thread = make_thread(tid=1, reply_num=5)
-    threads_response = make_threads_response([thread], has_more=True, current_page=1, total_page=3)
-
-    tb_client = SimpleNamespace(get_threads_dto=AsyncMock(return_value=threads_response))
+async def test_threads_handler_backfill_processes_one_create_page_and_retains_pinned_threads():
+    """Backfill page handlers process one CREATE page and report non-pinned boundaries."""
+    pinned = make_thread(tid=10, is_top=True, create_time=datetime.fromtimestamp(1))
+    recent = make_thread(tid=11, create_time=datetime.fromtimestamp(30))
+    older = make_thread(tid=12, create_time=datetime.fromtimestamp(20))
+    response = make_threads_response([pinned, recent, older], has_more=True, current_page=2, total_page=3)
+    tb_client = SimpleNamespace(get_threads_dto=AsyncMock(return_value=response))
     datastore = SimpleNamespace(
-        filter_new_ids=AsyncMock(return_value={thread.tid}),
+        filter_new_ids=AsyncMock(return_value={10, 11, 12}),
         save_items=AsyncMock(),
         save_threads_and_pending_scans=AsyncMock(),
-        get_threads_by_tids=AsyncMock(return_value=[]),
-        push_object_event=AsyncMock(),
     )
-    router = QueueRouter()
     handler = ThreadsTaskHandler(
         worker_id=0,
         container=create_mock_container(tb_client=tb_client),
         datastore=cast("Any", datastore),
-        router=router,
+        router=QueueRouter(),
     )
 
-    await handler.handle(ScanThreadsTask(fid=thread.fid, fname=thread.fname, pn=1, backfill=True, max_pages=5))
+    result = await handler.handle(ScanThreadsTask(fid=10, fname="bar", pn=2, backfill=True, max_pages=0))
 
-    # 回溯模式不应该推送对象事件
-    datastore.push_object_event.assert_not_called()
-
-    # 应该生成下一页的 ScanThreadsTask
-    queued_tasks = _drain_router(router)
-    next_page_tasks = [t for t in queued_tasks if isinstance(t.content, ScanThreadsTask) and t.content.pn == 2]
-    assert len(next_page_tasks) == 1
-    assert isinstance(next_page_tasks[0].content, ScanThreadsTask)
-    assert next_page_tasks[0].content.backfill is True
+    assert tb_client.get_threads_dto.await_args.kwargs["sort"] == ThreadSortType.CREATE
+    assert result == ThreadPageResult(
+        has_more=True,
+        current_page=2,
+        total_pages=3,
+        total_count=3,
+        tids=(10, 11, 12),
+        non_top_create_times=(datetime.fromtimestamp(30), datetime.fromtimestamp(20)),
+    )
+    saved_threads = datastore.save_threads_and_pending_scans.await_args.args[0]
+    assert {thread.tid for thread in saved_threads} == {10, 11, 12}
 
 
 @pytest.mark.asyncio
-async def test_threads_handler_filters_livepost():
-    """测试 ThreadsTaskHandler 过滤直播帖"""
+async def test_single_threads_worker_serves_monitor_before_next_backfill_page():
+    """A bounded producer lets a single threads worker service hybrid monitor work."""
+    first_page_started = asyncio.Event()
+    release_first_page = asyncio.Event()
+    requested: list[tuple[str, bool, int]] = []
+
+    async def get_threads_dto(fname: str, **kwargs):
+        pn = kwargs["pn"]
+        is_good = kwargs["is_good"]
+        requested.append((fname, is_good, pn))
+        if fname == "backfill" and not is_good and pn == 2:
+            first_page_started.set()
+            await release_first_page.wait()
+        if fname == "monitor":
+            return make_threads_response([], current_page=1, total_page=1)
+        thread = make_thread(
+            tid=1000 + int(is_good) * 100 + pn,
+            fname="backfill",
+            create_time=datetime.fromtimestamp(100 - pn),
+        )
+        return make_threads_response(
+            [thread],
+            has_more=pn == 2,
+            current_page=pn,
+            total_page=3,
+        )
+
+    config = SimpleNamespace(mode="hybrid", max_backfill_pages=0, backfill_force_scan=False)
+    container = create_mock_container(
+        tb_client=SimpleNamespace(get_threads_dto=AsyncMock(side_effect=get_threads_dto)),
+        config=config,
+    )
+    datastore = SimpleNamespace(
+        filter_new_ids=AsyncMock(return_value=set()),
+        get_threads_by_tids=AsyncMock(return_value=[]),
+        get_pending_thread_scan_tids=AsyncMock(return_value=set()),
+    )
+    router = QueueRouter(maxsize=1)
+    container.forums = [SimpleNamespace(fid=10, fname="backfill")]
+    worker = Worker(0, router.threads_queue, container, cast("Any", datastore), router, lane="threads")
+    scheduler = Scheduler(router, container)
+    worker_task = asyncio.create_task(worker.run())
+    try:
+        scheduler_task = asyncio.create_task(scheduler._run_backfill())
+        await asyncio.wait_for(first_page_started.wait(), timeout=1)
+        await router.put(Task(priority=Priority.REALTIME, content=ScanThreadsTask(fid=99, fname="monitor", pn=1)))
+        release_first_page.set()
+        await asyncio.wait_for(scheduler_task, timeout=2)
+    finally:
+        release_first_page.set()
+        worker_task.cancel()
+        await asyncio.gather(worker_task, return_exceptions=True)
+
+    assert requested[0] == ("backfill", False, 2)
+    assert requested[1] == ("monitor", False, 1)
+    assert {call[:2] for call in requested if call[0] == "backfill"} == {
+        ("backfill", False),
+        ("backfill", True),
+    }
+    assert len([call for call in requested if call[0] == "backfill"]) == 4
+
+
+@pytest.mark.asyncio
+async def test_threads_handler_keeps_livepost():
+    """直播帖仍属于回溯总体，不应被列表处理器过滤。"""
     normal_thread = make_thread(tid=1, reply_num=5, is_livepost=False)
     live_thread = make_thread(tid=2, reply_num=5, is_livepost=True)
     threads_response = make_threads_response([normal_thread, live_thread])
 
     tb_client = SimpleNamespace(get_threads_dto=AsyncMock(return_value=threads_response))
     datastore = SimpleNamespace(
-        filter_new_ids=AsyncMock(return_value={1}),  # 只有 tid=1 是新的
+        filter_new_ids=AsyncMock(return_value={1, 2}),
         save_items=AsyncMock(),
         save_threads_and_pending_scans=AsyncMock(),
         get_threads_by_tids=AsyncMock(return_value=[]),
@@ -280,11 +353,12 @@ async def test_threads_handler_filters_livepost():
         router=router,
     )
 
-    await handler.handle(ScanThreadsTask(fid=10, fname="bar", pn=1))
+    await handler.handle(ScanThreadsTask(fid=10, fname="bar", pn=1, backfill=True))
 
-    # filter_new_ids 应该只接收过滤后的 tid
-    call_args = datastore.filter_new_ids.call_args
-    assert 2 not in call_args[0][1]  # 直播帖 tid=2 应该被过滤
+    thread_calls = [call for call in datastore.filter_new_ids.await_args_list if call.args[0] == "thread"]
+    assert thread_calls[0].args[1] == [1, 2]
+    saved = datastore.save_threads_and_pending_scans.await_args.args[0]
+    assert {thread.tid for thread in saved} == {1, 2}
 
 
 @pytest.mark.asyncio

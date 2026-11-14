@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 from sqlalchemy.dialects import postgresql
 from tiebameow.models.dto import BaseThreadDTO, ThreadDTO, ThreadUserDTO
+from conftest import make_thread
 
 from src.core.config import ConsumerConfig
 from src.core.datastore import DataStore
@@ -75,9 +76,11 @@ class DummySession:
         self._tx_committed = False
         self._items_added: list[Any] = []
         self.last_statement: object | None = None
+        self.statements: list[object] = []
 
     async def execute(self, statement: object):
         self.last_statement = statement
+        self.statements.append(statement)
 
         class Result:
             def __init__(self, ids: set[int]) -> None:
@@ -457,6 +460,30 @@ async def test_add_pending_comment_scan_uses_conflict_update_for_task_kind_upgra
     assert "backfill" in compiled
     assert "fid" in compiled
     assert "fname" in compiled
+
+
+@pytest.mark.asyncio
+async def test_backfill_saves_pending_detail_for_zero_reply_thread():
+    """零回复回溯主题帖仍需 pending 详情任务读取完整首楼。"""
+    DataStore._cache = None
+    dummy_session = DummySession(existing_ids=set())
+    container = DummyContainer(dummy_session, DummyRedis())
+    datastore = DataStore(cast("Any", container))
+    datastore.cache = cast("Any", DummyCache())
+
+    thread = make_thread(tid=321, reply_num=0)
+    await datastore.save_threads_and_pending_scans([thread], backfill=True)
+
+    assert len(dummy_session.statements) == 2
+    pending_statement = dummy_session.statements[-1]
+    compiled = str(
+        pending_statement.compile(  # type: ignore[attr-defined]
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "INSERT INTO pending_thread_scan" in compiled
+    assert "321" in compiled
 
 
 @pytest.mark.asyncio
