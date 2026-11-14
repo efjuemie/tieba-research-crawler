@@ -212,3 +212,32 @@ logs
 config.toml
 copilot-instructions.md
 AGENTS.md
+
+# Local research data and source material
+data/
+test-data/
+exports/
+logs/
+secrets/
+references/
+*.csv
+*.xls
+*.xlsx
+*.sqlite*
+*.db
+*.sql
+*.dump
+*.backup
+*.pgdump
+*.har
+*.log
+*cookie*
+*token*
+*bduss*
+*stoken*
+
+# Local credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
