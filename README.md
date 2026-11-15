@@ -2,7 +2,22 @@
 
 本项目从 [TiebaMeow/TiebaScraper](https://github.com/TiebaMeow/TiebaScraper) 延伸，使用 `aiotieba` 访问贴吧接口，并保留上游历史与 [MIT 许可](LICENSE)中的版权声明。项目面向本机研究采集，保存原始用户 ID、昵称和帖子内容，不做匿名化。
 
-> **当前状态（2026-11-14）**：研究扩展已推送，合成回归、专用 PostgreSQL scope 竞态和独立审查通过。有限真实主题/楼中楼样本、主入口列表 checkpoint 的 SIGINT/同 run 恢复，以及七类 CSV/manifest 的三次真实导出已验证；这不代表完整详情队列或全吧采集完成。超过 10 页运行和备份恢复仍待验收。
+> **当前状态（2026-11-15）**：最新全库批次含 89 个主题、2,173 条一级回复、77 条楼中楼、1,619 个用户、2,089 条吧内快照和 542 条媒体记录。60 个详情响应页已保存且无失败，canonical 主题数仍为 89；详情子范围仍有未完成项，不能称整轮或全吧采集完成。字段覆盖与样本边界见下方和[字段来源审计](docs/FIELD_SOURCE_AUDIT.md)。
+
+## 最新字段范围
+
+按用户 2026-11-15 的补充要求，主要数据输出采用以下范围；数据库旧列及历史审计保留兼容，不删除原有记录：
+
+- 吧内任职只判断 `is_bawu`，不要求具体职务名称。缺少可靠肯定／否定证据时保持未知。
+- 主题互动保留评论数、点赞数、收藏数，以及接口已提供的浏览量；一级与二级评论互动仅保留点赞数。不再为不赞成量、转发数或具体职务额外补采。
+- 回复对象优先使用明确用户 ID；无法确定具体被回复评论时，保存“回复 XXX”中的显示对象，不按昵称猜 ID。
+- 只提供所属主题的 `thread_url`，不提供楼层或评论深链。
+- 成长等级数字不明时保存对应 `global_growth_icon_url`，与本吧等级和其他徽章分开。
+- 图片／视频引用除单独的 `media_assets.csv`，也在三类内容 CSV 的 `media_urls` 中按对应内容归集。该列为 JSON 链接数组，按媒体片段顺序去重，不混入表情或成长徽章。
+- protobuf 标量等级的解析值 `0` 缺少字段 presence 证明时按未知处理；不当作真实等级零，也不从用户当前资料倒填历史内容字段。图标和等级只按可确认的内容作者 UI 证据采集，不用 OCR 或 URL 文件名推断。
+- 评论中的 `reply_to_display_name` 保存页面明确显示的回复对象名称；没有充分证据时不猜测用户 ID。
+
+正文通过详情接口获取；列表索引中尚未执行详情的记录不标为正文完整。完整性以原始富文本片段、正文观察水位及相应详情 scope 证据为准，单个样本成功不代表全库完成。
 
 ## 采集范围和隐私
 
@@ -121,6 +136,53 @@ uv run python -m src.research login --account-file secrets/baidu-account.json
 
 凭据不会通过命令参数传入，也不会写进日志；默认账号文件权限为仅当前用户可读。不要把 Cookie 或 BDUSS 发给任何人。
 
+## 只处理待办和定向补采
+
+以下命令在本机 Python 环境运行。`YOUR_RUN_ID`、`YOUR_TID`、`YOUR_PID`、`YOUR_CID` 请替换为本地数据库中的真实标识，不要使用昵称代替 ID。
+
+停止发现新主题、只排空已有 run 的详情待办：
+
+```sh
+uv run python main.py drain-pending --run-id YOUR_RUN_ID --limit 10 --max-seconds 120
+uv run python main.py drain-pending --run-id YOUR_RUN_ID --tid YOUR_TID --limit 1 --max-seconds 120
+```
+
+`--limit` 限制初始选中的 scope，父任务产生的子任务仍可继续处理；`--max-seconds` 包含排队和处理时间，超时会保留待办。它不扫描论坛列表、不创建新 run。普通历史回溯仍使用 `backfill`；同 run 列表恢复仍使用前述 `--resume --run-id`。零回复主题也需要取得首楼详情。API 缺少分页身份或终止证据时记录不完整，不能把空解析对象当作成功空页。
+
+网页补采先检查已有 API 详情 scope，再读取指定字段。先检查计划：
+
+```sh
+uv run python -m src.research field-backfill --run-id YOUR_RUN_ID --target-type comment --tid YOUR_TID --cid YOUR_CID --field ip_location_text --field agree_count --limit 1 --dry-run
+```
+
+`--dry-run` 不创建补采任务、不打开浏览器、不写字段观察。API 未完成的目标为 `pending_api_detail`，应先用 `drain-pending`。正式执行需安装可选浏览器依赖，并指定项目专用资料目录：
+
+```sh
+uv sync --group login
+uv run playwright install chromium
+uv run python -m src.research field-backfill --run-id YOUR_RUN_ID --target-type comment --tid YOUR_TID --cid YOUR_CID --field ip_location_text --field agree_count --limit 1 --max-seconds 300 --browser-profile secrets/tieba-web-profile --headed --wait-for-login
+```
+
+需要官方登录或安全验证时，程序保存任务、释放数据库事务，保留可见页面；在该窗口扫码或完成验证，确认能看到帖子后回到终端按回车，同一目标至多恢复一次。等待计入 `--max-seconds`。HTTP 429 会停止，不作为扫码重试。无可取消标准输入的 IDE 控制台请改用 IDE 的 Terminal。不要选择个人 Chrome 默认 Profile，也不要在聊天或命令参数中粘贴 Cookie。
+
+只读网页审计不更新规范字段或创建补采任务，报告写入本机忽略目录：
+
+```sh
+uv run python -m src.research web-audit --run-id YOUR_RUN_ID --target-type post --tid YOUR_TID --pid YOUR_PID --field global_growth_icon_url --field ip_location_text --limit 1 --browser-profile secrets/tieba-web-profile --headed --wait-for-login --max-seconds 300
+```
+
+`post` 的 `--pid` 是目标楼层；`comment` 的 `--cid` 是目标评论，`--pid` 可进一步限定父楼。筛选条件同时生效，空结果不会退回全库。默认补采最多 5 个目标、120 秒；审计默认 1 个、最多 5 个。字段值缺失与身份未验证分别报告，正确身份但无数字的等级图标不会被猜成等级。
+
+补充当前用户资料、本吧头衔和吧务名单快照：
+
+```sh
+uv run python -m src.research user-backfill --run-id YOUR_RUN_ID --tid YOUR_TID --limit 5 --max-seconds 120 --profile --forum --bawu
+```
+
+该命令按 UID／FID 去重，使用本地账号文件；论坛查询需先完成上一节的账号登录。结果进入当前用户及吧内快照，不倒填成历史发帖时的属性。名单中未找到某用户不等于已确认不是吧务。
+
+API 与浏览器受控导航／展开使用同一请求预算；单个浏览器任务串行执行。页面自动加载的子资源另行计数，`global_rps` 不是全部网页资源 HTTP 请求数的逐个上限。网页只补已有目标的字段，不替代论坛 API 回溯。
+
 ## 导出本机 CSV
 
 先暂停采集，再运行导出，避免导出期间数据库内容和质量检查点继续变化：
@@ -129,7 +191,7 @@ uv run python -m src.research login --account-file secrets/baidu-account.json
 uv run python -m src.research export
 ```
 
-默认写入 `exports/` 下一个新的批次目录。每次导出都会生成唯一目录与文件名，文件名前缀含 `all-runs`、导出时间（Asia/Shanghai）和唯一批次 ID；已有批次不会覆盖。目录内包含七个 UTF-8 with BOM CSV：
+默认写入 `exports/` 下一个新的批次目录。每次导出都会生成唯一目录与文件名，文件名前缀含 `all-runs`、导出时间（Asia/Shanghai）和唯一批次 ID；已有批次不会覆盖。七个标准 UTF-8 with BOM CSV 保留：
 
 - `threads`
 - `posts`
@@ -147,7 +209,7 @@ uv run python -m src.research export
 uv run python -m src.research export --output exports
 ```
 
-`--run-id` 只筛选 `crawl_quality_report` 中的 checkpoint，并作为批次命名上下文；其余六类实体 CSV 仍导出数据库全部 run。批次名称和 manifest 会标明全库范围，不会把这次导出误称为单 run 数据。
+`--run-id` 筛选质量及相关运行审计，并作为批次命名上下文；默认六类实体 CSV 仍导出数据库全部 run。批次名称和 manifest 会标明范围，不会把这次导出误称为单 run 实体数据。
 
 ```sh
 uv run python -m src.research export --run-id YOUR_RUN_ID
@@ -155,7 +217,19 @@ uv run python -m src.research export --run-id YOUR_RUN_ID
 
 CSV 保留原始 ID、昵称和正文。实体行数、唯一 ID、回复父子关系和 CSV 行数会在写入后校验；manifest 的实体验证通过不代表平台数据已经完整。没有 checkpoint 时，质量证据状态为 `unknown_not_tested`。
 
-已完成三次真实数据库 CLI 导出。三个批次均生成不同的时间戳加 UUID 目录，旧批次保留且未被覆盖。最终批次的六类实体 CSV 覆盖全数据库，行数与 SQL 查询及 manifest 一致：`threads=89`、`posts=2`、`comments=50`、`users=80`、`user_forum_snapshots=119`、`media_assets=31`；manifest 的 `entity_scope=all_database_rows`、`validation_status=passed`，`crawl_quality_report` 覆盖全部 runs 共 98 行。前两次命令带有 comments run 的 `--run-id`，其质量报告各有 2 行。备份恢复尚未验证。
+V2 另输出 scope、字段来源、补采任务／尝试、字段观察、失败及字段质量审计 CSV；这些是本地审计材料，不是新增分析样本。API 字段观察与网页观察分开统计；无法归属 run 的 API 观察明确标为未归属。API／网页值冲突保留证据，不静默覆盖已有值。
+
+```sh
+uv run python -m src.research export --entity-scope completed-threads --output exports
+```
+
+`completed-threads` 选择最新详情及已知子评论 scope 有完成证明的主题，属于跨 run 的完整主题筛选，不是单 run 导出。用户和吧内快照仍为全库，媒体跟随所选内容，排除理由见 scope 审计。默认 `all` 不过滤未完成记录。
+
+`threads` 全文件按 `create_time DESC NULLS LAST, tid DESC` 排序；`posts` 按主题、创建时间、PID，`comments` 按主题、父 PID、创建时间、CID，后两者时间升序且空值最后。三类内容均有合法 TID 构造的完整 `https://tieba.baidu.com/p/{tid}`，主内容 CSV 不导出楼层／评论深链。规范主题链接的 `not_live_verified` 不承诺所有旧帖仍可访问。
+
+CSV 原样保留研究文本。用 Excel 查看时请通过“从文本／CSV”导入，把 ID 列设为文本，避免大整数被截断；以 `=,+,-,@` 开头的原始文本也可能被 Excel 当作公式。不要用 Excel 自动格式后的内容覆盖原始 CSV。
+
+早期 V1/V2 批次数字是当时快照，已由后续全库导出更新。当前批次中正文非空数为主题 87/89（85 条 API 已核实、2 条旧列表 fallback 未核实；另有 2 条纯媒体主题正文为空）、一级回复 2,150/2,173、楼中楼 74/77。属地非空数分别为 80、1,441、23；正成长等级数分别为 86、2,095、27。没有导出等级值 `0`；这不代表缺失行已确认真实为零。媒体 URL 数组非空行数为主题 38、一级回复 117、楼中楼 0；独立媒体表 542 行含 226 条图片引用和 316 条表情引用，没有真实视频样本。成长图标 URL 在三类内容 CSV 中分别为主题 1 条、一级回复 3 条、楼中楼 1 条；这些是定向页面证据，不能外推为批量覆盖。批次和行数校验通过不代表平台采集完整。
 
 ## VS Code 与 PyCharm
 

@@ -1,6 +1,6 @@
 # 字段来源与验证范围
 
-审计日期：2026-11-14
+审计日期：2026-11-15（V1 历史记录与 V2 增量分开列出）
 
 代码范围：当前工作树、`aiotieba==4.8.2`、`tiebameow==0.5.0`。本地参考截图只用于 UI 线索；公开仓库不包含截图、真实帖子正文、用户标识、原始属地值或登录资料。
 
@@ -18,7 +18,7 @@
 | 字段 | 来源路径 | 当前保存位置 | 证据与限制 |
 |---|---|---|---|
 | `tid/fid/fname/title/create_time/last_time` | `get_threads` 的 `ThreadDTO`；`get_posts` raw `Posts.thread: Thread_p` 提供首楼部分字段 | 基础表 + `research_thread`，记录 `create_time_raw/last_time_raw/source_api/observed_at` | 源码与合成映射已核对。`create_time` 是主题创建时间，`last_time` 是最后回复时间，二者不可互换。 |
-| `first_pid/body_text/contents_raw` | `get_posts` raw `Posts.thread`，并与返回的 floor 1 `Post` 配对 | `research_thread.first_pid/body_text/contents_raw`；`research_content_observation` 保存 `thread_first_post` owner 水位 | floor 1 不作为普通 `research_post` 行。列表新记录不会清掉详情正文；旧详情仅在内容水位被接受时补写详情独有字段。完整实时样本仍未验证。 |
+| `first_pid/body_text/contents_raw` | `get_posts` raw `Posts.thread`，并与返回的 floor 1 `Post` 配对 | `research_thread.first_pid/body_text/contents_raw`；`research_content_observation` 保存 `thread_first_post` owner 水位 | floor 1 不作为普通 `research_post` 行。列表新记录不会清掉详情正文；旧详情仅在内容水位被接受时补写详情独有字段。当前批次 87/89 正文非空，其中 85 条 API 核实、2 条旧列表 fallback 未核实，另有 2 条纯媒体主题正文为空。 |
 | `reply_count/agree_count/disagree_count/view_count/share_count` | `get_threads` 与 `get_posts` raw thread 的计数属性 | `research_thread` 规范列和 source payload | 计数是响应时点的值。接口报告数与真实回复总数/页面展示口径的差异尚未完成全量对账。 |
 | `collect_count` | `get_posts` raw `Posts.thread.collect_num`；`get_threads` 不提供该列 | `research_thread.collect_count`；raw 解析值保留在 `source_payload_json["counts"]["collect_count"]` | 合成映射和 PostgreSQL 水位回归已覆盖非零与零值。没有字段 presence 证据的 raw `0` 规范列写 `NULL`，缺失原因标记 `zero_presence_unverified_in_parsed_object`。没有据网页数字补值。 |
 | 主题状态和作者动态属性 | `get_threads` 列表字段；`get_posts` raw thread / author 字段 | `research_thread` 保存支持的 `thread_type`、状态、作者、互动和属地列 | 只更新响应来源支持的字段；共享字段使用更新时点，详情独有字段由内容观测水位控制。分享帖自身内容缺失时不把分享来源正文冒充首楼正文。 |
@@ -32,11 +32,11 @@
 
 | 范围 | 来源路径 | 当前保存位置 | 边界 |
 |---|---|---|---|
-| 一级回复 | `get_posts` raw `Posts.objs[]` / `Post`，含 `pid/tid/fid/floor/create_time/contents/author/counts` | `research_post`；媒体片段写入 `research_media_asset` | `research_post` 保存首楼以外的楼层。首楼 ID、正文和评论报告数留在 `research_thread`。 |
+| 一级回复 | `get_posts` raw `Posts.objs[]` / `Post`，含 `pid/tid/fid/floor/create_time/contents/author/counts` | `research_post`；媒体片段写入 `research_media_asset` | `research_post` 保存首楼以外的楼层。首楼 ID、正文和评论报告数留在 `research_thread`。当前 CSV 2,150/2,173 行正文非空。 |
 | 楼中楼 | 独立 `get_comments(tid, pid, page)` 的 raw `Comment` | `research_comment`，保留 `cid/tid/parent_post_pid` 和 `reply_to_user_id/reply_to_id_raw` | `get_posts` 带回的有限附带 comments 不代表完整楼中楼分页，也不会替代独立 `get_comments` 扫描。真实多页完整率未验证。 |
 | 回复目标 | `Comment.reply_to_id` | 非零解析值原样保留；`0` 写入 `reply_to_id_raw`，规范目标为 `NULL` 并记录 `aiotieba_zero_sentinel` | 该字段是目标用户 ID，不是被回复 comment ID。解析器的 `0` 是 sentinel，不能据此断言 API 明确返回数值零。 |
 | 首楼楼中楼父楼报告数 | `get_posts` 匹配到的 floor 1 raw `Post.reply_num` | `research_thread.source_payload_json["first_post"]`，包含 raw 值、规范值、来源和观察时间 | 不与 `ResearchThread.reply_count` 混用。没有 presence 证据的 parsed `0` 规范值为 `NULL`。质量报告优先使用该评论 scope 当前代最近有可信报告数的完成 checkpoint；没有时才回退此父楼值。 |
-| 评论作者等级/属地 | 独立 `get_comments` 的 `UserInfo_c` | `research_comment` 对该接口未提供的 `glevel/ip` 留空并记录缺失原因 | raw 附带 comments 的 `UserInfo_p` 有更丰富字段，但它不是全量来源，当前不会用它填充独立评论记录。 |
+| 评论作者等级/属地 | 独立 `get_comments` 的 `UserInfo_c`；`get_posts` 预览的 `UserInfo_p` | 同次响应中可验证的预览作者属性保存为 `api_raw` 字段观察；按评论完整身份补规范字段 | 预览不代表全文或分页完成，不创建评论壳、不推进内容水位；先有观察或先有完整详情均按同 CID／父楼／作者匹配。具体属地时点仍是 API 观察，不冒充发表当年位置。 |
 
 楼层、点赞/反对数、作者标识和内容片段均保留来源与响应观察时间。父子关系在导出前由 SQL 检查；回复数与已采集唯一 ID 数分别统计。
 
@@ -47,8 +47,8 @@
 | 用户 ID、用户名、昵称、portrait、`tieba_uid` | `get_threads/get_posts/get_comments` 作者对象 | `research_user` 最新身份行与每条内容的作者 ID | `user_id` 与 `tieba_uid` 是不同标识。用户名、昵称、portrait 会变化。 |
 | 吧内 `forum_level/forum_level_name/role_name` | 启用登录后的 `get_user_forum_info`；内容接口作者对象也可能提供 `forum_level` | `research_user_forum_snapshot`，按用户、贴吧、来源和观察时间记录 | `get_user_forum_info` 的映射明确将 `is_bawu`、`icons` 留空并记录为接口未提供；内容作者对象单独提供这些字段时才映射。`role_type` 或徽章 ID 不从图标猜测。 |
 | 作者 `is_bawu/icons` | `get_threads/get_posts/get_comments` 返回的内容作者对象（仅在该对象暴露时） | 对应内容行及由内容接口生成的 `research_user_forum_snapshot` | 不来自 `get_user_forum_info`；不同内容接口的作者对象字段并不完全相同，缺失时保持空值并记录原因。 |
-| 帖子作者 `ip_location_text` | `get_posts` 的 `PostUserDTO.ip` 或 raw thread author `.ip` | `research_post` / `research_thread` 的属地列，另保存来源路径和观察时间 | 10 条有界作者样本中，字段非空且为中文地域文本 10/10；IPv4/IPv6 字面值 0/10。只把非 IP 字面值当属地文本写入；原始 `ip` 不写入 source payload。该样本不能证明其他接口、其他用户或历史位置。 |
-| 评论作者 `ip_location_text/glevel` | 独立 `get_comments` 的 `UserInfo_c` 未声明这些字段 | 缺失时保持 `NULL` 并写原因 | 不用作者头像、截图或附带 comments 推断。 |
+| 帖子作者 `ip_location_text` | `get_posts` 的 `PostUserDTO.ip` 或 raw thread author `.ip`；raw `Post` 节点本身不声明 IP/location | `research_post` / `research_thread` 的属地列，另保存来源路径和观察时间 | 10 条历史有界作者样本字段非空 10/10；后续精确 API 对照曾见解析对象等级默认 `0`、属地空值，而定向 UI 样本明确显示属地。只把非 IP 字面值当属地文本写入；该内容作者值不由当前 profile 倒填，且不代表历史位置。 |
+| 评论作者 `ip_location_text/glevel` | `UserInfo_c` 未声明；同帖预览 `UserInfo_p` 与精确网页响应可能提供 | 只有明确属性及组合身份通过才补；`verified_content_api` 与网页来源分开保留 | 不按头像／截图／昵称推断，不将附带评论误认作完整分页。后续接口缺少属性不擦除已验证值，冲突留证据。 |
 
 用户在百度官方页面手动登录后，进行过一次有界 `get_user_forum_info` 检查：状态 `available`，请求和响应用户匹配，`forum_level`、`level_name`、`role_name` 均非空。只验证这一当前响应，不代表所有用户都可查询，也不回填旧帖发表时的身份。原始账号值未写入仓库或本文件。
 
@@ -59,21 +59,57 @@
 
 ## 媒体、checkpoint 与质量报告
 
-- 详情响应中的内容片段映射到 `research_media_asset`：`get_posts` 的首楼（需匹配到 floor 1 `Post`）和普通一级回复，以及独立 `get_comments` 返回的评论；`get_threads` 列表响应不会直接写媒体行。已映射的片段保留 owner 类型、ID、位置、片段类型、URL/hash/尺寸、来源及观察时间；不下载媒体文件。图片字段在库源码中有声明；真实媒体样本的完整性尚未现场验证，不能据此声称媒体覆盖完整。视频稳定 ID 仍未确认。
+- 详情响应中的内容片段映射到 `research_media_asset`：`get_posts` 的首楼（需匹配到 floor 1 `Post`）和普通一级回复，以及独立 `get_comments` 返回的评论；`get_threads` 列表响应不会直接写媒体行。已映射的片段保留 owner 类型、ID、位置、片段类型、URL/hash/尺寸、来源及观察时间；不下载媒体文件。实际批次的媒体引用归属已与三类内容 CSV 逐行按 owner 类型、owner ID 和 TID 对照通过；没有真实视频样本。
 - `research_content_observation(owner_type, owner_id)` 只由完整内容响应推进。thread 首楼 owner 为 `thread_first_post/tid`，普通 post 与独立 comment 的 owner 分别为 `post/pid`、`comment/cid`。空媒体集合也有水位，避免较旧页面恢复已删除的媒体引用。
 - `research_run` 记录每次研究运行；`research_checkpoint` 按 run/task/page 保存页码、分页状态、游标、报告数、错误类型与 scope 状态。`crawl_quality_report` 对详情 scope 汇总报告数、成功/失败页、唯一记录数、差异和原因。楼中楼 scope 优先采用当前代最近一个报告数可信的完成 checkpoint；无可信 checkpoint 时，首楼回退 `research_thread.source_payload_json["first_post"]["subreply_count_reported"]`，普通回复楼回退 `research_post.subreply_count_reported`。评论质量计数不会回退到主题总回复数；一级回复对账使用主题回复报告数和保存的唯一一级回复数。列表流的分页状态仍由 `thread_list` checkpoint 保存。
 - manifest 的实体导出校验与采集完整性是分开的结果。没有 checkpoint 时，质量证据为 `unknown_not_tested`；存在 checkpoint 也不证明平台上的所有数据都已抓取。
 
-当前实现回归为全仓 236 passed、10 个默认门控用例 skipped；质量 SQL 定向用例 17 passed；专用 PostgreSQL scope 双事务锁竞态两种顺序 2 passed。Ruff、compileall、diff-check 通过。三次真实 CLI 导出各生成唯一批次且未覆盖旧文件；最终批次六类实体 CSV 的全数据库行数与 SQL/manifest 一致，`entity_scope=all_database_rows`、`validation_status=passed`，全 runs 质量报告为 98 行。备份恢复尚未验证。导出校验不能证明平台数据完整。
+V1 历史回归为全仓 236 passed、10 skipped；质量 SQL 定向 17 passed、专用 PostgreSQL scope 锁竞态 2 passed。三次历史导出未覆盖旧批次，当时全 runs 质量报告为 98 行。V2 已验证隔离恢复与无损迁移，新增批次及字段证据见下节；导出一致始终不代表平台数据完整。
 
 ## 截图仅提供 UI 线索
 
 七张本机截图显示了排序、等级、角色文字/图标、媒体、属地、计数和折叠评论等页面元素。截图没有作为公开文件发布。页面控件本身不能证明接口字段、protobuf presence、计数口径或历史状态。
 
-## 当前未验证项
+## V1 当时未验证项（后续 V2/V3 证据见下节）
 
 - 超过两页的真实 CREATE 跨页排序、服务端页数变化与全吧终止条件。
 - 超过 10 页真实运行、真实一级回复/楼中楼完整分页和数量对账。
 - 多类型真实媒体片段、分享帖和投票内容的 raw 到数据库完整性。
 - 详情队列完成与详情 checkpoint 恢复、IDE GUI 停止、进程崩溃后的现场恢复，以及备份恢复。
-- `ip` 地域文本与具体网页 UI 地区标签的一一映射；当前结论只限于上述 10 条接口字段样本。
+- 当时尚未对照 `ip` 地域文本与网页 UI 地区标签；V3 有限对照及覆盖限制见下节。
+
+## V2 历史证据与字段状态（V3 当前批次见下节）
+
+本节记录 V2 当时证据；后续 V3 字段／导出变化以紧随其后的当前批次为准。不能把源码实现、合成测试、只读实采和正式入库四种证据混为一谈。所有真实值、精确标识和现场材料只在本机报告中保存。
+
+| 字段／行为 | V2 证据 | 状态与限制 |
+|---|---|---|
+| 规范 `thread_url` | 三类内容 CSV 从严格合法 TID 构造可信 HTTPS 地址，长整数与非法输入有测试；另选 3 条不同导出链接，浏览器落点和自然响应 TID 均匹配 | 该次样本 3/3 通过；导出仍默认 `not_live_verified`，不把样本成功外推到全部链接 |
+| 楼层／评论深链 | 尚无可靠实际落点证明 | 当时保持 `NULL`；V3 主内容 CSV 已移除楼层／评论深链字段 |
+| 正文和详情待办 | 真实 `drain-pending` 4 次请求保存首楼、2 条一级回复和 9 条楼中楼，未发现新主题 | 一个首楼评论范围缺可靠空页证据，仍 `incomplete`；不声称整个 run 完成 |
+| 独立评论接口作者扩展 | 一次原 protobuf 与 SDK 同响应、同 CID／父楼／作者校验通过，共 7 条；属地、成长等级、另一套 UID 和具体职务均无非空值 | `partial`；只限该响应，不能泛化为 endpoint 不支持；scalar 默认零未获得 presence 证明 |
+| 帖子详情附带评论作者 | `get_posts` 的 9 条预览通过组合身份校验；有界生产入库使既有 9 条评论成长等级 0→9、属地 0→7 | `api_verified` 包含该次入库及十三 CSV 验证，正文／媒体／内容水位和行观察时间哈希未变。预览仍不证明完整正文或分页结束 |
+| 网页评论属地、赞／踩 | 专用登录会话自然 `page_pc`／`nestedFloor` 响应，经数据库 TID／父 PID／CID／UID 校验；3 个评论目标正式回填完成，样本属地 7/9→9/9，并保存赞／踩明确零值 | `web_verified` 包含正式租约／事务入库证据；不能用无 CID 的 DOM 评论绑定，页面显示也不冒充发表当年的属地 |
+| 本吧等级与头衔 | 实采 DOM 和 API 已知作者交叉核验，等级来自同 owner 的 `icon_level`、明确“本吧头衔”提示与 `#level_N`，不是图片文件名 | `partial`；同页另一作者没有等级图标时保持缺失，不能借用嵌套评论图标 |
+| 全局成长等级图片 | V2 当时页面仅见成长图标，未验证数字 | `needs_evidence` 是历史 V2 结论；V3 已在定向页面样本中核实成长数字及图标 URL，见下节 |
+| 具体吧务角色 | 有界当前资料、论坛资料、吧务名单共 3 次请求，UID／FID 匹配，样本确认具体职务 | `api_verified` 当前快照；不代表历史发帖时职务，名单未列出不能写确定 False |
+| 收藏／赞按钮无数字 | DOM 仅显示操作文案；自然 `page_pc` 明确计数字段另有结构化证据 | 文案仍为 `zero_presence_unverified`；已用 JSON 明确数字补入主题收藏／转发／反对零值，不把文案当 0 |
+| 媒体与回复方向 | 原完整 API 内容／媒体水位及富媒体映射保留；用户提及的被回复 UID 与父楼 UID 分开 | V2 历史批次未提供独立 `media_urls` 字段；V3 变更见下节。视频／精确被回复评论 ID 当时仍未证实 |
+
+## V3 当前批次与定向页面证据
+
+最新本机全库 CSV 批次：threads 89、posts 2,173、comments 77、users 1,619、user_forum_snapshots 2,089、media_assets 542。三类内容正文非空分别为 87、2,150、74；属地非空分别为 80、1,441、23；正成长等级分别为 86、2,095、27。没有一行被规范化为成长等级 `0`；未能证明 presence 的 protobuf 标量零仍表示未知，不从当前 profile 补写历史内容作者字段。
+
+媒体表共 226 条图片引用、316 条表情引用、0 个真实视频样本。三类内容 CSV 的 `media_urls` 非空行数分别为 38、117、0；数组只含按片段位置排序、去重的图片／视频 URL，并按 `(owner_type, owner_id, tid)` 关联。跨三类内容 CSV 对应媒体归属、顺序及 URL 对照通过。媒体表独立保留。不会做 OCR 或 URL 文件名推断，也不把表情、成长图标或视频封面缩略图误列为正文媒体。视频支持目前只有合成测试证据。
+
+目标页面截图中，3 条一级回复均显示并保留数值等级 10、成长图标 URL 和属地。一个嵌套评论的成长图标从深层 `feed_head.main_data` 读取并保留；页面字段任务状态为 planned／eligible／collected／completed 各 1、missing 0。三类内容 CSV 的 `global_growth_icon_url` 分别有 1、3、1 条，仅是定向页面证据，不代表全库覆盖；评论 `reply_to_display_name` 按页面明确显示值提取。未使用 OCR。
+
+API 对照发现 raw `Post` 节点没有 `ip_address` 或 `location` 字段；帖子地区候选位于 `user_list` 作者对象。已存目标的有效 API 对照中解析等级为默认零、属地为空；同目标的原生 `page_pc` 深层响应含成长徽章 URL，但该证据没有证明其数字等级或 IP。另有 3 条一级回复截图样本显示等级 10、图标 URL 和 IP。网页观察按精确内容及作者身份绑定，并与该 API 样本区分；不借用其他楼层或当前用户 profile。成长值为 `0` 的 presence 无法由 protobuf scalar 证明。
+
+`get_posts` 详情分页响应的 canonical PID 需由明确、唯一的 floor 1 Post 证明，不能将分页返回的 `raw.thread.pid` 当成主题首楼 PID。修正后 60 个详情响应页已保存且 0 失败，canonical 主题仍为 89。5/6 个主题详情 API 任务在本次有界分页验证中取得终止证据，但直接采集没有推进对应 checkpoint；另一次原生 CLI 验证完成同一主题的两个一级回复页面 checkpoint，其子评论 scope 有 3 个完成、7 个未完成、22 个待处理。因此整轮及详情队列均未完成。长正文样本 API 10,686 字符与页面 DOM 10,649 字符在空白归一后相等；这是单个样本，不能保证所有正文。IDE 图形界面停止行为仍为 NOT_TESTED。
+
+字段来源使用响应／页面观察时间。帖子详情中的用户对象也不能据此声称是作者发表当年的属性；独立 profile、论坛资料和吧务名单始终属于当前快照。API 预览中的共享用户信息需保留明确 source path，并与网页的该条内容展示值分别对照。
+
+正常／精品流深度测试实际保存了普通 CREATE 12 页和精品 1 页，共 374 个去重主题索引；全部详情仍待处理。13 页的非置顶创建时间页内和跨页均倒序，未发现重复页。14 次 HTTP 计数中包含一次 SDK 论坛名称解析；首两次间隔 0.327 秒，不能宣称这一旧版本实测的全部 HTTP 都满足 5 秒间隔。该隐式解析路径已纳入后续限速修复和独立测试。
+
+API 能取但未映射、接口此样本空值、页面未显示、图标语义未证实、身份不匹配、分页未完成和当前资料快照分别记录。最终是否写入及每次非空率，以本机新批次的 field observation、field quality 和验收报告为准；本节不表示全吧覆盖。

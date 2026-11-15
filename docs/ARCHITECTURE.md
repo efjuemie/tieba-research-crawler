@@ -1,6 +1,6 @@
 # 架构与数据边界
 
-本文对应当前工作树。采集、登录和导出功能已有代码与合成测试；有限真实主题/楼中楼 scope、主入口列表 checkpoint 的 SIGINT/同 run 恢复，以及七类 CSV/manifest 的三次真实导出已验证。完整详情队列、超过 10 页运行和备份恢复仍待验收。
+本文对应当前实现。普通 CREATE 12 页、隔离恢复迁移、有限详情排空、字段生产入库和定向页面核验已有实测。最新全库 CSV 有 89 个主题、2,173 条一级回复、77 条楼中楼；详情子范围仍有未完成项，不能把列表页数、单 scope 完成或 CSV 一致性等同于全吧完整。
 
 ## 请求与数据流
 
@@ -64,6 +64,8 @@ flowchart LR
 
 `research_content_observation` 使用 `(owner_type, owner_id)` 标识内容：`thread_first_post` 的 `owner_id` 是 `tid`，媒体表对应 `owner_type = thread`；`post` 对应 `pid`；`comment` 对应 `cid`。主题列表响应不能推进正文水位。完整 `get_posts` 首楼、普通一级回复和独立 `get_comments` 响应会在同一数据库事务中更新正文、接受新水位并替换整组媒体。最新空媒体集合也会推进水位并清掉旧片段，较旧响应不能再恢复旧媒体。
 
+`threads.csv`、`posts.csv`、`comments.csv` 的 `media_urls` 是按对应内容 owner 与 `tid` 精确关联的 JSON URL 数组，仅含图片／视频片段，按片段位置排序并去重；`media_assets.csv` 仍单独保留。存在当前权威首楼观察时，空媒体集合不会被旧首楼 alias 复活；没有当前观察才允许兼容旧 owner fallback。媒体分类不把 emoji、成长图标或缩略封面当正文图片／视频 URL。
+
 研究记录带 `source_api`、`observed_at`、`source_payload_json` 和 `missing_reasons_json`。API 数值字段若在解析对象中为 `0`，但没有 protobuf 字段 presence 证据，规范化列写 `NULL`，原始解析值留在 source payload，缺失原因注明 `zero_presence_unverified_in_parsed_object`。`get_user_forum_info` 返回的 JSON 明确字段按其接口值保存。数据时间是观察时间，不代表历史发帖时状态。
 
 ## 回复层级和来源边界
@@ -87,18 +89,38 @@ thread(tid)
 
 2026-11-14 的一次有界登录后资料查询返回 `available`，请求用户与响应用户匹配，吧内等级、等级名称和角色名称均非空。它只证明该用户、该贴吧和该时点的字段路径可用，不能回填为旧帖历史状态或代表全体用户覆盖率。
 
+## V2 定向字段补采
+
+`drain-pending` 复用既有 run、scope、generation 和 checkpoint，只排空已发现的详情，不启动列表发现。默认限制初始 scope 数量和详情排队／处理时限；启动和账号准备不计入此时限。中断后继续已有代次，缺少有效分页证据的空响应仍是不完整页。
+
+字段补采从已存研究记录规划目标，固定 `tid/pid/cid/parent_post_pid/author_user_id/fid`、API 行观察时间及 scope 代次。主题／一级回复要求对应主题详情已完成；评论还要求其父楼评论 scope 完成且父代一致。未完成目标停在 `pending_api_detail`，不访问网页。
+
+`research_web_enrichment_task` 保存字段集合、重试、租约和状态；attempt、field observation 与 failure 表保存本地审计。短事务领取租约，事务外读取浏览器，提交时重新锁定并核对租约、代次和目标身份。任何明确身份不一致拒绝整批；规范更新的条件必须命中恰好一行。过期回包不能修改新租约或新 attempt。
+
+Network 来源优先，页面只能自然加载或展开，不重放签名请求。现代 DOM 按所属楼层边界取值；本吧头衔与成长等级分开。没有 CID 的嵌套评论 DOM 不绑定研究评论。少量主题／一级回复允许以确证内容 ID、既有 API 作者 UID 及官方主页链接的 portrait token 进行有限绑定；不能用头像外观、昵称、正文相似或序号关联。
+
+独立 `identity_verified` 与字段是否有值分开。按钮仅显示“收藏／赞”不证明数字零；只有成长等级图片而无数值时保留缺失原因。已知 API 与网页值不同保留观察和冲突，不静默改写。`field_sources_json` 记录逐字段来源；后续 SDK 未暴露属性或默认零不擦除已验证的补采值。API 若试图在同一主键下改变已知作者、父楼、论坛等稳定身份，则页级事务回滚。
+
+浏览器使用显式项目隔离 Profile，串行复用上下文。导航、展开和显式 API 共用请求预算，页面自动子资源另计诊断。登录／验证暂停时不持数据库事务；可见保留页用于人工操作，确认后仅恢复该目标一次，429 不自动恢复。关闭操作只等待 provider 自有 collection worker，取消或超时仍清理监听、捕获任务和页面。
+
+网页 provider 的 `max_pages`、`max_expansions`、`timeout_seconds` 默认分别为 1、1、30 秒；允许页数 1–10、展开数 0–10、超时大于 0 且不超过 120 秒。
+
+`user-backfill` 独立更新当前用户与用户论坛快照，UID／FID 去重并缓存吧务名单。当前查询不能倒填为历史内容发表时属性；名单未列出不是确定的否定角色证据。
+
 ## CSV 批次和验证
 
-`python -m src.research export` 从本机数据库导出七个 CSV：`threads`、`posts`、`comments`、`users`、`user_forum_snapshots`、`media_assets`、`crawl_quality_report`，并写一个 manifest。每次创建新批次目录，文件名含 `all-runs`、Asia/Shanghai 导出时间和唯一批次 ID；不会覆盖既有批次。实体 CSV 包含数据库的全部 run。传 `--run-id` 只筛选质量报告并为批次提供命名上下文，实体 CSV 仍是全库范围。
+`python -m src.research export` 保留七个标准 CSV，V2 加入 scope、任务、attempt、字段观察、失败和字段质量审计，目前共十三类 CSV 及 manifest。每次创建新批次目录，文件名含范围前缀（默认 `all-runs`，完成主题模式为 `completed-threads`）、Asia/Shanghai 时间和唯一批次 ID，不覆盖既有批次。默认实体 CSV 是全数据库；`--run-id` 筛选运行质量及相关审计，不能改称单 run 实体数据。API 观察未知 run 时标为未归属，全量审计保留、指定 run 审计不冒认归属。
 
 导出会保留没有研究扩展行的旧基础记录，并标为 `legacy_base_unverified`；它不会用旧 ORM 的零值补齐研究扩展中的 `NULL`。写入过程中会校验数据库查询数、CSV 行数、唯一键和回复父子关系。PostgreSQL 的实体查询使用一致快照；导出前仍应暂停采集，以免 checkpoint 汇总和实体查询来自不同时间。实体一致性验证通过与整站采集完整是两种不同状态。无 checkpoint 证据时 manifest 标记 `unknown_not_tested`。
 
 导出只产生 CSV 与 manifest，不含 Excel/XLSX。文件保存在本机指定目录，权限为当前用户读写。CSV 中的用户 ID、昵称、回复目标 ID 和原始正文不脱敏。
 
-三次真实 CLI 导出均生成了不同时间戳加 UUID 的新批次，没有覆盖旧文件。最终批次中六类实体 CSV 覆盖全数据库，其行数与 SQL 查询和 manifest 一致；manifest `entity_scope=all_database_rows`、`validation_status=passed`，全 runs `crawl_quality_report` 有 98 行。前两次导出传入 comments run 的 `--run-id`，所以质量报告各有 2 行。精确实体计数见[开发记录](DEVELOPMENT_LOG.md)。
+评论另导出 `reply_to_display_name`，仅在页面内容明确提供回复对象名称时填写；未验证的回复评论 ID 不推测。三类内容均可带 `global_growth_icon_url`。解析对象中的标量等级 `0` 若无 protobuf presence 证据会规范化为未知，不表示真实等级零；当前用户资料也不回填历史内容属性。网页字段读取按作者与内容身份绑定，不使用 OCR 或 URL 文件名推断等级。
 
-## 已核实与待验收
+V1 三次真实 CLI 导出均生成了不同时间戳加 UUID 的新批次，没有覆盖旧文件。该阶段最终批次中六类实体 CSV 覆盖全数据库，其行数与 SQL 查询和 manifest 一致；manifest `entity_scope=all_database_rows`、`validation_status=passed`，全 runs `crawl_quality_report` 有 98 行。前两次导出传入 comments run 的 `--run-id`，所以质量报告各有 2 行。精确实体计数见[开发记录](DEVELOPMENT_LOG.md)。
 
-当前实现回归记录为全仓 236 passed、10 个默认门控用例 skipped；质量 SQL 定向用例 17 passed，专用 PostgreSQL scope 双事务锁竞态两种顺序 2 passed。Ruff、compileall、diff-check 通过；独立 Sol 对质量 SQL 的定向复核未发现新问题。有限真实样本观察到主题回复报告 2 对 1 条唯一普通回复、以及楼中楼报告 51 对 50 条唯一记录，原因未知。三次真实 CLI 导出验证了六类实体 CSV、全 runs 质量报告和 manifest；全吧采集、详情 scopes 完成、超过 10 页运行和备份恢复仍待完成；见[开发记录](DEVELOPMENT_LOG.md)与[字段来源审计](FIELD_SOURCE_AUDIT.md)。
+## 历史验收与当前批次
+
+早期 V1/V2 回归和导出行数是历史快照；当时观察到回复报告 2 对 1、楼中楼 51 对 50 的差异，原因仍未证实。最终验证结果以[开发记录](DEVELOPMENT_LOG.md)和[字段审计](FIELD_SOURCE_AUDIT.md)中的 2026-11-15 当前批次为准。该批次实体 CSV 行数、唯一键、长整数、媒体归属及回复关系校验通过；运行队列仍有未完成 scope，不宣称全吧完成。IDE 图形界面停止行为尚未验证。
 
 上游项目的代码和文档归属见 [TiebaMeow/TiebaScraper](https://github.com/TiebaMeow/TiebaScraper) 与 [LICENSE](../LICENSE)。

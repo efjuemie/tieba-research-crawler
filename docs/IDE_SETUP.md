@@ -103,7 +103,7 @@ uv run python main.py --mode backfill --resume --run-id <run_id>
 uv run python -m src.research export
 ```
 
-默认在 `exports/` 下新建独立批次目录，导出完整本地数据库中的全部 run，包含七个 UTF-8 with BOM CSV：`threads`、`posts`、`comments`、`users`、`user_forum_snapshots`、`media_assets`、`crawl_quality_report`，以及批次 manifest。每次导出都会创建唯一目录，不覆盖已有批次。
+默认在 `exports/` 下新建独立批次目录，导出完整本地数据库中的全部 run，保留七类标准 UTF-8 with BOM CSV：`threads`、`posts`、`comments`、`users`、`user_forum_snapshots`、`media_assets`、`crawl_quality_report`，以及 V2 运行／字段审计，目前共十三类 CSV 和一个批次 manifest。每次导出创建唯一目录，不覆盖已有批次。
 
 可用 `--output` 指定另一个本机导出根目录：
 
@@ -111,7 +111,7 @@ uv run python -m src.research export
 uv run python -m src.research export --output exports
 ```
 
-如果追加 `--run-id`，它只筛选质量报告中的 checkpoint，并作为批次名称的上下文；其他六个内容 CSV 仍包含数据库所有 run 的记录：
+如果追加 `--run-id`，它筛选运行质量及相关审计，并作为批次命名上下文；默认其他六类实体 CSV 仍包含全数据库所有 run：
 
 ```sh
 uv run python -m src.research export --run-id <run_id>
@@ -119,9 +119,26 @@ uv run python -m src.research export --run-id <run_id>
 
 命令会打印实际生成的批次目录。质量报告汇总采集 checkpoint，不是“所有平台记录均已抓取”的证明。CSV 和账号文件均只保存在本机。
 
-已有三次真实 CLI 导出成功：每次都创建不同时间戳加 UUID 的新批次目录，旧批次未覆盖。最终批次的六类实体 CSV 覆盖全数据库，行数与 SQL 查询和 manifest 一致；manifest `entity_scope=all_database_rows`、`validation_status=passed`，全 runs 质量报告有 98 行。前两次命令传入 comments run 的 `--run-id`，所以质量 CSV 各有 2 行。备份恢复尚未验证。
+三次真实 CLI 导出、98 行全 runs 质量报告和旧实体数是 V1 历史结果。V2 已验证隔离备份恢复及十三 CSV 新批次；当前批次计数和字段覆盖见[开发记录](DEVELOPMENT_LOG.md)，以最新全库导出为准。
 
-## 验证命令行参数
+## V2 在 IDE 中运行定向任务
+
+沿用项目 `.venv` 和项目根目录作为 working directory。PyCharm 的 `drain-pending` 使用 Script path `main.py`，其余研究子命令使用 Module name `src.research`；Parameters 只填子命令及其参数；VS Code 可在集成 Terminal 运行完整命令。需要扫码后按回车时使用有标准输入的 Terminal，避免无可取消输入的调试控制台。
+
+```sh
+uv run python main.py drain-pending --run-id YOUR_RUN_ID --tid YOUR_TID --limit 1 --max-seconds 120
+uv run python -m src.research field-backfill --run-id YOUR_RUN_ID --target-type comment --tid YOUR_TID --cid YOUR_CID --field ip_location_text --limit 1 --dry-run
+uv run python -m src.research web-audit --run-id YOUR_RUN_ID --target-type post --tid YOUR_TID --pid YOUR_PID --field global_growth_icon_url --browser-profile secrets/tieba-web-profile --headed --wait-for-login --max-seconds 300
+uv run python -m src.research export --entity-scope completed-threads
+```
+
+先用 `uv sync --group login`、`uv run playwright install chromium` 安装网页可选依赖。正式 `field-backfill` 在去掉 `--dry-run` 后也需传专用 `--browser-profile`；需要手工验证时加 `--headed --wait-for-login`。登录在当前官方页面完成，不复制 Cookie。等待计入运行时限，429 不自动恢复。
+
+`drain-pending` 不发现新主题；`field-backfill` 不绕过未完成 API 详情。当前用户资料可使用 `user-backfill --profile --forum --bawu` 单独补充，不能倒填为历史发表属性。完整参数、筛选含义和数据范围见 [README](../README.md)。
+
+导出默认仍为全库，`--run-id` 不是单 run 实体过滤器；`completed-threads` 是最新 API scope 完成证明筛选。主题 CSV 按创建时间倒序，三类内容均带规范主题链接和 `media_urls` JSON URL 数组；`media_assets.csv` 仍独立输出。主内容 CSV 不含楼层／评论深链。每批时间戳与 UUID 唯一；用 Excel 导入时把 ID 列设为文本，保留原 CSV。
+
+### 帮助检查
 
 这些帮助命令只打印用法，不启动采集、登录或导出：
 
@@ -134,4 +151,4 @@ uv run python -m src.research export --help
 
 命令行选项也可参考 [VS Code Python 调试文档](https://code.visualstudio.com/docs/python/debugging)；该文档说明如何选择项目解释器并配置 `launch.json`。
 
-本指南编写时已用项目 `.venv` 验证 `main.py --help`、研究 CLI 的总帮助、`login --help` 和 `export --help`；也验证了启动示例是有效 JSON，并确认缺少 `--resume` 时 `--run-id` 会在启动应用前被拒绝。本机 Python 主入口已连接真实 PostgreSQL 并做有限真实采集和列表恢复演练；独立的小范围详情检查也验证了一页帖子详情与两页楼中楼数据落库。VS Code/PyCharm GUI 尚未操作。三次真实导出已校验七类 CSV/manifest；备份恢复仍待验证。
+本指南编写时已用项目 `.venv` 验证 `main.py --help`、研究 CLI 的总帮助、`login --help` 和 `export --help`；也验证了启动示例是有效 JSON，并确认常规采集模式中缺少 `--resume` 时 `--run-id` 会在启动应用前被拒绝；`drain-pending --run-id` 则是合法用法。本机 Python 主入口已连接 PostgreSQL 并做有限真实采集和列表恢复演练。最新批次有 89 个主题、2,173 条一级回复、77 条楼中楼，实体 CSV 与 manifest 校验通过，但详情子范围仍有待办。V1/V2 导出数据属于历史快照。VS Code/PyCharm 图形界面的运行与停止操作均为 `NOT_TESTED`；GUI 没有端到端验收。
