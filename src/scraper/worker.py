@@ -873,11 +873,9 @@ class ThreadsTaskHandler(TaskHandler):
             _expected_fid=task_content.fid,
         )
         threads_data = self._dto(fetched_page.response)
-
-        all_tids = [thread.tid for thread in threads_data.objs]
         if threads_data.page.total_page < 0 or threads_data.page.total_count < 0:
             raise PageIntegrityError(f"Thread list returned negative page metadata for {fname} pn={pn}.")
-        if not all_tids and (
+        if not threads_data.objs and (
             threads_data.page.has_more
             or threads_data.page.total_count > 0
             or threads_data.page.total_page < 1
@@ -887,6 +885,26 @@ class ThreadsTaskHandler(TaskHandler):
             raise PageIntegrityError(f"Thread list has_more exceeds total_page for {fname} pn={pn}.")
         if not threads_data.page.has_more and threads_data.page.total_page > 0 and pn < threads_data.page.total_page:
             raise PageIntegrityError(f"Thread list ended before total_page for {fname} pn={pn}.")
+
+        identity_constraints: dict[int, dict[str, int | None]] = {}
+        unique_threads = self._dedupe_thread_list_items(
+            threads_data.objs,
+            fname=fname,
+            pn=pn,
+            identity_constraints=identity_constraints,
+        )
+        threads_data.objs[:] = unique_threads
+        raw_page = getattr(fetched_page.response, "raw", None)
+        raw_threads = getattr(raw_page, "objs", None)
+        if raw_threads is not None and raw_threads is not threads_data.objs:
+            raw_threads[:] = self._dedupe_thread_list_items(
+                raw_threads,
+                fname=fname,
+                pn=pn,
+                identity_constraints=identity_constraints,
+            )
+
+        all_tids = [thread.tid for thread in threads_data.objs]
         non_top_threads = [thread for thread in threads_data.objs if not thread.is_top]
         non_top_create_times = tuple(thread.create_time for thread in non_top_threads)
         non_top_tids = tuple(thread.tid for thread in non_top_threads)
@@ -895,9 +913,12 @@ class ThreadsTaskHandler(TaskHandler):
             earlier < later
             for earlier, later in zip(non_top_create_times, non_top_create_times[1:], strict=False)
         ):
-            raise ValueError(f"CREATE sort order is not descending for {fname} is_good={is_good} pn={pn}")
-        if task_content.backfill and len(set(non_top_tids)) != len(non_top_tids):
-            raise PageIntegrityError(f"CREATE page contains duplicate non-top tid values for {fname} pn={pn}.")
+            self.log.warning(
+                "CREATE page time order moved forward for {} is_good={} pn={}; continuing by page number.",
+                fname,
+                is_good,
+                pn,
+            )
         if task_content.backfill:
             last_create_time = cursor.get("last_create_time")
             if non_top_create_times and last_create_time:
@@ -905,14 +926,41 @@ class ThreadsTaskHandler(TaskHandler):
 
                 previous_oldest = datetime.fromisoformat(str(last_create_time))
                 if non_top_create_times[0] > previous_oldest:
-                    raise PageIntegrityError(f"CREATE sort order moved forward across pages for {fname} pn={pn}.")
-            recent_non_top = {int(tid) for tid in cursor.get("recent_non_top_tids", [])}
-            duplicate_tids = recent_non_top.intersection(non_top_tids)
+                    self.log.warning(
+                        "CREATE page time order moved forward across pages for {} is_good={} pn={}; "
+                        "continuing by page number.",
+                        fname,
+                        is_good,
+                        pn,
+                    )
+            flow_seen = {int(tid) for tid in cursor.get("_flow_seen_tids", [])}
+            duplicate_tids = flow_seen.intersection(non_top_tids)
             fingerprints = cursor.get("recent_page_fingerprints", [])
             if threads_data.page.has_more and all_tids and all_tids in fingerprints:
-                raise PageIntegrityError(f"CREATE pages repeated the same thread IDs for {fname} pn={pn}.")
+                self.log.warning(
+                    "CREATE page fingerprint repeated for {} is_good={} pn={}; continuing by page number.",
+                    fname,
+                    is_good,
+                    pn,
+                )
+            replay = cursor.get("_resume_replay_page") == pn
+            page_seen = {int(tid) for tid in cursor.get("_resume_page_seen_tids", [])} if replay else set()
+            page_seen.update(non_top_tids)
+            duplicate_ratio = len(duplicate_tids) / len(non_top_tids) if non_top_tids and not replay else None
+            duplicate_streak = int(cursor.get("_flow_duplicate_streak", 0))
+            if not replay:
+                duplicate_streak = duplicate_streak + 1 if duplicate_ratio is not None and duplicate_ratio >= 0.9 else 0
+            duplicate_pause_reason = (
+                "three_consecutive_pages_at_least_90_percent_seen"
+                if not replay and duplicate_streak >= 3
+                else None
+            )
         else:
             duplicate_tids = set()
+            page_seen = set(non_top_tids)
+            duplicate_ratio = None
+            duplicate_streak = 0
+            duplicate_pause_reason = None
 
         continuation_json = self._thread_list_continuation(
             cursor,
@@ -920,6 +968,10 @@ class ThreadsTaskHandler(TaskHandler):
             non_top_tids,
             all_tids,
             duplicate_tids,
+            page_seen,
+            duplicate_ratio=duplicate_ratio,
+            duplicate_streak=duplicate_streak,
+            duplicate_pause_reason=duplicate_pause_reason,
             has_more=threads_data.page.has_more,
         )
         await self._persist_research_page(fetched_page.response)
@@ -940,6 +992,8 @@ class ThreadsTaskHandler(TaskHandler):
             await self._process_old_threads(threads_data, old_tids, task_content.backfill)
 
         run_id = getattr(self.container, "research_run_id", None)
+        await self._enqueue_missing_web_targets(run_id, thread_ids=tuple(all_tids))
+
         if task_content.backfill and run_id and hasattr(self.datastore, "record_research_checkpoint"):
             await self.datastore.record_research_checkpoint(
                 run_id=run_id,
@@ -952,7 +1006,13 @@ class ThreadsTaskHandler(TaskHandler):
                 fname=fname,
                 is_good=is_good,
                 status="completed",
-                scope_status="running" if threads_data.page.has_more else "completed",
+                scope_status=(
+                    "incomplete"
+                    if duplicate_pause_reason
+                    else "running"
+                    if threads_data.page.has_more
+                    else "completed"
+                ),
                 attempts=fetched_page.attempts,
                 has_more=threads_data.page.has_more,
                 next_page=pn + 1 if threads_data.page.has_more else None,
@@ -964,10 +1024,9 @@ class ThreadsTaskHandler(TaskHandler):
                             else None
                         ),
                 page_item_count=len(all_tids),
+                reason=duplicate_pause_reason,
                 continuation_json=continuation_json,
             )
-
-        await self._enqueue_missing_web_targets(run_id, thread_ids=tuple(all_tids))
 
         return ThreadPageResult(
             has_more=threads_data.page.has_more,
@@ -987,11 +1046,16 @@ class ThreadsTaskHandler(TaskHandler):
         non_top_tids: tuple[int, ...],
         page_tids: list[int],
         duplicate_tids: set[int],
+        page_seen_tids: set[int],
         *,
+        duplicate_ratio: float | None,
+        duplicate_streak: int,
+        duplicate_pause_reason: str | None,
         has_more: bool,
     ) -> dict[str, object]:
-        previous_tids = [int(tid) for tid in previous.get("recent_non_top_tids", [])]
-        previous_tids.extend(non_top_tids)
+        previous_tids = list(
+            dict.fromkeys([int(tid) for tid in previous.get("recent_non_top_tids", [])] + list(non_top_tids))
+        )
         fingerprints = list(previous.get("recent_page_fingerprints", []))
         fingerprints.append(page_tids)
         result: dict[str, object] = {
@@ -999,12 +1063,72 @@ class ThreadsTaskHandler(TaskHandler):
             "recent_page_fingerprints": fingerprints[-3:],
             "page_fingerprint": page_tids,
             "page_duplicate_tids": sorted(duplicate_tids),
+            "page_non_top_tids": sorted(page_seen_tids),
+            "flow_duplicate_streak": duplicate_streak,
         }
+        if duplicate_ratio is not None:
+            result["page_duplicate_ratio"] = duplicate_ratio
+        if duplicate_pause_reason:
+            result["high_duplicate_pause_reason"] = duplicate_pause_reason
         if page_times:
             result["last_create_time"] = page_times[-1].isoformat()
         elif previous.get("last_create_time"):
             result["last_create_time"] = previous["last_create_time"]
         return result
+
+    @staticmethod
+    def _dedupe_thread_list_items(
+        items: Sequence[Any],
+        *,
+        fname: str,
+        pn: int,
+        identity_constraints: dict[int, dict[str, int | None]] | None = None,
+    ) -> list[Any]:
+        unique: dict[int, Any] = {}
+        known_by_tid = identity_constraints if identity_constraints is not None else {}
+        for item in items:
+            tid = _positive_int_id(getattr(item, "tid", None))
+            if tid is None:
+                raise PageIntegrityError(f"Thread list contains an invalid TID for {fname} pn={pn}.")
+            known_identity = known_by_tid.setdefault(tid, {})
+            ThreadsTaskHandler._accumulate_thread_list_identity(known_identity, item, fname=fname, pn=pn)
+            previous = unique.get(tid)
+            if previous is None:
+                unique[tid] = item
+                continue
+
+            if bool(getattr(item, "is_top", False)) and not bool(getattr(previous, "is_top", False)):
+                unique[tid] = item
+        return list(unique.values())
+
+    @staticmethod
+    def _thread_list_identity(item: Any) -> dict[str, int | None]:
+        user = getattr(item, "user", None) or getattr(item, "author", None)
+        record_author_id = _positive_int_id(getattr(item, "author_id", None))
+        user_id = _positive_int_id(getattr(user, "user_id", None))
+        if record_author_id is not None and user_id is not None and record_author_id != user_id:
+            raise PageIntegrityError("Thread list record author ID conflicts with its parsed user identity.")
+        return {
+            "fid": _positive_int_id(getattr(item, "fid", None)),
+            "first_pid": _positive_int_id(getattr(item, "pid", None) or getattr(item, "first_pid", None)),
+            "author_user_id": record_author_id or user_id,
+        }
+
+    @staticmethod
+    def _accumulate_thread_list_identity(
+        known_identity: dict[str, int | None], incoming: Any, *, fname: str, pn: int
+    ) -> None:
+        incoming_identity = ThreadsTaskHandler._thread_list_identity(incoming)
+        if any(
+            known_identity.get(field) is not None
+            and incoming_identity[field] is not None
+            and known_identity[field] != incoming_identity[field]
+            for field in incoming_identity
+        ):
+            raise PageIntegrityError(f"Duplicate thread TID has conflicting core identity for {fname} pn={pn}.")
+        for field, value in incoming_identity.items():
+            if known_identity.get(field) is None and value is not None:
+                known_identity[field] = value
 
     async def _process_new_threads(
         self,

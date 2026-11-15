@@ -73,8 +73,9 @@ def _thread_page(
     return response
 
 
-async def _exercise_list_scan(page_factory):
+async def _exercise_list_scan(page_factory, *, expose_persisted=False):
     checkpoints: list[dict[str, Any]] = []
+    persisted_pages: list[tuple[int, ...]] = []
     run = {"status": "running"}
 
     async def get_threads_dto(_fname, **kwargs):
@@ -117,7 +118,12 @@ async def _exercise_list_scan(page_factory):
     )
     worker = Worker(0, router.threads_queue, container, datastore, router, lane="threads")
     handler = worker.handlers[ScanThreadsTask]
-    handler._persist_research_page = AsyncMock()
+
+    async def capture_persisted_page(response):
+        dto = getattr(response, "dto", response)
+        persisted_pages.append(tuple(thread.tid for thread in dto.objs))
+
+    handler._persist_research_page = AsyncMock(side_effect=capture_persisted_page)
     handler._process_new_threads = AsyncMock()
     handler._process_old_threads = AsyncMock()
     scheduler = Scheduler(router, container, datastore)
@@ -131,13 +137,8 @@ async def _exercise_list_scan(page_factory):
     finally:
         worker_task.cancel()
         await asyncio.gather(worker_task, return_exceptions=True)
-    return checkpoints, run["status"], error
-
-
-def _good_stream_page(is_good: bool, pn: int):
-    assert is_good
-    assert pn == 1
-    return _thread_page([])
+    result = (checkpoints, run["status"], error)
+    return (*result, persisted_pages) if expose_persisted else result
 
 
 @pytest.mark.asyncio
@@ -160,21 +161,11 @@ def _good_stream_page(is_good: bool, pn: int):
             "empty page without pagination evidence",
             lambda: _thread_page([], total_pages=0, total_count=0, has_more=False),
         ),
-        (
-            "same-page CREATE order reversal",
-            lambda: _thread_page(
-                [
-                    make_thread(tid=104, create_time=datetime.fromtimestamp(20)),
-                    make_thread(tid=105, create_time=datetime.fromtimestamp(30)),
-                ]
-            ),
-        ),
     ],
 )
 async def test_create_list_integrity_failures_persist_nonterminal_checkpoint(case, normal_page):
     def page_factory(is_good: bool, pn: int):
-        if is_good:
-            return _good_stream_page(is_good, pn)
+        assert not is_good
         assert pn == 1
         return normal_page()
 
@@ -194,15 +185,44 @@ async def test_create_list_integrity_failures_persist_nonterminal_checkpoint(cas
 
 
 @pytest.mark.asyncio
-async def test_create_list_repeated_full_page_fingerprint_fails_after_first_page_checkpoint():
-    thread = make_thread(tid=200, create_time=datetime.fromtimestamp(20))
-
+async def test_create_list_time_reversal_warns_and_completes():
     def page_factory(is_good: bool, pn: int):
-        if is_good:
-            return _good_stream_page(is_good, pn)
-        return _thread_page([thread], current_page=pn, total_pages=3, has_more=True)
+        assert not is_good
+        return _thread_page(
+            [
+                make_thread(tid=104, create_time=datetime.fromtimestamp(20)),
+                make_thread(tid=105, create_time=datetime.fromtimestamp(30)),
+            ],
+            total_pages=1,
+            has_more=False,
+        )
 
     checkpoints, run_status, error = await _exercise_list_scan(page_factory)
+
+    assert error is None
+    assert run_status == "running"
+    assert len(checkpoints) == 1
+    assert checkpoints[0]["status"] == "completed"
+    assert checkpoints[0]["scope_status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_create_list_pauses_after_three_high_overlap_pages_and_commits_page_ids():
+    first_page_ids = tuple(range(200, 210))
+
+    def page_factory(is_good: bool, pn: int):
+        assert not is_good
+        new_tid = 209 + pn
+        tids = first_page_ids if pn == 1 else (*first_page_ids, new_tid)
+        if pn == 2:
+            tids = (*tids, *(new_tid for _ in range(10)))
+        threads = [make_thread(tid=tid, create_time=datetime.fromtimestamp(100 - tid)) for tid in tids]
+        return _thread_page(threads, current_page=pn, total_pages=6, has_more=True)
+
+    checkpoints, run_status, error, persisted_pages = await _exercise_list_scan(
+        page_factory,
+        expose_persisted=True,
+    )
 
     assert isinstance(error, BackfillIncompleteError)
     normal_pages = [
@@ -213,10 +233,37 @@ async def test_create_list_repeated_full_page_fingerprint_fails_after_first_page
     assert [
         (checkpoint["page_number"], checkpoint["status"], checkpoint["scope_status"])
         for checkpoint in normal_pages
-    ] == [
-        (1, "completed", "running"),
-        (2, "failed", "incomplete"),
+    ] == [(page, "completed", "running") for page in (1, 2, 3)] + [(4, "completed", "incomplete")]
+    final_cursor = normal_pages[-1]["continuation_json"]
+    assert final_cursor["flow_duplicate_streak"] == 3
+    assert final_cursor["page_duplicate_ratio"] >= 0.9
+    assert final_cursor["high_duplicate_pause_reason"] == "three_consecutive_pages_at_least_90_percent_seen"
+    assert 213 in final_cursor["page_non_top_tids"]
+    assert 213 in persisted_pages[-1]
+    assert normal_pages[-1]["reason"] == final_cursor["high_duplicate_pause_reason"]
+    assert run_status == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_create_list_repeated_page_fingerprint_continues_until_overlap_threshold():
+    page_threads = [
+        make_thread(tid=320 + index, create_time=datetime.fromtimestamp(100 - index))
+        for index in range(10)
     ]
+
+    def page_factory(is_good: bool, pn: int):
+        assert not is_good
+        return _thread_page(page_threads, current_page=pn, total_pages=6, has_more=True)
+
+    checkpoints, run_status, error = await _exercise_list_scan(page_factory)
+
+    assert isinstance(error, BackfillIncompleteError)
+    normal_pages = [checkpoint for checkpoint in checkpoints if checkpoint["is_good"] is False]
+    assert [checkpoint["page_number"] for checkpoint in normal_pages] == [1, 2, 3, 4]
+    assert [checkpoint["status"] for checkpoint in normal_pages] == ["completed"] * 4
+    assert normal_pages[1]["continuation_json"]["flow_duplicate_streak"] == 1
+    assert normal_pages[2]["continuation_json"]["flow_duplicate_streak"] == 2
+    assert normal_pages[3]["scope_status"] == "incomplete"
     assert run_status == "incomplete"
 
 
@@ -225,8 +272,7 @@ async def test_create_list_uses_has_more_when_total_pages_and_total_count_are_un
     thread = make_thread(tid=300, create_time=datetime.fromtimestamp(20))
 
     def page_factory(is_good: bool, pn: int):
-        if is_good:
-            return _good_stream_page(is_good, pn)
+        assert not is_good
         if pn == 1:
             return _thread_page([thread], total_pages=0, total_count=0, has_more=True)
         return _thread_page(

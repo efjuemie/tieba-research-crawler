@@ -40,6 +40,7 @@ from src.scraper.worker import (
     FullScanPostsTaskHandler,
     IncrementalScanCommentsTaskHandler,
     IncrementalScanPostsTaskHandler,
+    PageIntegrityError,
     ThreadsTaskHandler,
     Worker,
 )
@@ -489,11 +490,171 @@ async def test_threads_handler_backfill_processes_one_create_page_and_retains_pi
             "recent_page_fingerprints": [[10, 11, 12]],
             "page_fingerprint": [10, 11, 12],
             "page_duplicate_tids": [],
+            "page_non_top_tids": [11, 12],
+            "flow_duplicate_streak": 0,
+            "page_duplicate_ratio": 0.0,
             "last_create_time": datetime.fromtimestamp(20).isoformat(),
         },
     )
     saved_threads = datastore.save_threads_and_pending_scans.await_args.args[0]
     assert {thread.tid for thread in saved_threads} == {10, 11, 12}
+
+
+@pytest.mark.asyncio
+async def test_threads_handler_dedupes_same_page_tid_before_persistence_and_dispatch():
+    listed = make_thread(tid=77)
+    listed.is_good = True
+    duplicate = make_thread(tid=77)
+    duplicate.is_good = False
+    dto_response = make_threads_response([listed, duplicate])
+    raw_thread = SimpleNamespace(
+        tid=77,
+        fid=10,
+        pid=77,
+        author_id=1,
+        user=SimpleNamespace(user_id=1),
+        is_top=False,
+        is_good=True,
+    )
+    raw_duplicate = SimpleNamespace(
+        tid=77,
+        fid=10,
+        pid=77,
+        author_id=1,
+        user=SimpleNamespace(user_id=1),
+        is_top=False,
+        is_good=False,
+    )
+    research_response = ResearchPage(
+        raw=SimpleNamespace(objs=[raw_thread, raw_duplicate]),
+        dto=dto_response,
+        observed_at=datetime.now(),
+        source_api="aiotieba.get_threads",
+    )
+    datastore = SimpleNamespace(filter_new_ids=AsyncMock(return_value={77}))
+    handler = ThreadsTaskHandler(
+        worker_id=0,
+        container=create_mock_container(
+            tb_client=SimpleNamespace(get_threads_dto=AsyncMock(return_value=research_response)),
+            config=SimpleNamespace(research_enabled=False, fetch_user_forum_info=False),
+        ),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler._persist_research_page = AsyncMock()
+    handler._process_new_threads = AsyncMock()
+    handler._process_old_threads = AsyncMock()
+
+    result = await handler.handle(ScanThreadsTask(fid=10, fname="bar", pn=1, backfill=True))
+
+    assert result.tids == (77,)
+    assert datastore.filter_new_ids.await_args.args[1] == [77]
+    assert dto_response.objs == [listed]
+    assert dto_response.objs[0].is_good is True
+    assert research_response.raw.objs == [raw_thread]
+    assert handler._persist_research_page.await_args.args[0] is research_response
+    assert handler._process_new_threads.await_args.args[0].objs == [listed]
+
+
+@pytest.mark.asyncio
+async def test_threads_handler_rejects_duplicate_tid_with_conflicting_identity():
+    conflicting = make_thread(tid=77)
+    conflicting.pid = 99
+    response = make_threads_response([make_thread(tid=77), conflicting])
+    handler = ThreadsTaskHandler(
+        worker_id=0,
+        container=create_mock_container(
+            tb_client=SimpleNamespace(get_threads_dto=AsyncMock(return_value=response)),
+            config=SimpleNamespace(research_enabled=False, fetch_user_forum_info=False),
+        ),
+        datastore=cast("Any", SimpleNamespace(filter_new_ids=AsyncMock(return_value=set()))),
+        router=QueueRouter(),
+    )
+    handler._persist_research_page = AsyncMock()
+
+    with pytest.raises(PageIntegrityError, match="conflicting core identity"):
+        await handler.handle(ScanThreadsTask(fid=10, fname="bar", pn=1, backfill=True))
+
+    handler._persist_research_page.assert_not_awaited()
+
+
+@pytest.mark.parametrize("identity_field", ["fid", "pid", "author_id"])
+@pytest.mark.parametrize(
+    ("values", "top_flags"),
+    [
+        ((11, 0, 22), (False, True, False)),
+        ((0, 11, 22), (False, False, False)),
+    ],
+)
+def test_thread_list_dedupe_accumulates_known_identity_across_representative_changes(
+    identity_field, values, top_flags
+):
+    items = []
+    for value, is_top in zip(values, top_flags, strict=True):
+        attrs = {
+            "tid": 77,
+            "fid": 10,
+            "pid": 77,
+            "author_id": 1,
+            "user": SimpleNamespace(user_id=1),
+            "is_top": is_top,
+        }
+        if identity_field == "fid":
+            attrs["fid"] = value
+        elif identity_field == "pid":
+            attrs["pid"] = value
+        else:
+            attrs["author_id"] = value
+            attrs["user"].user_id = value
+        items.append(SimpleNamespace(**attrs))
+
+    with pytest.raises(PageIntegrityError, match="conflicting core identity"):
+        ThreadsTaskHandler._dedupe_thread_list_items(items, fname="bar", pn=1)
+
+
+@pytest.mark.asyncio
+async def test_thread_list_dedupe_shares_identity_constraints_between_dto_and_raw():
+    listed = make_thread(tid=77)
+    listed.author_id = 11
+    listed.author.user_id = 11
+    dto_response = make_threads_response([listed])
+    raw_unknown_top = SimpleNamespace(
+        tid=77,
+        fid=10,
+        pid=77,
+        author_id=0,
+        user=SimpleNamespace(user_id=0),
+        is_top=True,
+    )
+    raw_conflicting_author = SimpleNamespace(
+        tid=77,
+        fid=10,
+        pid=77,
+        author_id=22,
+        user=SimpleNamespace(user_id=22),
+        is_top=False,
+    )
+    response = ResearchPage(
+        raw=SimpleNamespace(objs=[raw_unknown_top, raw_conflicting_author]),
+        dto=dto_response,
+        observed_at=datetime.now(),
+        source_api="aiotieba.get_threads",
+    )
+    handler = ThreadsTaskHandler(
+        worker_id=0,
+        container=create_mock_container(
+            tb_client=SimpleNamespace(get_threads_dto=AsyncMock(return_value=response)),
+            config=SimpleNamespace(research_enabled=False, fetch_user_forum_info=False),
+        ),
+        datastore=cast("Any", SimpleNamespace(filter_new_ids=AsyncMock(return_value=set()))),
+        router=QueueRouter(),
+    )
+    handler._persist_research_page = AsyncMock()
+
+    with pytest.raises(PageIntegrityError, match="conflicting core identity"):
+        await handler.handle(ScanThreadsTask(fid=10, fname="bar", pn=1, backfill=True))
+
+    handler._persist_research_page.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -561,9 +722,8 @@ async def test_single_threads_worker_serves_monitor_before_next_backfill_page():
     assert requested[1] == ("monitor", False, 1)
     assert {call[:2] for call in requested if call[0] == "backfill"} == {
         ("backfill", False),
-        ("backfill", True),
     }
-    assert len([call for call in requested if call[0] == "backfill"]) == 4
+    assert len([call for call in requested if call[0] == "backfill"]) == 2
 
 
 @pytest.mark.asyncio
@@ -632,6 +792,8 @@ async def test_resume_replays_last_list_page_and_continues_after_page_shift():
 @pytest.mark.asyncio
 async def test_list_page_overlap_records_duplicate_tids_without_stopping_stream():
     previous_cursor = {
+        "_flow_seen_tids": [100, 101],
+        "_flow_duplicate_streak": 0,
         "recent_non_top_tids": [100, 101],
         "recent_page_fingerprints": [[100, 101]],
         "last_create_time": datetime.fromtimestamp(10).isoformat(),
@@ -673,6 +835,91 @@ async def test_list_page_overlap_records_duplicate_tids_without_stopping_stream(
     assert result.has_more is True
     assert result.continuation_json is not None
     assert result.continuation_json["page_duplicate_tids"] == [101]
+
+
+@pytest.mark.asyncio
+async def test_replayed_list_page_unions_new_ids_without_incrementing_overlap_streak():
+    response = make_threads_response(
+        [
+            make_thread(tid=102, create_time=datetime.fromtimestamp(10)),
+            make_thread(tid=103, create_time=datetime.fromtimestamp(5)),
+        ],
+        has_more=True,
+        current_page=4,
+        total_page=6,
+    )
+    datastore = SimpleNamespace(
+        filter_new_ids=AsyncMock(return_value=set()),
+        record_research_checkpoint=AsyncMock(return_value=True),
+    )
+    container = create_mock_container(
+        tb_client=SimpleNamespace(get_threads_dto=AsyncMock(return_value=response)),
+        config=SimpleNamespace(research_enabled=False, fetch_user_forum_info=False),
+    )
+    container.research_run_id = "synthetic-replay-run"
+    handler = ThreadsTaskHandler(
+        worker_id=0,
+        container=container,
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler._persist_research_page = AsyncMock()
+    handler._process_new_threads = AsyncMock()
+    handler._process_old_threads = AsyncMock()
+
+    result = await handler.handle(
+        ScanThreadsTask(
+            fid=10,
+            fname="bar",
+            pn=4,
+            backfill=True,
+            continuation_json={
+                "_flow_seen_tids": [100, 101, 102],
+                "_flow_duplicate_streak": 3,
+                "_resume_replay_page": 4,
+                "_resume_page_seen_tids": [101, 102],
+                "page_non_top_tids": [101, 102],
+            },
+        )
+    )
+
+    cursor = result.continuation_json
+    assert cursor["page_non_top_tids"] == [101, 102, 103]
+    assert cursor["flow_duplicate_streak"] == 3
+    assert "page_duplicate_ratio" not in cursor
+    assert "high_duplicate_pause_reason" not in cursor
+    checkpoint = datastore.record_research_checkpoint.await_args.kwargs
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["scope_status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_thread_list_checkpoint_is_committed_after_all_page_side_effects():
+    response = make_threads_response([make_thread(tid=88)])
+    datastore = SimpleNamespace(
+        filter_new_ids=AsyncMock(return_value={88}),
+        record_research_checkpoint=AsyncMock(return_value=True),
+    )
+    container = create_mock_container(
+        tb_client=SimpleNamespace(get_threads_dto=AsyncMock(return_value=response)),
+        config=SimpleNamespace(research_enabled=False, fetch_user_forum_info=False),
+    )
+    container.research_run_id = "synthetic-side-effect-run"
+    handler = ThreadsTaskHandler(
+        worker_id=0,
+        container=container,
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler._persist_research_page = AsyncMock()
+    handler._process_new_threads = AsyncMock()
+    handler._process_old_threads = AsyncMock()
+    handler._enqueue_missing_web_targets = AsyncMock(side_effect=RuntimeError("synthetic sidecar failure"))
+
+    with pytest.raises(RuntimeError, match="synthetic sidecar failure"):
+        await handler.handle(ScanThreadsTask(fid=10, fname="bar", pn=1, backfill=True))
+
+    datastore.record_research_checkpoint.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 # 本机 IDE 运行指南
 
-本文说明如何在本机 VS Code 或 PyCharm 中运行回溯采集、恢复任务和导出 CSV。程序直接连接 `config.toml` 里配置的 PostgreSQL；无需 Docker、Redis 或远程服务。历史主入口做过有限真实回溯与 SIGINT/列表恢复演练；V5 的异步网页补采收尾经受控信号测试，但没有实际操作 IDE 图形界面，也没有验证 SIGKILL 清理。
+本文说明如何在本机 VS Code 或 PyCharm 中运行回溯采集、恢复任务和导出 CSV。程序直接连接 `config.toml` 里配置的 PostgreSQL；无需 Docker、Redis 或远程服务。统一“发布”排序和重复页保护已实现，自动化回归及 SDK 第 71–75 页列表写入验收通过；该有限验收不代表详情、网页补采或 2021 年以来的完整覆盖。历史 SIGINT/恢复结果及验收范围见[稳定性验收摘要](PREFLIGHT_STABILITY_SUMMARY.md)。
 
 ## 准备项目和 PostgreSQL
 
@@ -78,6 +78,8 @@ uv run python main.py --mode backfill
 
 每次不带 `--resume` 都会创建新的研究 run。采集范围由当前配置中的论坛列表决定。
 
+回溯使用统一的“发布”排序列表，不再单独扫描精华主题；每条主题的已有 `is_good` 字段记录精华标记。主题创建时间乱序会记警告并继续；暂停条件为同一 run、同一列表流连续 3 个新页面中，每页至少 90% 的唯一非置顶 TID 已在该流先前页面出现。恢复时重读的列表页和置顶 TID 不计入此判断。该重复规则不用于 `periodic` 的 REPLY 首页监控。自动化回归及 SDK 第 71–75 页列表写入验收通过；本次列表验收未运行详情或网页补采。
+
 恢复当前论坛范围下最近一个可恢复的 run：
 
 ```sh
@@ -94,9 +96,9 @@ uv run python main.py --mode backfill --resume --run-id <run_id>
 
 ### 停止后继续
 
-优先在终端按 **Ctrl+C**，或使用 IDE 的正常停止操作，让 Python 执行收尾。每个完成的页面会保存数据和 checkpoint；正在请求或尚未完成写入的页面不会被当成已完成。下次用 `--resume` 重放尚未完成的工作，页面写入可以安全重试。
+在终端按 **Ctrl+C** 请求程序协作停止。每个已完成页面会保存数据和 checkpoint；正在请求或尚未完成写入的页面不会被当成已完成。回溯恢复会重放最近成功的非终止列表页一次；详情任务则从各自的 checkpoint 继续。新策略排除这种重放页对三页重复判定的影响。终端恢复机制不代表 IDE 图形 Stop 或强制结束行为已验证。
 
-本机主入口的一次真实演练中，普通 CREATE 流第 1 页保存 checkpoint 后收到 SIGINT；同一 run 恢复时重放该页并继续到第 2 页，再次停止。数据库中的 run 状态为 `interrupted`。该结果只验证列表 checkpoint 的恢复路径，不代表详情 scope 已清空或整轮采集已完成；进程 exit code 不能代替数据库 run 状态。
+旧版列表策略的一次真实主入口演练中，普通 CREATE 流第 1 页保存 checkpoint 后收到 SIGINT；同一 run 恢复时重放该页并继续到第 2 页，再次停止。数据库中的 run 状态为 `interrupted`。该结果只验证旧版列表 checkpoint 的恢复路径，不代表新分页策略、详情 scope 或整轮采集已完成；进程 exit code 不能代替数据库 run 状态。
 
 如果 IDE 的强制停止、任务管理器结束进程或断电直接杀掉进程，清理代码可能不会运行。不要因此删除 checkpoint 或另起一个新 run；重新启动时使用相同论坛配置并加 `--resume`。若本轮已完成，程序不会把已完成 run 当作未完成 run 恢复。
 

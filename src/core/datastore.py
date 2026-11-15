@@ -65,6 +65,47 @@ RESEARCH_RUN_RESUMABLE_STATUSES = (
 )
 
 
+def _research_forum_ids(forums_json: Any) -> tuple[set[int], bool]:
+    """Read current dict and legacy pair/scalar forum scope entries."""
+    if not isinstance(forums_json, (list, tuple)):
+        return set(), forums_json not in (None, [])
+    forum_ids: set[int] = set()
+    invalid_entry = False
+    for item in forums_json:
+        if isinstance(item, dict):
+            value = item.get("fid")
+        elif isinstance(item, (list, tuple)) and item:
+            value = item[0]
+        else:
+            value = item
+        try:
+            fid = int(value)
+        except (TypeError, ValueError):
+            invalid_entry = True
+            continue
+        if isinstance(value, bool) or fid <= 0:
+            invalid_entry = True
+            continue
+        forum_ids.add(fid)
+    return forum_ids, invalid_entry
+
+
+def _checkpoint_tid_set(values: Any) -> set[int]:
+    if not isinstance(values, (list, tuple)):
+        return set()
+    tids: set[int] = set()
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        try:
+            tid = int(value)
+        except (TypeError, ValueError):
+            continue
+        if tid > 0:
+            tids.add(tid)
+    return tids
+
+
 def _research_scope_key(forums: list[tuple[int, str]]) -> str:
     normalized_forums = sorted({(int(fid), fname) for fid, fname in forums})
     scope_payload = {
@@ -330,6 +371,12 @@ class DataStore:
             if run.status in protected_statuses:
                 return run.status
 
+            active_list_filters = [checkpoint.run_id == run_id, checkpoint.scope_type == "thread_list"]
+            needs_create_proof = getattr(run, "mode", "periodic") in {"backfill", "hybrid"}
+            active_list_filters.append(checkpoint.is_good.is_(False))
+            if needs_create_proof:
+                active_list_filters.append(checkpoint.sort_mode == "create")
+
             list_counts_result = await session.execute(
                 select(
                     func.coalesce(
@@ -357,9 +404,40 @@ class DataStore:
                         checkpoint.page_number == latest_pages.c.page_number,
                     ),
                 )
-                .where(checkpoint.run_id == run_id, checkpoint.scope_type == "thread_list")
+                .where(*active_list_filters)
             )
             list_counts = list_counts_result.one()
+
+            missing_create_proof = False
+            if needs_create_proof:
+                forum_ids, invalid_forums = _research_forum_ids(getattr(run, "forums_json", []))
+                create_rows_result = await session.execute(
+                    select(
+                        checkpoint.fid,
+                        checkpoint.status,
+                        checkpoint.scope_status,
+                        checkpoint.has_more,
+                    )
+                    .select_from(checkpoint)
+                    .join(
+                        latest_pages,
+                        and_(
+                            checkpoint.task_key == latest_pages.c.task_key,
+                            checkpoint.page_number == latest_pages.c.page_number,
+                        ),
+                    )
+                    .where(*active_list_filters)
+                )
+                completed_create_forums = {
+                    fid
+                    for fid, status_value, scope_status, has_more in create_rows_result.all()
+                    if fid is not None
+                    and status_value == "completed"
+                    and scope_status == "completed"
+                    and has_more is False
+                }
+                missing_create_proof = invalid_forums or not forum_ids.issubset(completed_create_forums)
+
             scope_status_rows = await session.execute(
                 select(ResearchTaskScope.status).where(
                     ResearchTaskScope.run_id == run_id,
@@ -375,7 +453,7 @@ class DataStore:
                 status, reason = "paused_rate_limit", "latest_checkpoint_paused_for_rate_limit"
             elif list_counts.incomplete_count or any(
                 scope_status != "completed" for scope_status in scope_statuses
-            ):
+            ) or missing_create_proof:
                 status, reason = "incomplete", "latest_checkpoint_not_terminal"
             else:
                 status, reason = "completed", None
@@ -1040,12 +1118,14 @@ class DataStore:
     async def get_research_list_checkpoint_states(
         self, run_id: str
     ) -> dict[tuple[int, bool], tuple[int | None, str | None, dict[str, object] | None]]:
-        """Return the resume page, status, and bounded cursor for each list stream.
+        """Return CREATE stream resume state and rebuild successful page history.
 
         A successful non-terminal page is replayed once after restart to absorb
-        page drift caused by deletions or updates at the top of the list.
+        page drift caused by deletions or updates at the top of the list. The
+        in-memory seen set is reconstructed from successful page checkpoints;
+        only page-sized TID sets are stored in each continuation JSON.
         """
-        latest: dict[str, ResearchCheckpoint] = {}
+        history: dict[str, list[ResearchCheckpoint]] = {}
         async with self.async_sessionmaker() as session:
             result = await session.stream(
                 select(ResearchCheckpoint)
@@ -1056,24 +1136,60 @@ class DataStore:
                 .order_by(ResearchCheckpoint.task_key, ResearchCheckpoint.page_number)
             )
             async for row in result.scalars():
-                latest[row.task_key] = row
+                history.setdefault(row.task_key, []).append(row)
 
         states: dict[tuple[int, bool], tuple[int | None, str | None, dict[str, object] | None]] = {}
-        for row in latest.values():
-            if row.fid is None or row.is_good is None:
+        for rows in history.values():
+            row = rows[-1]
+            if row.fid is None or row.is_good is None or getattr(row, "sort_mode", "create") != "create":
                 continue
-            if row.status == "completed" and row.has_more is False:
+
+            successful_rows = [
+                checkpoint
+                for checkpoint in rows
+                if checkpoint.status == "completed"
+                or (checkpoint.continuation_json or {}).get("replay_page_checkpoint_committed")
+                == checkpoint.page_number
+            ]
+            flow_seen: set[int] = set()
+            history_partial = False
+            duplicate_streak = 0
+            for checkpoint in successful_rows:
+                checkpoint_cursor = checkpoint.continuation_json or {}
+                page_ids = checkpoint_cursor.get("page_non_top_tids")
+                if isinstance(page_ids, (list, tuple)):
+                    flow_seen.update(_checkpoint_tid_set(page_ids))
+                else:
+                    history_partial = True
+                    legacy_ids = checkpoint_cursor.get("recent_non_top_tids", [])
+                    flow_seen.update(_checkpoint_tid_set(legacy_ids))
+                try:
+                    duplicate_streak = max(0, int(checkpoint_cursor.get("flow_duplicate_streak", 0)))
+                except (TypeError, ValueError):
+                    duplicate_streak = 0
+
+            cursor = dict(row.continuation_json or {})
+            cursor["_flow_seen_tids"] = sorted(flow_seen)
+            cursor["_flow_duplicate_streak"] = duplicate_streak
+            if history_partial:
+                cursor["_flow_history_partial"] = True
+
+            duplicate_pause = bool(cursor.get("high_duplicate_pause_reason"))
+            failed_replay = cursor.get("replay_page_checkpoint_committed") == row.page_number
+            if (row.status == "completed" and (row.has_more is True or duplicate_pause)) or failed_replay:
+                next_page = row.page_number
+                scope_status = row.scope_status or "running"
+                page_ids = cursor.get("page_non_top_tids")
+                if not isinstance(page_ids, (list, tuple)):
+                    page_ids = cursor.get("recent_non_top_tids", [])
+                cursor["_resume_replay_page"] = row.page_number
+                cursor["_resume_page_seen_tids"] = sorted(_checkpoint_tid_set(page_ids))
+            elif row.status == "completed" and row.has_more is False:
                 next_page = None
                 scope_status = row.scope_status or "completed"
-                cursor = row.continuation_json
-            elif row.status == "completed":
-                next_page = row.page_number if row.has_more is True else row.next_page or row.page_number + 1
-                scope_status = row.scope_status or "running"
-                cursor = {} if row.has_more is True else row.continuation_json
             else:
                 next_page = row.page_number
                 scope_status = row.scope_status or row.status
-                cursor = row.continuation_json
             states[(row.fid, row.is_good)] = (next_page, scope_status, cursor)
         return states
 

@@ -188,8 +188,8 @@ def _synthetic_page(content: ScanThreadsTask, *, tids: tuple[int, ...], times: t
 
 
 @pytest.mark.asyncio
-async def test_scheduler_round_robins_both_streams_from_create_page_one_in_hybrid():
-    """Hybrid mode still starts both CREATE streams at page one."""
+async def test_scheduler_uses_one_unified_create_stream_in_hybrid():
+    """Hybrid mode starts one CREATE stream and leaves thread flags to the response."""
     router = QueueRouter(maxsize=1)
     container = DummyContainer(config=DummyConfig(mode="hybrid", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
     scheduler = Scheduler(router, container)  # type: ignore[arg-type]
@@ -197,23 +197,18 @@ async def test_scheduler_round_robins_both_streams_from_create_page_one_in_hybri
 
     async def acknowledge(content: ScanThreadsTask):
         requested.append((content.is_good, content.pn))
-        result = _synthetic_page(
-            content,
-            tids=(content.pn + int(content.is_good) * 10,),
-            times=(100 - content.pn * 10,),
-            has_more=content.pn == 1,
-        )
+        result = _synthetic_page(content, tids=(content.pn,), times=(100 - content.pn * 10,), has_more=content.pn == 1)
         assert content.max_pages == 0
         assert content.completion is not None
         content.completion.set_result(result)
 
     await _consume_backfill_pages(scheduler, acknowledge)
 
-    assert requested == [(False, 1), (True, 1), (False, 2), (True, 2)]
+    assert requested == [(False, 1), (False, 2)]
 
 
 @pytest.mark.asyncio
-async def test_scheduler_stream_failure_does_not_skip_good_stream():
+async def test_scheduler_stream_failure_does_not_start_a_separate_good_stream():
     router = QueueRouter(maxsize=1)
     container = DummyContainer(config=DummyConfig(mode="backfill", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
     scheduler = Scheduler(router, container)  # type: ignore[arg-type]
@@ -222,15 +217,50 @@ async def test_scheduler_stream_failure_does_not_skip_good_stream():
     async def acknowledge(content: ScanThreadsTask):
         requested.append(content.is_good)
         assert content.completion is not None
-        if not content.is_good:
-            content.completion.set_exception(RuntimeError("synthetic list error"))
-        else:
-            content.completion.set_result(_synthetic_page(content, tids=(20,), times=(10,), has_more=False))
+        content.completion.set_exception(RuntimeError("synthetic list error"))
 
     with pytest.raises(BackfillIncompleteError):
         await _consume_backfill_pages(scheduler, acknowledge)
 
-    assert requested == [False, True]
+    assert requested == [False]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_failure_during_replay_preserves_committed_page_evidence():
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(config=DummyConfig(mode="backfill", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
+    container.research_run_id = "synthetic-replay-run"
+    replay_cursor = {
+        "page_non_top_tids": [100, 101, 102],
+        "flow_duplicate_streak": 2,
+        "_flow_seen_tids": [90, 100, 101, 102],
+        "_flow_duplicate_streak": 2,
+        "_resume_replay_page": 5,
+        "_resume_page_seen_tids": [100, 101, 102],
+    }
+    checkpoints = []
+    datastore = SimpleNamespace(
+        get_research_list_checkpoint_states=AsyncMock(
+            return_value={(1, False): (5, "running", replay_cursor)}
+        ),
+        record_research_checkpoint=AsyncMock(side_effect=lambda **kwargs: checkpoints.append(kwargs)),
+        set_research_run_status_if=AsyncMock(return_value=True),
+    )
+    scheduler = Scheduler(router, container, cast("Any", datastore))  # type: ignore[arg-type]
+
+    async def fail_replayed_page(*_args, **_kwargs):
+        raise RuntimeError("synthetic replay failure")
+
+    scheduler._scan_backfill_page = fail_replayed_page  # type: ignore[method-assign]
+    with pytest.raises(BackfillIncompleteError):
+        await scheduler._run_backfill()
+
+    checkpoint = checkpoints[0]
+    assert checkpoint["status"] == "failed"
+    assert checkpoint["continuation_json"]["replay_page_checkpoint_committed"] == 5
+    assert checkpoint["continuation_json"]["page_non_top_tids"] == [100, 101, 102]
+    assert checkpoint["continuation_json"]["flow_duplicate_streak"] == 2
+    assert not any(key.startswith("_") for key in checkpoint["continuation_json"])
 
 
 @pytest.mark.asyncio
@@ -321,9 +351,7 @@ async def test_scheduler_duplicate_tid_overlap_does_not_stop_page_continuation()
     async def acknowledge(content: ScanThreadsTask):
         requested.append((content.is_good, content.pn))
         assert content.completion is not None
-        if content.is_good:
-            page = _synthetic_page(content, tids=(900,), times=(5,), has_more=False)
-        elif content.pn == 1:
+        if content.pn == 1:
             page = _synthetic_page(content, tids=(1, 2), times=(20, 10), has_more=True)
         else:
             page = _synthetic_page(content, tids=(2, 3), times=(10, 5), has_more=False)
@@ -331,11 +359,11 @@ async def test_scheduler_duplicate_tid_overlap_does_not_stop_page_continuation()
 
     await _consume_backfill_pages(scheduler, acknowledge)
 
-    assert requested == [(False, 1), (True, 1), (False, 2)]
+    assert requested == [(False, 1), (False, 2)]
 
 
 @pytest.mark.asyncio
-async def test_scheduler_cross_page_create_time_reversal_marks_stream_incomplete():
+async def test_scheduler_cross_page_create_time_reversal_warns_and_advances():
     router = QueueRouter(maxsize=1)
     container = DummyContainer(config=DummyConfig(mode="backfill", max_backfill_pages=0), forums=[DummyForum(1, "bar")])
     scheduler = Scheduler(router, container)  # type: ignore[arg-type]
@@ -344,17 +372,18 @@ async def test_scheduler_cross_page_create_time_reversal_marks_stream_incomplete
     async def acknowledge(content: ScanThreadsTask):
         requested.append((content.is_good, content.pn))
         assert content.completion is not None
-        if content.is_good:
-            page = _synthetic_page(content, tids=(900,), times=(5,), has_more=False)
-        else:
-            times = (20,) if content.pn == 1 else (21,)
-            page = _synthetic_page(content, tids=(content.pn,), times=times, has_more=True)
+        times = (20,) if content.pn == 1 else (21,)
+        page = _synthetic_page(
+            content,
+            tids=(content.pn,),
+            times=times,
+            has_more=content.pn == 1,
+        )
         content.completion.set_result(page)
 
-    with pytest.raises(BackfillIncompleteError):
-        await _consume_backfill_pages(scheduler, acknowledge)
+    await _consume_backfill_pages(scheduler, acknowledge)
 
-    assert requested == [(False, 1), (True, 1), (False, 2)]
+    assert requested == [(False, 1), (False, 2)]
 
 
 @pytest.mark.asyncio
@@ -371,7 +400,7 @@ async def test_scheduler_finite_page_limit_is_reported_as_paused_limit():
 
     await _consume_backfill_pages(scheduler, acknowledge)
 
-    assert requested == [False, True]
+    assert requested == [False]
 
 
 @pytest.mark.asyncio
@@ -406,6 +435,26 @@ async def test_scheduler_stop_event():
     assert not s.is_stopped
     s.stop()
     assert s.is_stopped
+
+
+@pytest.mark.asyncio
+async def test_periodic_loop_schedules_only_the_unified_thread_list():
+    router = QueueRouter()
+    container = DummyContainer(
+        config=DummyConfig(scheduler_interval_seconds=0, good_page_every_ticks=1),
+        forums=[DummyForum(1, "bar")],
+    )
+    scheduler = Scheduler(router, container)  # type: ignore[arg-type]
+    requested = []
+
+    async def capture(_forums, *, is_good=False):
+        requested.append(is_good)
+        scheduler.stop()
+
+    scheduler._schedule_homepage_scans = capture  # type: ignore[method-assign]
+    await scheduler._run_loop(lambda: cast("Any", container.forums), 0, "Default")
+
+    assert requested == [False]
 
 
 @pytest.mark.asyncio

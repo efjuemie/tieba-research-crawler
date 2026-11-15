@@ -147,7 +147,7 @@ password = ""
 # 以下配置项仅 periodic/hybrid 模式生效
 # 调度周期，即每 N 秒投递一次首页任务
 interval_seconds = 60
-# 每 N 个周期投递一次精华贴首页任务
+# 兼容旧配置保留；当前统一列表不再单独调度精华首页
 good_page_every_n_ticks = 10
 # 队列感知调度：队列深度超过阈值时跳过本轮调度
 # 设为 0 禁用此功能

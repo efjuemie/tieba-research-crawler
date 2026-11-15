@@ -216,7 +216,6 @@ class Scheduler:
         支持优雅停止：当 stop() 被调用后，循环会在当前迭代完成后退出。
         支持队列感知：当队列深度超过阈值时，跳过本轮调度。
         """
-        good_every = self.container.config.good_page_every_ticks
         queue_threshold = self.container.config.queue_depth_threshold
         skip_wait = self.container.config.skip_wait_seconds
         tick = 0
@@ -262,10 +261,6 @@ class Scheduler:
 
             await self._schedule_homepage_scans(forums, is_good=False)
 
-            if tick % good_every == 0:
-                logger.debug("[{}] Extra GOOD-section scheduling.", task_name)
-                await self._schedule_homepage_scans(forums, is_good=True)
-
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
                 break
@@ -291,7 +286,7 @@ class Scheduler:
         # Backfill uses CREATE sort while the live monitor uses REPLY sort, so
         # the monitor's page 1 cannot stand in for CREATE page 1.
         start_page = 1
-        streams = [(forum, is_good) for forum in forums for is_good in (False, True)]
+        streams = [(forum, False) for forum in forums]
         pages = {(forum.fid, is_good): start_page for forum, is_good in streams}
         cursors: dict[tuple[int, bool], dict[str, object]] = {key: {} for key in pages}
         run_id = getattr(self.container, "research_run_id", None)
@@ -329,6 +324,21 @@ class Scheduler:
                     error_code = getattr(exc, "code", None)
                     pause_status = {4011: "paused_auth", 429: "paused_rate_limit", 220034: "blocked"}.get(error_code)
                     if run_id and self.datastore is not None:
+                        checkpoint_cursor = {
+                            cursor_key: value
+                            for cursor_key, value in cursors[key].items()
+                            if not cursor_key.startswith("_")
+                        }
+                        if cursors[key].get("_resume_replay_page") == pn:
+                            page_ids = cursors[key].get(
+                                "_resume_page_seen_tids",
+                                checkpoint_cursor.get("page_non_top_tids", []),
+                            )
+                            checkpoint_cursor["page_non_top_tids"] = sorted({int(tid) for tid in page_ids})
+                            checkpoint_cursor["flow_duplicate_streak"] = int(
+                                cursors[key].get("_flow_duplicate_streak", 0)
+                            )
+                            checkpoint_cursor["replay_page_checkpoint_committed"] = pn
                         await self.datastore.record_research_checkpoint(
                             run_id=run_id,
                             task_key=research_thread_list_task_key(forum.fid, is_good),
@@ -345,7 +355,7 @@ class Scheduler:
                             error_type=type(exc).__name__,
                             error_code=getattr(exc, "code", None),
                             reason=type(exc).__name__,
-                            continuation_json=cursors[key],
+                            continuation_json=checkpoint_cursor,
                         )
                     if run_id and self.datastore is not None and error_code not in {4011, 429, 220034}:
                         await self.datastore.set_research_run_status_if(
@@ -406,11 +416,12 @@ class Scheduler:
 
                 fingerprint = result.tids
                 if result.has_more and fingerprint and fingerprint in recent_fingerprints[key]:
-                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} repeated_page_fingerprint"
-                    failures.append(failure)
-                    logger.error("Backfill stream repeated the same page: {}", failure)
-                    active.remove((forum, is_good))
-                    continue
+                    logger.warning(
+                        "Backfill page fingerprint repeated for forum={} is_good={} pn={}; continuing by page number.",
+                        forum.fname,
+                        is_good,
+                        pn,
+                    )
                 if fingerprint:
                     recent_fingerprints[key].append(fingerprint)
 
@@ -421,12 +432,40 @@ class Scheduler:
 
                     previous_oldest = datetime.fromisoformat(str(previous_oldest))
                 if page_times and previous_oldest is not None and page_times[0] > previous_oldest:
-                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} create_time_order_reversed"
+                    logger.warning(
+                        "Backfill CREATE time order moved forward for forum={} is_good={} pn={}; "
+                        "continuing by page number.",
+                        forum.fname,
+                        is_good,
+                        pn,
+                    )
+                next_cursor = dict(result.continuation_json or cursors[key])
+                flow_seen = {int(tid) for tid in cursors[key].get("_flow_seen_tids", [])}
+                flow_seen.update(result.non_top_tids)
+                next_cursor["_flow_seen_tids"] = sorted(flow_seen)
+                next_cursor["_flow_duplicate_streak"] = int(
+                    next_cursor.get("flow_duplicate_streak", cursors[key].get("_flow_duplicate_streak", 0))
+                )
+                if cursors[key].get("_flow_history_partial"):
+                    next_cursor["_flow_history_partial"] = True
+                next_cursor.pop("_resume_replay_page", None)
+                next_cursor.pop("_resume_page_seen_tids", None)
+                cursors[key] = next_cursor
+
+                duplicate_pause_reason = (
+                    result.continuation_json.get("high_duplicate_pause_reason")
+                    if result.continuation_json
+                    else None
+                )
+                if duplicate_pause_reason:
+                    failure = (
+                        f"forum={forum.fname} is_good={is_good} pn={pn} "
+                        f"reason={duplicate_pause_reason}"
+                    )
                     failures.append(failure)
-                    logger.error("Backfill CREATE order moved forward across pages: {}", failure)
+                    logger.warning("Backfill list flow paused after its committed high-overlap page: {}", failure)
                     active.remove((forum, is_good))
                     continue
-                cursors[key] = result.continuation_json or cursors[key]
 
                 if result.has_more:
                     if max_pages > 0 and scanned[key] >= max_pages:

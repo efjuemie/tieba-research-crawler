@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from src.core.datastore import DataStore, _first_post_comment_count_expressions
-from src.core.models import ResearchCheckpoint, ResearchTaskScope
+from src.core.models import ResearchCheckpoint, ResearchRun, ResearchTaskScope
 from src.research.models import ResearchComment, ResearchPost, ResearchThread
 
 
@@ -89,6 +89,15 @@ class _AsyncSessionAdapter:
     async def stream(self, statement):
         rows = self.session.execute(statement).mappings().all()
         return _AsyncMappingRows(rows)
+
+    async def execute(self, statement):
+        return self.session.execute(statement)
+
+    async def get(self, model, key):
+        return self.session.get(model, key)
+
+    async def commit(self):
+        self.session.commit()
 
 
 @pytest.mark.asyncio
@@ -397,6 +406,7 @@ def test_list_checkpoint_replays_last_nonterminal_page_once():
             task_key="thread_list:10:create:0",
             fid=10,
             is_good=False,
+            sort_mode="create",
             page_number=4,
             status="completed",
             has_more=True,
@@ -408,6 +418,7 @@ def test_list_checkpoint_replays_last_nonterminal_page_once():
             task_key="thread_list:10:create:1",
             fid=10,
             is_good=True,
+            sort_mode="create",
             page_number=2,
             status="completed",
             has_more=False,
@@ -419,6 +430,7 @@ def test_list_checkpoint_replays_last_nonterminal_page_once():
             task_key="thread_list:20:create:0",
             fid=20,
             is_good=False,
+            sort_mode="create",
             page_number=3,
             status="failed",
             has_more=None,
@@ -434,9 +446,103 @@ def test_list_checkpoint_replays_last_nonterminal_page_once():
 
     states = asyncio.run(store.get_research_list_checkpoint_states("run"))
 
-    assert states[(10, False)] == (4, "running", {})
-    assert states[(10, True)] == (None, "completed", {"page_fingerprint": [3]})
-    assert states[(20, False)] == (3, "incomplete", {"recent_non_top_tids": [8]})
+    replay_cursor = states[(10, False)][2]
+    assert states[(10, False)][:2] == (4, "running")
+    assert replay_cursor["_flow_seen_tids"] == [1, 2]
+    assert replay_cursor["_flow_history_partial"] is True
+    assert replay_cursor["_resume_replay_page"] == 4
+    assert replay_cursor["_resume_page_seen_tids"] == [1, 2]
+    assert states[(10, True)][:2] == (None, "completed")
+    assert states[(20, False)][:2] == (3, "incomplete")
+    assert states[(20, False)][2]["_flow_seen_tids"] == []
+
+
+def test_list_checkpoint_rebuilds_run_seen_and_preserves_overlap_streak_for_replay():
+    rows = [
+        SimpleNamespace(
+            task_key="thread_list:10:create:0",
+            fid=10,
+            is_good=False,
+            sort_mode="create",
+            page_number=3,
+            status="completed",
+            has_more=True,
+            next_page=4,
+            scope_status="running",
+            continuation_json={"page_non_top_tids": [1, 2, 3], "flow_duplicate_streak": 1},
+        ),
+        SimpleNamespace(
+            task_key="thread_list:10:create:0",
+            fid=10,
+            is_good=False,
+            sort_mode="create",
+            page_number=4,
+            status="completed",
+            has_more=True,
+            next_page=5,
+            scope_status="running",
+            continuation_json={"page_non_top_tids": [3, 4], "flow_duplicate_streak": 2},
+        ),
+    ]
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = lambda: _CheckpointReadSession(rows)
+
+    import asyncio
+
+    states = asyncio.run(store.get_research_list_checkpoint_states("run"))
+    cursor = states[(10, False)][2]
+
+    assert states[(10, False)][:2] == (4, "running")
+    assert cursor["_flow_seen_tids"] == [1, 2, 3, 4]
+    assert cursor["_resume_replay_page"] == 4
+    assert cursor["_resume_page_seen_tids"] == [3, 4]
+    assert cursor["_flow_duplicate_streak"] == 2
+
+
+def test_failed_replay_retains_its_previously_committed_page_history():
+    rows = [
+        SimpleNamespace(
+            task_key="thread_list:10:create:0",
+            fid=10,
+            is_good=False,
+            sort_mode="create",
+            page_number=3,
+            status="completed",
+            has_more=True,
+            next_page=4,
+            scope_status="running",
+            continuation_json={"page_non_top_tids": [1, 2], "flow_duplicate_streak": 1},
+        ),
+        SimpleNamespace(
+            task_key="thread_list:10:create:0",
+            fid=10,
+            is_good=False,
+            sort_mode="create",
+            page_number=4,
+            status="failed",
+            has_more=None,
+            next_page=4,
+            scope_status="incomplete",
+            continuation_json={
+                "page_non_top_tids": [2, 3],
+                "flow_duplicate_streak": 2,
+                "replay_page_checkpoint_committed": 4,
+            },
+        ),
+    ]
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = lambda: _CheckpointReadSession(rows)
+
+    import asyncio
+
+    states = asyncio.run(store.get_research_list_checkpoint_states("run"))
+    cursor = states[(10, False)][2]
+
+    assert states[(10, False)][:2] == (4, "incomplete")
+    assert cursor["_flow_seen_tids"] == [1, 2, 3]
+    assert cursor["_flow_duplicate_streak"] == 2
+    assert cursor["_resume_replay_page"] == 4
+    assert cursor["_resume_page_seen_tids"] == [2, 3]
 
 
 @pytest.mark.asyncio
@@ -492,3 +598,155 @@ async def test_run_status_reconciliation_keeps_no_checkpoint_scope_incomplete():
     status = await store.reconcile_research_run_status_after_drain("run-1")
 
     assert status == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_backfill_reconciliation_requires_false_create_checkpoint_for_every_forum():
+    engine = create_engine("sqlite://")
+    for model in (ResearchRun, ResearchCheckpoint, ResearchTaskScope):
+        model.__table__.create(engine)
+    now = datetime.now(UTC)
+    with Session(engine) as session:
+        session.add(
+            ResearchRun(
+                run_id="create-proof-run",
+                mode="hybrid",
+                scope_key="synthetic",
+                forums_json=[{"fid": 10, "fname": "dict"}, [20, "legacy"], 30],
+                status="running",
+                started_at=now,
+                last_checked=now,
+            )
+        )
+        session.add_all(
+            [
+                ResearchCheckpoint(
+                    run_id="create-proof-run",
+                    task_key="thread_list:10:create:0",
+                    page_number=1,
+                    task_type="thread_list",
+                    scope_type="thread_list",
+                    sort_mode="create",
+                    fid=10,
+                    is_good=False,
+                    status="completed",
+                    scope_status="completed",
+                    has_more=False,
+                    last_checked=now,
+                ),
+                ResearchCheckpoint(
+                    run_id="create-proof-run",
+                    task_key="thread_list:20:reply:0",
+                    page_number=1,
+                    task_type="thread_list",
+                    scope_type="thread_list",
+                    sort_mode="reply",
+                    fid=20,
+                    is_good=False,
+                    status="completed",
+                    scope_status="completed",
+                    has_more=False,
+                    last_checked=now,
+                ),
+                ResearchCheckpoint(
+                    run_id="create-proof-run",
+                    task_key="thread_list:20:create:1",
+                    page_number=1,
+                    task_type="thread_list",
+                    scope_type="thread_list",
+                    sort_mode="create",
+                    fid=20,
+                    is_good=True,
+                    status="completed",
+                    scope_status="completed",
+                    has_more=False,
+                    last_checked=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = lambda: _AsyncSessionAdapter(engine)
+    try:
+        status = await store.reconcile_research_run_status_after_drain("create-proof-run")
+        assert status == "incomplete"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_backfill_reconciliation_ignores_legacy_good_failure_but_checks_detail_scopes():
+    engine = create_engine("sqlite://")
+    for model in (ResearchRun, ResearchCheckpoint, ResearchTaskScope):
+        model.__table__.create(engine)
+    now = datetime.now(UTC)
+    with Session(engine) as session:
+        session.add(
+            ResearchRun(
+                run_id="good-history-run",
+                mode="backfill",
+                scope_key="synthetic",
+                forums_json=[[10, "legacy"]],
+                status="running",
+                started_at=now,
+                last_checked=now,
+            )
+        )
+        session.add_all(
+            [
+                ResearchCheckpoint(
+                    run_id="good-history-run",
+                    task_key="thread_list:10:create:0",
+                    page_number=1,
+                    task_type="thread_list",
+                    scope_type="thread_list",
+                    sort_mode="create",
+                    fid=10,
+                    is_good=False,
+                    status="completed",
+                    scope_status="completed",
+                    has_more=False,
+                    last_checked=now,
+                ),
+                ResearchCheckpoint(
+                    run_id="good-history-run",
+                    task_key="thread_list:10:create:1",
+                    page_number=1,
+                    task_type="thread_list",
+                    scope_type="thread_list",
+                    sort_mode="create",
+                    fid=10,
+                    is_good=True,
+                    status="failed",
+                    scope_status="incomplete",
+                    last_checked=now,
+                ),
+            ]
+        )
+        session.commit()
+
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = lambda: _AsyncSessionAdapter(engine)
+    try:
+        assert await store.reconcile_research_run_status_after_drain("good-history-run") == "completed"
+        with Session(engine) as session:
+            session.add(
+                ResearchTaskScope(
+                    run_id="good-history-run",
+                    logical_task_key="thread_replies:100",
+                    generation=0,
+                    task_type="full_scan_posts",
+                    scope_type="thread_replies",
+                    fid=10,
+                    tid=100,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                    last_checked=now,
+                )
+            )
+            session.commit()
+        assert await store.reconcile_research_run_status_after_drain("good-history-run") == "incomplete"
+    finally:
+        engine.dispose()
