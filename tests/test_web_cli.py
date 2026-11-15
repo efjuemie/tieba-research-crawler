@@ -10,8 +10,12 @@ from stat import S_IMODE
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from tiebameow.models.orm import Base
 
 from src.research import __main__ as cli
+from src.research.models import ResearchComment
 from src.research.web_fallback import service
 from src.research.web_fallback.tasks import EnqueueSummary, WebEnrichmentTargetPlan
 
@@ -47,6 +51,28 @@ def _summary(*plans: WebEnrichmentTargetPlan, created: int = 1) -> EnqueueSummar
         task_keys=tuple(plan.task_key for plan in plans),
         planned_targets=tuple(plans),
     )
+
+
+class _SQLiteSessionAdapter:
+    def __init__(self, session):
+        self.session = session
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        self.session.close()
+
+    async def scalar(self, statement):
+        return self.session.scalar(statement)
+
+
+class _SQLiteSessionMaker:
+    def __init__(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        return _SQLiteSessionAdapter(Session(self.engine))
 
 
 def test_cli_parses_bounded_web_and_user_commands_without_browser_runtime(capsys):
@@ -120,6 +146,49 @@ def test_audit_login_wait_requires_headed_mode():
             "/private/synthetic-profile",
             "--wait-for-login",
         ])
+
+
+@pytest.mark.asyncio
+async def test_read_canonical_snapshot_uses_real_sqlite_session():
+    plan = _plan()
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine, tables=[ResearchComment.__table__])
+    with Session(engine) as session, session.begin():
+        session.add(
+            ResearchComment(
+                cid=plan.target_id,
+                tid=plan.tid,
+                parent_post_pid=plan.parent_post_pid,
+                fid=plan.fid,
+                author_user_id=plan.author_user_id,
+                author_portrait=plan.author_portrait,
+                source_api="synthetic.api",
+                observed_at=plan.target_observed_at,
+                source_payload_json={},
+                missing_reasons_json={"ip_location_text": "not_returned_by_source"},
+                field_sources_json={
+                    "ip_location_text": {
+                        "verified_web": {"source_kind": "web_network", "value": "合成地区"}
+                    }
+                },
+            )
+        )
+
+    try:
+        snapshot = await service._read_canonical_snapshot(_SQLiteSessionMaker(engine), plan)
+    finally:
+        engine.dispose()
+
+    assert snapshot["status"] == "found"
+    assert snapshot["source_api"] == "synthetic.api"
+    assert snapshot["fields"]["ip_location_text"] == {
+        "canonical_value": None,
+        "csv_value": "",
+        "api_missing_reason": "not_returned_by_source",
+        "field_source_metadata": {
+            "verified_web": {"source_kind": "web_network", "value": "合成地区"}
+        },
+    }
 
 
 def test_cli_target_filters_keep_post_and_comment_ids_distinct():

@@ -757,8 +757,8 @@ def _base_audit_target(plan: WebEnrichmentTargetPlan) -> dict[str, Any]:
 
 
 async def _read_canonical_snapshot(sessions: Any, plan: WebEnrichmentTargetPlan) -> dict[str, Any]:
-    from .exporter import _csv_value
-    from .models import ResearchComment, ResearchPost, ResearchThread
+    from ..exporter import _csv_value
+    from ..models import ResearchComment, ResearchPost, ResearchThread
 
     model, id_field = {
         "thread": (ResearchThread, ResearchThread.tid),
