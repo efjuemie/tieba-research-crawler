@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -25,6 +26,7 @@ from src.core.models import (
     research_posts_task_key,
     research_thread_list_task_key,
 )
+from src.research.models import ResearchWebEnrichmentTask
 from src.scraper.router import QueueRouter
 from src.scraper.tasks import FullScanPostsTask
 
@@ -32,6 +34,14 @@ TEST_DATABASE_NAME = "tieba_research_runtime_test_20261114"
 TEST_DATABASE_COMMENT = "TiebaScraper synthetic runtime integration test database"
 TEST_FID = 9_223_372_036_854_775_807
 TEST_TID = 9_223_372_036_854_775_806
+
+
+async def _fake_web_worker_waits_for_shutdown(_sessions, _run_ids, *, stop_event, **_kwargs):
+    await stop_event.wait()
+
+
+async def _fake_discover_missing_web_targets(*_args, **_kwargs):
+    return None
 
 
 async def _ensure_test_database(url: URL) -> None:
@@ -88,6 +98,7 @@ async def test_main_backfill_persists_real_run_and_checkpoints_before_completing
         async with engine.begin() as connection:
             for table in (
                 ResearchRun.__table__,
+                ResearchWebEnrichmentTask.__table__,
                 ResearchTaskScope.__table__,
                 ResearchCheckpoint.__table__,
                 PendingThreadScan.__table__,
@@ -130,6 +141,10 @@ async def test_main_backfill_persists_real_run_and_checkpoints_before_completing
             )
             forums = [SimpleNamespace(fid=TEST_FID, fname="synthetic-runtime-test")]
             research_run_id = None
+
+            def __init__(self):
+                self.config.pydantic_config = SimpleNamespace(web_fallback=SimpleNamespace(browser_profile=None))
+                self.semaphore = asyncio.Semaphore(1)
 
             async def teardown(self):
                 return None
@@ -183,6 +198,9 @@ async def test_main_backfill_persists_real_run_and_checkpoints_before_completing
                     )
                 events.append("list_scheduler_finished")
 
+            def stop(self):
+                return None
+
         async def initialize(*, mode):
             assert mode == "backfill"
             return container, router
@@ -190,6 +208,9 @@ async def test_main_backfill_persists_real_run_and_checkpoints_before_completing
         monkeypatch.setattr(app_main, "initialize_application", initialize)
         monkeypatch.setattr(app_main, "DataStore", lambda _container: store)
         monkeypatch.setattr(app_main, "Scheduler", FakeScheduler)
+        # Keep the WEB lifecycle alive through shutdown without launching a browser or scanning unrelated entities.
+        monkeypatch.setattr(app_main, "run_live_web_worker", _fake_web_worker_waits_for_shutdown)
+        monkeypatch.setattr(app_main, "discover_missing_web_targets", _fake_discover_missing_web_targets)
 
         await app_main.main("backfill")
         run_id = container.research_run_id
@@ -247,6 +268,7 @@ async def test_main_recovers_committed_current_generation_without_checkpoint(mon
         async with engine.begin() as connection:
             for table in (
                 ResearchRun.__table__,
+                ResearchWebEnrichmentTask.__table__,
                 ResearchTaskScope.__table__,
                 ResearchCheckpoint.__table__,
                 PendingThreadScan.__table__,
@@ -337,6 +359,10 @@ async def test_main_recovers_committed_current_generation_without_checkpoint(mon
             forums = [SimpleNamespace(fid=fid, fname=forum[1])]
             research_run_id = None
 
+            def __init__(self):
+                self.config.pydantic_config = SimpleNamespace(web_fallback=SimpleNamespace(browser_profile=None))
+                self.semaphore = asyncio.Semaphore(1)
+
             async def teardown(self):
                 return None
 
@@ -364,6 +390,9 @@ async def test_main_recovers_committed_current_generation_without_checkpoint(mon
             async def run(self, mode):
                 assert mode == "backfill"
 
+            def stop(self):
+                return None
+
         async def initialize(*, mode):
             assert mode == "backfill"
             return container, router
@@ -372,6 +401,9 @@ async def test_main_recovers_committed_current_generation_without_checkpoint(mon
         monkeypatch.setattr(app_main, "DataStore", lambda _container: store)
         monkeypatch.setattr(app_main, "Scheduler", FakeScheduler)
         monkeypatch.setattr(app_main, "Worker", FakeWorker)
+        # Keep the WEB lifecycle alive through shutdown without launching a browser or scanning unrelated entities.
+        monkeypatch.setattr(app_main, "run_live_web_worker", _fake_web_worker_waits_for_shutdown)
+        monkeypatch.setattr(app_main, "discover_missing_web_targets", _fake_discover_missing_web_targets)
 
         await app_main.main("backfill", resume=True, run_id=run_id)
 

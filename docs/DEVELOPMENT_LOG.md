@@ -112,3 +112,13 @@ PostgreSQL 租约竞争、过期接管、身份混批原子拒绝和 API 预览�
 - 浏览器执行 167 次导航和 5 次自然展开，另有 1 次导航及 5 次展开用于核对剩余 5 条评论的成长徽章。10 条 legacy 评论以 6 次 API 请求刷新，ID、父楼、作者、FID 和正文均与原记录相同；研究评论计数从 67 增至 77，CSV 仍为 77 行。生产 enqueue／lease／reconcile 流程合并网页值；此前被 source-anchor URL 拒绝的 41 个目标改用规范来源主题 URL 后全部重试通过，owner PID/CID 证据未丢失。
 - 媒体 URL 与内容 owner、TID 及片段顺序逐项对照通过。17 张受保护表中的内容、ID、父子关系、媒体、正文标记、checkpoint 和 scope 哈希未改变。真实数据只保存在受 Git 忽略的本机数据和私有交付物中，没有加入公开仓库。
 - V5 主入口异步／信号收尾经受控信号测试和独立审阅；没有实际 VS Code/PyCharm GUI 停止或 SIGKILL 验收。此前全仓回归 639 passed、10 skipped、18 warnings 及 Ruff／compileall／diff 检查通过，发生在配置默认值调整之前。将网页默认改为每目标最多 10 次展开、90 秒后，配置、浏览器、任务和 CLI 定向回归为 99 passed、1 条依赖弃用警告；Ruff、compileall 和 diff 检查通过。没有把历史全仓结果说成变更后的全仓验证。
+
+## 2026-11-16：正式采集前稳定性验收（本轮结果）
+
+- 基线 HEAD `4db3217` 全仓测试为 640 passed、10 skipped；本轮最终全仓回归为 654 passed、10 skipped、18 warnings，定向合成测试为 22 passed、4 skipped。隔离备份恢复通过。只读最终对照确认原始三个数据库保持不变，V5 的 13 个 CSV 与 manifest 哈希、字节数和行数均与基线一致；此结果不涵盖含合成记录的隔离验收副本。
+- R1–R3 隔离 PostgreSQL／模拟 API 恢复及故障演练通过。SIGINT 发出后，已接收的第 3 页完成；同一 run 恢复时重放最近完成的非终止第 3 页，再推进第 4 页。双 CREATE 流分别保留检查点和规范 ID 去重通过；checkpoint 提交前故障注入后重试通过。
+- 两组隔离 PostgreSQL 回归通过：scope 2 passed、runtime 2 passed，相关测试表没有遗留行。R4–R6 合成回归 22 passed、4 skipped；夹具适配未引入额外生产逻辑变化。
+- 普通 CREATE 流通过至第 70 页，最早日期为 2026-05-05。第 71 页响应含 28 条唯一记录，按 API 返回／解析出的置顶标记处理后仍有页内创建时间逆序；raw 与 DTO 一致。相同页面指纹的受控重放再次复现，程序保持 failed/incomplete。精华 CREATE 流第 2 页重放仍有跨页时间回跳，也保持 failed/incomplete。两条流到 2021 年的完整可达性未证明；所有真实请求已停止。这些页数只代表列表发现与持久化验收，本轮未对相应主题运行完整详情或 WEB 工作器，也未导出新的正式研究语料。
+- 针对跨模式恢复目标误选，恢复查询增加按模式筛选。隔离 PostgreSQL 复现后确认拒绝；唯一生产源码变化为此条件。独立最终审查覆盖 4 个代码文件，未发现阻断问题。
+- 两条旧楼中楼异常抽样的当前 API 响应中 TID／PID／FID 身份正确，报告总数为 0 且 `has_more=false`；无法由此还原旧 `PageIntegrityError` 的根因，历史 incomplete 保留。其余 8 条本轮未重新请求。一个旧 PID 错配样本的 `web_network` 候选经只读身份核验通过；不代表其他旧样本或所有来源类型。
+- 隔离验收库包含合成故障记录，不作为研究语料。本轮未启动新的正式采集。2021—2026 年双流全量仍为 INCONCLUSIVE，不建议直接按全量已验证启动正式采集。

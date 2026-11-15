@@ -202,6 +202,7 @@ class DataStore:
             if resume:
                 statement = select(ResearchRun).where(
                         ResearchRun.scope_key == scope_key,
+                        ResearchRun.mode == mode,
                         ResearchRun.status.in_(RESEARCH_RUN_RESUMABLE_STATUSES),
                     )
                 if run_id is not None:

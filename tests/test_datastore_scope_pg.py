@@ -153,7 +153,10 @@ async def test_postgres_refresh_fences_late_old_comment_page_transaction(monkeyp
 
         store.get_research_task_scope_for_update = announce_worker_lock
 
-        async def fake_persist(_maker, page, *, session):
+        expected_run_id = run_id
+
+        async def fake_persist(_maker, page, *, session, run_id):
+            assert run_id == expected_run_id
             persisted.append(page)
 
         monkeypatch.setattr("src.research.persistence.persist_research_page", fake_persist)
@@ -367,8 +370,11 @@ async def test_postgres_worker_commit_then_refresh_reopens_child_generation(monk
         store.record_research_checkpoint = pause_after_old_checkpoint
         store.save_items_in_session = _noop_async
 
-        async def fake_persist(_maker, _page, *, session):
+        expected_run_id = run_id
+
+        async def fake_persist(_maker, _page, *, session, run_id):
             assert session.info.get("worker_tx")
+            assert run_id == expected_run_id
 
         monkeypatch.setattr("src.research.persistence.persist_research_page", fake_persist)
 
