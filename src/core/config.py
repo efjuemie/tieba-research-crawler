@@ -209,8 +209,8 @@ class ResearchConfig(BaseModel):
 class WebFallbackConfig(BaseModel):
     """Bounded defaults for explicit, local web enrichment commands."""
 
-    max_pages: int = Field(default=1, ge=1, le=1)
-    max_expansions: int = Field(default=1, ge=0, le=1)
+    max_pages: int = Field(default=1, ge=1, le=10)
+    max_expansions: int = Field(default=1, ge=0, le=10)
     timeout_seconds: float = Field(default=30.0, gt=0, le=120)
 
 

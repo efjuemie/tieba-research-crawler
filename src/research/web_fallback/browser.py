@@ -20,6 +20,7 @@ from .network import (
     NetworkExtractionResult,
     extract_nested_floor,
     extract_page_pc_comment,
+    extract_page_pc_post,
     extract_page_pc_thread_counts,
 )
 
@@ -168,6 +169,8 @@ class PlaywrightWebFallbackProvider:
         context = await self._ensure_context()
         page = await context.new_page()
         request_contexts: dict[Any, ImmutableRequestContext] = {}
+        request_page_numbers: dict[Any, int] = {}
+        page_network_results: dict[int, list[NetworkExtractionResult]] = {}
         capture_tasks: dict[Any, asyncio.Task] = {}
         response_tasks: set[asyncio.Task] = set()
         callback_tasks: set[asyncio.Task] = set()
@@ -185,8 +188,10 @@ class PlaywrightWebFallbackProvider:
         async def read_and_parse_response(response, key: int) -> None:
             nonlocal identity_mismatch
             context_snapshot = request_contexts.pop(key, None)
+            response_page_number = request_page_numbers.pop(key, None)
             if context_snapshot is None:
                 identity_mismatch = True
+                state["network_request_context_unavailable"] = True
                 return
             path = urlparse(response.request.url).path
             try:
@@ -200,6 +205,8 @@ class PlaywrightWebFallbackProvider:
                 parser = (
                     extract_page_pc_thread_counts
                     if target.target_type == "thread"
+                    else extract_page_pc_post
+                    if target.target_type == "post"
                     else extract_page_pc_comment
                 )
             else:
@@ -211,6 +218,8 @@ class PlaywrightWebFallbackProvider:
                 response_status=response.status,
             )
             network_results.append(result)
+            if response_page_number is not None:
+                page_network_results.setdefault(response_page_number, []).append(result)
             if result.status == "identity_unverified" and result.reason not in {
                 "cid_missing_from_response",
                 "parent_post_missing_from_response",
@@ -228,10 +237,10 @@ class PlaywrightWebFallbackProvider:
                 state["user_card_reason"] = "unverified_source_schema"
             if path == NESTED_FLOOR_PATH:
                 state["nested_floor_requests"] += 1
-            if path == PAGE_PC_PATH and target.target_type in {"thread", "comment"}:
+            if path == PAGE_PC_PATH and target.target_type in {"thread", "post", "comment"}:
                 state["page_pc_requests"] += 1
             if path == NESTED_FLOOR_PATH or (
-                path == PAGE_PC_PATH and target.target_type in {"thread", "comment"}
+                path == PAGE_PC_PATH and target.target_type in {"thread", "post", "comment"}
             ):
                 request_contexts[_request_key(request)] = make_request_context(
                     target,
@@ -244,6 +253,7 @@ class PlaywrightWebFallbackProvider:
                         f":{uuid.uuid4().hex}"
                     ),
                 )
+                request_page_numbers[_request_key(request)] = state["pages"]
 
         def schedule_blocked(reason: str) -> None:
             if state["block_callback_notified"]:
@@ -279,13 +289,13 @@ class PlaywrightWebFallbackProvider:
                 schedule_blocked("http_429")
             elif status in {401, 403} and (
                 path in {NESTED_FLOOR_PATH, USER_CARD_PATH}
-                or (path == PAGE_PC_PATH and target.target_type in {"thread", "comment"})
+                or (path == PAGE_PC_PATH and target.target_type in {"thread", "post", "comment"})
                 or _is_document_request(response.request)
             ):
                 state["blocked_reason"] = "http_auth_or_verification"
                 schedule_blocked("http_auth_or_verification")
             if path == NESTED_FLOOR_PATH or (
-                path == PAGE_PC_PATH and target.target_type in {"thread", "comment"}
+                path == PAGE_PC_PATH and target.target_type in {"thread", "post", "comment"}
             ):
                 task = asyncio.create_task(capture_response(response))
                 response_tasks.add(task)
@@ -320,7 +330,15 @@ class PlaywrightWebFallbackProvider:
                 pages_left = self._max_pages - page_number + 1
                 remaining = max(0.0, deadline - loop.time())
                 page_deadline = loop.time() + remaining / pages_left
-                readiness = await self._wait_for_target(page, target, page_deadline, deadline, state)
+                readiness = await self._wait_for_target(
+                    page,
+                    target,
+                    page_deadline,
+                    deadline,
+                    state,
+                    page_network_results,
+                    page_number,
+                )
                 if readiness in {"needs_login", "blocked"}:
                     state["blocked_reason"] = readiness
                     state["manual_gate_detected"] = True
@@ -328,6 +346,9 @@ class PlaywrightWebFallbackProvider:
                     break
                 if readiness == "timeout":
                     return BrowserRunResult("timeout", "browser_task_timeout", (), dict(state))
+                if readiness in {"network_ready", "network_invalid"}:
+                    dom_result = extract_dom_candidates(target, page.url, await page.content())
+                    break
                 if readiness != "ready":
                     if target.target_type in {"thread", "post"}:
                         dom_result = extract_dom_candidates(target, page.url, await page.content())
@@ -348,6 +369,15 @@ class PlaywrightWebFallbackProvider:
                 await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
             if state["blocked_reason"]:
                 return BrowserRunResult("blocked", state["blocked_reason"], (), dict(state))
+            if target.target_type == "post" and dom_result is not None and dom_result.status == "identity_unverified":
+                return BrowserRunResult(
+                    "identity_unverified",
+                    dom_result.reason,
+                    (),
+                    dict(state),
+                    _field_outcomes(target, network_results, None),
+                    False,
+                )
             if identity_mismatch:
                 return BrowserRunResult("identity_unverified", "network_request_context_unavailable", (), dict(state))
             if state.get("identity_failure"):
@@ -359,6 +389,14 @@ class PlaywrightWebFallbackProvider:
                 for result in network_results
             ):
                 return BrowserRunResult("identity_unverified", "network_identity_mismatch", (), dict(state))
+
+            if (
+                target.target_type == "post"
+                and any(result.identity_verified for result in network_results)
+                and dom_result is not None
+                and not dom_result.identity_verified
+            ):
+                dom_result = None
 
             candidates = _merge_candidates(network_results, dom_result)
             identity_verified = any(result.identity_verified for result in network_results) or (
@@ -381,6 +419,24 @@ class PlaywrightWebFallbackProvider:
                     dict(state),
                     _field_outcomes(target, network_results, dom_result),
                     True,
+                )
+            if (
+                target.target_type == "post"
+                and dom_result is not None
+                and not dom_result.identity_verified
+                and any(
+                    result.status == "not_tested"
+                    and result.reason == "target_post_missing_from_response"
+                    for result in network_results
+                )
+            ):
+                return BrowserRunResult(
+                    "not_tested",
+                    "target_post_missing_from_response",
+                    (),
+                    dict(state),
+                    _field_outcomes(target, network_results, None),
+                    False,
                 )
             if target.target_type == "comment":
                 reason = next(
@@ -431,7 +487,16 @@ class PlaywrightWebFallbackProvider:
                 else:
                     await _await_cleanup(asyncio.create_task(page.close()))
 
-    async def _wait_for_target(self, page, target, page_deadline, task_deadline, state) -> str:
+    async def _wait_for_target(
+        self,
+        page,
+        target,
+        page_deadline,
+        task_deadline,
+        state,
+        page_network_results=None,
+        page_number=None,
+    ) -> str:
         loop = asyncio.get_running_loop()
         previous_html = None
         stable_count = 0
@@ -441,6 +506,24 @@ class PlaywrightWebFallbackProvider:
             gate_reason = await _page_gate_reason(page)
             if gate_reason:
                 return gate_reason
+            if target.target_type == "post":
+                current_results = (
+                    page_network_results.get(page_number, ())
+                    if page_network_results is not None and page_number is not None
+                    else ()
+                )
+                if state.get("network_request_context_unavailable") or state.get("identity_failure"):
+                    return "network_invalid"
+                if any(result.status == "identity_unverified" for result in current_results):
+                    return "network_invalid"
+                if any(result.identity_verified for result in current_results):
+                    return "network_ready"
+                if any(
+                    result.status == "not_tested"
+                    and result.reason == "target_post_missing_from_response"
+                    for result in current_results
+                ):
+                    return "ready"
             if target.target_type in {"thread", "post"}:
                 html_text = await page.content()
                 if target_dom_structure_ready(target, page.url, html_text):

@@ -165,6 +165,7 @@ class FakePage:
         status=200,
         nested_response_text="{}",
         page_pc_response_text=None,
+        page_pc_response_delay=0,
         expansion_remaining=1,
         has_post=True,
         emit_user_card=False,
@@ -185,6 +186,7 @@ class FakePage:
         self.goto_status = status
         self.nested_response_text = nested_response_text
         self.page_pc_response_text = page_pc_response_text
+        self.page_pc_response_delay = page_pc_response_delay
         self.expansion_remaining = expansion_remaining
         self.has_post = has_post
         self.emit_user_card = emit_user_card
@@ -239,7 +241,15 @@ class FakePage:
                 post_data=f"kz={TID}&pn=1",
             )
             self.emit("request", page_pc)
-            self.emit("response", FakeResponse(page_pc, text=self.page_pc_response_text))
+            response = FakeResponse(page_pc, text=self.page_pc_response_text)
+            if self.page_pc_response_delay:
+                async def emit_delayed_response():
+                    await asyncio.sleep(self.page_pc_response_delay)
+                    self.emit("response", response)
+
+                asyncio.create_task(emit_delayed_response())
+            else:
+                self.emit("response", response)
         if self.navigation_delay:
             await asyncio.sleep(self.navigation_delay)
         return FakeResponse(document, status=self.goto_status)
@@ -274,15 +284,25 @@ class FakePage:
 
 
 class PaginatedPagePcFakePage(FakePage):
-    def __init__(self, *, page_pc_responses, has_post_by_page, nested_response_text="{}"):
-        super().__init__(has_post=False, nested_response_text=nested_response_text)
+    def __init__(
+        self,
+        *,
+        page_pc_responses,
+        has_post_by_page,
+        page_pc_delays=None,
+        html_text="",
+        nested_response_text="{}",
+    ):
+        super().__init__(html_text=html_text, has_post=False, nested_response_text=nested_response_text)
         self.page_pc_responses = page_pc_responses
         self.has_post_by_page = has_post_by_page
+        self.page_pc_delays = page_pc_delays or [0] * len(page_pc_responses)
         self.page_number = 0
 
     async def goto(self, url, **kwargs):
         self.page_number += 1
         self.page_pc_response_text = self.page_pc_responses[self.page_number - 1]
+        self.page_pc_response_delay = self.page_pc_delays[self.page_number - 1]
         self.has_post = self.has_post_by_page[self.page_number - 1]
         return await super().goto(url, **kwargs)
 
@@ -332,6 +352,26 @@ def _comment_target(**changes):
     return Target(**values)
 
 
+def _post_target(**changes):
+    values = {
+        "target_type": "post",
+        "target_id": "45003",
+        "tid": TID,
+        "fid": FID,
+        "pid": "45003",
+        "author_user_id": AUTHOR_ID,
+        "author_portrait": PORTRAIT,
+        "requested_fields": (
+            "ip_location_text",
+            "global_growth_level",
+            "global_growth_icon_url",
+            "agree_count",
+        ),
+    }
+    values.update(changes)
+    return Target(**values)
+
+
 def _thread_html(tid=TID):
     return f"""
     <html><body><div class="image-text">
@@ -343,6 +383,19 @@ def _thread_html(tid=TID):
       </div></div>
       <div class="desc-info"><span class="ip-address">合成地区</span></div>
       <div class="pc-pb-first-floor-interactive"></div>
+    </div></body></html>
+    """
+
+
+def _post_html(*, pid="45003", tid=TID, fid=FID, portrait="tb.1.other"):
+    return f"""
+    <html><body><div class="pb-comment-item" data-id="{pid}">
+      <div class="pb-content-wrap">
+        <div class="richtext-item"><span tid="{tid}" fid="{fid}" index="1"></span></div>
+      </div>
+      <div class="head-line user-info"><div class="name-info">
+        <a class="head-name" href="https://tieba.baidu.com/home/main?id={portrait}">synthetic</a>
+      </div></div>
     </div></body></html>
     """
 
@@ -396,6 +449,37 @@ def _page_pc_response(*, cid=CID):
                 }
             ],
             "user_list": [{"id": int(AUTHOR_ID), "ip_address": "合成地区"}],
+        },
+        ensure_ascii=False,
+    )
+
+
+def _post_page_pc_response(
+    *, post_id="45003", ip_address="  ", growth_level=0, include_growth_icon=False
+):
+    user = {
+        "id": int(AUTHOR_ID),
+        "ip_address": ip_address,
+        "user_growth": {"level_id": growth_level},
+    }
+    if include_growth_icon:
+        user["user_show_info"] = {
+            "feed_head": {
+                "main_data": [
+                    {
+                        "business_info_map": {"icon_tip": "贴吧成长等级"},
+                        "icon": {"url": "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp"},
+                    }
+                ]
+            }
+        }
+    return json.dumps(
+        {
+            "error_code": 0,
+            "forum": {"id": int(FID)},
+            "thread": {"id": int(TID)},
+            "post_list": [{"id": int(post_id), "author_id": int(AUTHOR_ID)}],
+            "user_list": [user],
         },
         ensure_ascii=False,
     )
@@ -570,6 +654,71 @@ async def test_comment_page_pc_candidates_do_not_stop_nested_floor_fallback():
     assert candidates["author_nickname"].raw_value == "合成昵称"
     assert candidates["ip_location_text"].source_path == "page_pc.user_list[0].ip_address"
     assert candidates["agree_count"].normalized_value == 3
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_post_page_pc_identity_finishes_without_dom_owner_and_keeps_empty_outcomes():
+    page = FakePage(
+        html_text="<html><body></body></html>",
+        has_post=False,
+        page_pc_response_text=_post_page_pc_response(),
+    )
+    provider = _provider(FakeContext(lambda: page), max_pages=2, timeout_seconds=0.3)
+
+    result = await provider.collect(_post_target())
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.candidates == ()
+    assert result.diagnostics["pages"] == 1
+    assert result.diagnostics["page_pc_requests"] == 1
+    assert result.field_outcomes["ip_location_text"]["reason"] == "ip_location_empty_in_response"
+    assert result.field_outcomes["global_growth_level"]["reason"] == "global_growth_level_zero_is_unknown"
+    assert result.field_outcomes["agree_count"]["reason"] == "not_observed_in_response"
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_post_page_pc_waits_for_delayed_exact_response_on_later_page():
+    page = PaginatedPagePcFakePage(
+        html_text="<html><body></body></html>",
+        page_pc_responses=[
+            _post_page_pc_response(post_id="45004"),
+            _post_page_pc_response(ip_address="合成地区", growth_level=3),
+        ],
+        page_pc_delays=[0, 0.02],
+        has_post_by_page=[False, False],
+    )
+    provider = _provider(FakeContext(lambda: page), max_pages=2, timeout_seconds=0.5)
+
+    result = await provider.collect(_post_target())
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.diagnostics["pages"] == 2
+    assert result.diagnostics["page_pc_requests"] == 2
+    assert {candidate.field_name for candidate in result.candidates} == {
+        "ip_location_text",
+        "global_growth_level",
+    }
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_post_page_pc_keeps_explicit_dom_author_conflict_fail_closed():
+    page = FakePage(
+        html_text=_post_html(),
+        page_pc_response_text=_post_page_pc_response(ip_address="合成地区", growth_level=3),
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=0.3)
+
+    result = await provider.collect(_post_target())
+
+    assert result.status == "identity_unverified"
+    assert result.reason == "owner_author_not_verified"
+    assert result.identity_verified is False
+    assert result.candidates == ()
     await provider.close()
 
 
@@ -887,21 +1036,22 @@ async def test_provider_obeys_max_pages_when_owner_is_not_on_current_page():
     )
     target = Target(
         target_type="post",
-        target_id=POST_ID,
+        target_id="45004",
         tid=TID,
         fid=FID,
-        pid=POST_ID,
+        pid="45004",
         author_user_id=AUTHOR_ID,
         author_portrait=PORTRAIT,
         requested_fields=("ip_location_text",),
     )
-    provider = _provider(FakeContext(lambda: page), max_pages=2, timeout_seconds=0.1)
+    provider = _provider(FakeContext(lambda: page), max_pages=2, timeout_seconds=0.5)
 
     result = await provider.collect(target)
 
-    assert result.status in {"dom_changed", "timeout"}
+    assert result.status == "not_tested"
+    assert result.reason == "target_post_missing_from_response"
     assert result.diagnostics["pages"] == 2
-    assert result.diagnostics["page_pc_requests"] == 0
+    assert result.diagnostics["page_pc_requests"] == 2
     await provider.close()
 
 

@@ -21,6 +21,7 @@ from .network import (
     NetworkExtractionResult,
     extract_nested_floor,
     extract_page_pc_comment,
+    extract_page_pc_post,
     extract_page_pc_thread_counts,
 )
 
@@ -40,6 +41,7 @@ __all__ = [
     "extract_dom_candidates",
     "extract_nested_floor",
     "extract_page_pc_comment",
+    "extract_page_pc_post",
     "extract_page_pc_thread_counts",
     "make_request_context",
     "parse_json_unique",

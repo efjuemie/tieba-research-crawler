@@ -139,6 +139,74 @@ def test_nested_floor_uses_python_raw_json_ids_and_explicit_zero_presence():
     }
 
 
+def test_nested_floor_extracts_reply_target_only_from_exact_prefix_and_type4_mention():
+    target = _target(requested_fields=("reply_to_display_name", "reply_to_user_id"))
+    payload = _payload()
+    payload["data"]["post_list"][0]["content"] = [
+        {"type": 0, "text": "回复 "},
+        {"type": 4, "text": "Synthetic Mention", "uid": 99001},
+        {"type": 0, "text": " synthetic body"},
+    ]
+
+    result = _extract(payload, target=target)
+
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+    assert candidates["reply_to_display_name"].normalized_value == "Synthetic Mention"
+    assert candidates["reply_to_display_name"].raw_value == {
+        "mention_type": 4,
+        "mention_uid": "99001",
+    }
+    assert candidates["reply_to_user_id"].normalized_value == 99001
+    assert candidates["reply_to_display_name"].identity.cid == CID
+    assert candidates["reply_to_display_name"].identity.parent_post_pid == POST_ID
+
+
+def test_nested_floor_reply_display_name_only_requires_type4_mention_with_exact_prefix():
+    target = _target(requested_fields=("reply_to_display_name", "reply_to_user_id"))
+    payload = _payload()
+    payload["data"]["post_list"][0]["content"] = [
+        {"type": 0, "text": "回复 "},
+        {"type": 4, "text": "Synthetic Mention", "uid": 0},
+    ]
+    result = _extract(payload, target=target)
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+    assert candidates["reply_to_display_name"].normalized_value == "Synthetic Mention"
+    assert candidates["reply_to_display_name"].raw_value["mention_uid"] is None
+    assert "reply_to_user_id" not in candidates
+
+    payload["data"]["post_list"][0]["content"][0]["text"] = "回复"
+    not_exact = _extract(payload, target=target)
+    assert not_exact.candidates == ()
+
+
+@pytest.mark.parametrize("asset_path", ["synthetic/growth.png", "synthetic/growth-asset"])
+def test_nested_floor_growth_icon_url_requires_structured_growth_semantics(asset_path):
+    target = _target(requested_fields=("global_growth_icon_url",))
+    payload = _payload()
+    payload["data"]["post_list"][0]["author"]["user_show_info"] = {
+        "feed_head": {
+            "main_data": [
+                {
+                    "business_info_map": {"icon_tip": "本吧头衔"},
+                    "icon": {"url": "https://tieba-ares.cdn.bcebos.com/synthetic/forum.webp"},
+                },
+                {
+                    "business_info_map": {"icon_tip": "贴吧成长等级"},
+                    "icon": {"url": f"https://tieba-ares.cdn.bcebos.com/{asset_path}?size=1"},
+                },
+            ]
+        }
+    }
+
+    result = _extract(payload, target=target)
+
+    [candidate] = result.candidates
+    assert candidate.field_name == "global_growth_icon_url"
+    assert candidate.normalized_value == (
+        f"https://tieba-ares.cdn.bcebos.com/{asset_path}?size=1"
+    )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "reason"),
     [
@@ -278,3 +346,18 @@ def test_generic_author_level_zero_is_not_used_as_forum_or_growth_level():
 
     assert "global_growth_level" not in candidates
     assert candidates["forum_level"].normalized_value == 8
+
+
+def test_nested_floor_keeps_zero_growth_unknown_and_explicit_zero_agree_count():
+    payload = _payload()
+    payload["data"]["post_list"][0]["author"]["user_growth"]["level_id"] = 0
+
+    result = _extract(payload)
+
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+    assert "global_growth_level" not in candidates
+    assert result.field_outcomes["global_growth_level"] == {
+        "status": "absent_on_page",
+        "reason": "global_growth_level_zero_is_unknown",
+    }
+    assert candidates["agree_count"].normalized_value == 0

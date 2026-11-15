@@ -70,6 +70,37 @@ class PageIntegrityError(ValueError):
     """Raised when a returned API page does not match the requested scope."""
 
 
+def _positive_int_id(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.isdecimal():
+        parsed = int(value)
+    else:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _page_first_post_pid(page: Any, raw_thread: Any, expected_tid: int) -> int:
+    raw_tid = _positive_int_id(getattr(raw_thread, "tid", None))
+    raw_fid = _positive_int_id(getattr(raw_thread, "fid", None))
+    if raw_tid != expected_tid or raw_fid is None:
+        return 0
+
+    matching_floor_one = [
+        post
+        for post in getattr(page, "objs", ())
+        if type(getattr(post, "floor", None)) is int
+        and post.floor == 1
+        and _positive_int_id(getattr(post, "tid", None)) == raw_tid
+        and _positive_int_id(getattr(post, "fid", None)) == raw_fid
+    ]
+    if len(matching_floor_one) != 1:
+        return 0
+    return _positive_int_id(getattr(matching_floor_one[0], "pid", None)) or 0
+
+
 def _retry_delay(wait_seconds: float, attempt: int) -> float:
     """Return a bounded exponential delay with light jitter for ordinary retries."""
     if wait_seconds <= 0:
@@ -1012,19 +1043,15 @@ class FullScanPostsTaskHandler(TaskHandler):
 
         run_id = task.run_id or getattr(self.container, "research_run_id", None)
         logical_key = research_posts_task_key(task.tid)
-        posts = [post for post in page.objs if post.floor != 1]
-        await self.ensure_users(posts)
-        await self.ensure_users([comment for post in posts for comment in post.comments])
+        page_posts = [post for post in page.objs if post.floor != 1]
+        await self.ensure_users(page_posts)
+        await self.ensure_users([comment for post in page_posts for comment in post.comments])
         await self._prepare_research_page(response)
 
-        post_models = [Post.from_dto(post) for post in posts]
         child_tasks: list[FullScanCommentsTask] = []
         parent_priority = Priority.BACKFILL_POSTS if task.backfill else Priority.LOW
         raw_thread = getattr(getattr(response, "raw", None), "thread", None)
-        first_pid = int(getattr(raw_thread, "pid", 0) or 0)
-        first_floor = next((post for post in page.objs if post.tid == task.tid and post.floor == 1), None)
-        if first_pid <= 0 and first_floor is not None:
-            first_pid = int(getattr(first_floor, "pid", 0) or 0)
+        first_pid = _page_first_post_pid(page, raw_thread, task.tid)
 
         async with self.datastore.async_sessionmaker() as session, session.begin():
             scope = await self.datastore.get_research_task_scope_for_update(session, run_id, logical_key)
@@ -1036,7 +1063,14 @@ class FullScanPostsTaskHandler(TaskHandler):
             ):
                 stored_first_pids = await self.datastore.get_research_first_post_pids(task.tid, session=session)
                 if len(stored_first_pids) == 1:
-                    first_pid = next(iter(stored_first_pids))
+                    first_pid = _positive_int_id(next(iter(stored_first_pids))) or 0
+
+            posts = [
+                post
+                for post in page_posts
+                if first_pid <= 0 or _positive_int_id(getattr(post, "pid", None)) != first_pid
+            ]
+            post_models = [Post.from_dto(post) for post in posts]
 
             await persist_research_page(
                 self.datastore.async_sessionmaker,
@@ -1097,6 +1131,17 @@ class FullScanPostsTaskHandler(TaskHandler):
                             rn=task.rn,
                         )
                     )
+
+            if first_pid > 0:
+                for post in page_posts:
+                    if _positive_int_id(getattr(post, "pid", None)) != first_pid:
+                        continue
+                    comments = list(post.comments)
+                    if comments:
+                        await self.datastore.save_items_in_session(
+                            session,
+                            [Comment.from_dto(comment) for comment in comments],
+                        )
 
             if first_pid > 0:
                 fid = int(getattr(raw_thread, "fid", 0) or task.fid or page.forum.fid or 0)
@@ -1379,9 +1424,21 @@ class FullScanPostsTaskHandler(TaskHandler):
             tid: 主题贴tid
             posts_page: 该页面的回复数据
         """
-        posts = [p for p in posts_page.objs if p.floor != 1]
+        page_posts = [p for p in posts_page.objs if p.floor != 1]
+        raw_thread = getattr(getattr(research_response, "raw", None), "thread", None)
+        first_pid = _page_first_post_pid(posts_page, raw_thread, tid)
+        if first_pid <= 0 and self.research_enabled and hasattr(self.datastore, "get_research_first_post_pids"):
+            stored_first_pids = await self.datastore.get_research_first_post_pids(tid)
+            if len(stored_first_pids) == 1:
+                first_pid = _positive_int_id(next(iter(stored_first_pids))) or 0
 
-        await self.ensure_users(posts)
+        await self.ensure_users(page_posts)
+
+        posts = [
+            post
+            for post in page_posts
+            if first_pid <= 0 or _positive_int_id(getattr(post, "pid", None)) != first_pid
+        ]
 
         post_models = [Post.from_dto(p) for p in posts]
         await self.datastore.save_items(post_models)
@@ -1417,21 +1474,15 @@ class FullScanPostsTaskHandler(TaskHandler):
                 await self.router.put(Task(priority=priority, content=comment_task))
                 self.log.info("[{}吧] Scheduled FullScanCommentsTask for pid={} in tid={}", post.fname, post.pid, tid)
 
-        raw_thread = getattr(getattr(research_response, "raw", None), "thread", None)
-        try:
-            first_pid = int(getattr(raw_thread, "pid", 0) or 0)
-        except (TypeError, ValueError):
-            first_pid = 0
-        if first_pid <= 0:
-            first_floor = next((post for post in posts_page.objs if post.tid == tid and post.floor == 1), None)
-            try:
-                first_pid = int(getattr(first_floor, "pid", 0) or 0)
-            except (TypeError, ValueError):
-                first_pid = 0
-        if first_pid <= 0 and self.research_enabled and hasattr(self.datastore, "get_research_first_post_pids"):
-            stored_first_pids = await self.datastore.get_research_first_post_pids(tid)
-            if len(stored_first_pids) == 1:
-                first_pid = next(iter(stored_first_pids))
+        if first_pid > 0:
+            for post in page_posts:
+                if _positive_int_id(getattr(post, "pid", None)) != first_pid:
+                    continue
+                comments = list(post.comments)
+                if comments:
+                    await self.ensure_users(comments)
+                    await self.datastore.save_items([Comment.from_dto(comment) for comment in comments])
+
         if self.research_enabled and first_pid > 0:
             fid = int(getattr(raw_thread, "fid", 0) or 0)
             fname = str(getattr(raw_thread, "fname", "") or "")

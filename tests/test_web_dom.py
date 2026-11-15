@@ -30,6 +30,7 @@ def _target(target_type="thread", **changes):
             "forum_level_icon_ref",
             "forum_level",
             "global_growth_level",
+            "global_growth_icon_url",
             "ip_location_text",
             "agree_count",
             "reply_count",
@@ -52,7 +53,9 @@ def _header(*, label="owner", portrait=PORTRAIT, nested=False):
               <svg><use href="#level_12"></use></svg>
             </span>
             <span class="tag">太保</span>
-            <span class="icon_tshows tooltip__reference" aria-describedby="growth-tip-{label}"></span>
+            <span class="icon_tshows tooltip__reference" aria-describedby="growth-tip-{label}">
+              <img class="icon_tshows_img" src="https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp?size=1">
+            </span>
           </div>
         </a></div>
       </div>
@@ -140,6 +143,9 @@ def test_thread_dom_uses_nearest_owner_and_tooltip_semantics():
     assert candidates["forum_level_icon_ref"].raw_value == "#level_12"
     assert candidates["forum_level"].normalized_value == 12
     assert "global_growth_level" not in candidates
+    assert candidates["global_growth_icon_url"].normalized_value == (
+        "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp?size=1"
+    )
     assert candidates["ip_location_text"].normalized_value == "广东"
     assert candidates["agree_count"].normalized_value == 0
     assert candidates["reply_count"].normalized_value == 32
@@ -318,6 +324,37 @@ def test_self_tooltip_growth_requires_an_explicit_numeric_value():
     candidates = {candidate.field_name: candidate for candidate in result.candidates}
 
     assert candidates["global_growth_level"].normalized_value == 20
+
+
+def test_growth_icon_url_requires_its_own_official_growth_tooltip_and_cdn():
+    target = _target(requested_fields=("global_growth_icon_url",))
+    no_tooltip = _thread_html(nested=False).replace(
+        'aria-describedby="growth-tip-owner"', 'aria-describedby="missing-tip"'
+    )
+    unverified = extract_dom_candidates(target, f"https://tieba.baidu.com/p/{TID}", no_tooltip)
+    assert "global_growth_icon_url" not in {candidate.field_name for candidate in unverified.candidates}
+
+    wrong_host = _thread_html(nested=False).replace(
+        "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp?size=1",
+        "https://example.com/synthetic/growth.webp",
+    )
+    rejected = extract_dom_candidates(target, f"https://tieba.baidu.com/p/{TID}", wrong_host)
+    assert "global_growth_icon_url" not in {candidate.field_name for candidate in rejected.candidates}
+
+
+@pytest.mark.parametrize("asset_path", ["synthetic/growth.png", "synthetic/growth-asset"])
+def test_growth_icon_url_accepts_official_assets_without_webp_extension(asset_path):
+    target = _target(requested_fields=("global_growth_icon_url",))
+    expected = f"https://tieba-ares.cdn.bcebos.com/{asset_path}"
+    fixture = _thread_html(nested=False).replace(
+        "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp?size=1",
+        expected,
+    )
+
+    result = extract_dom_candidates(target, f"https://tieba.baidu.com/p/{TID}", fixture)
+
+    [candidate] = result.candidates
+    assert candidate.normalized_value == expected
 
 
 def test_post_dom_requires_exact_data_id_and_scopes_header_and_location_to_owner():

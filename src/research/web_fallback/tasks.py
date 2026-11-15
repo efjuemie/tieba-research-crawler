@@ -40,20 +40,27 @@ WEB_FIELD_TYPES: dict[str, type] = {
     "author_portrait": str,
     "forum_level": int,
     "global_growth_level": int,
+    "global_growth_icon_url": str,
     "is_bawu": bool,
+    "ip_location_text": str,
+    "agree_count": int,
+    "reply_count": int,
+    "collect_count": int,
+    "view_count": int,
+    "reply_to_user_id": int,
+    "reply_to_display_name": str,
+}
+
+# Existing tasks may still contain these fields. Keep their types for reconciliation,
+# while excluding them from new task requests.
+LEGACY_WEB_FIELD_TYPES: dict[str, type] = {
     "forum_level_name": str,
     "role_type": str,
     "role_name": str,
     "role_badge_id": str,
     "role_badge_url": str,
-    "ip_location_text": str,
-    "agree_count": int,
     "disagree_count": int,
-    "reply_count": int,
-    "collect_count": int,
-    "view_count": int,
     "share_count": int,
-    # A page icon reference is evidence only; it has no canonical field yet.
     "forum_level_icon_ref": str,
 }
 
@@ -63,25 +70,45 @@ _TARGET_FIELDS: dict[str, frozenset[str]] = {
             "author_user_name",
             "author_nickname",
             "author_portrait",
+            "forum_level",
             "global_growth_level",
+            "global_growth_icon_url",
             "is_bawu",
-            "forum_level_name",
-            "role_type",
-            "role_name",
-            "role_badge_id",
-            "role_badge_url",
             "ip_location_text",
             "agree_count",
-            "disagree_count",
             "reply_count",
             "collect_count",
             "view_count",
-            "share_count",
-            "forum_level_icon_ref",
         }
     ),
-    "post": frozenset(WEB_FIELD_TYPES),
-    "comment": frozenset(WEB_FIELD_TYPES),
+    "post": frozenset(
+        {
+            "author_user_name",
+            "author_nickname",
+            "author_portrait",
+            "forum_level",
+            "global_growth_level",
+            "global_growth_icon_url",
+            "is_bawu",
+            "ip_location_text",
+            "agree_count",
+        }
+    ),
+    "comment": frozenset(
+        {
+            "author_user_name",
+            "author_nickname",
+            "author_portrait",
+            "forum_level",
+            "global_growth_level",
+            "global_growth_icon_url",
+            "is_bawu",
+            "ip_location_text",
+            "agree_count",
+            "reply_to_user_id",
+            "reply_to_display_name",
+        }
+    ),
 }
 
 
@@ -762,6 +789,7 @@ def _safe_reason(value: str) -> str:
 
 __all__ = [
     "EnqueueSummary",
+    "LEGACY_WEB_FIELD_TYPES",
     "WEB_FIELD_TYPES",
     "WebEnrichmentTaskLease",
     "cancel_web_enrichment_task",

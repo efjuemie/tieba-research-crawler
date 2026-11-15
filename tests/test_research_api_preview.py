@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
+from aiotieba.api._classdef.contents import FragAt, FragText
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from tiebameow.models.orm import Base
@@ -119,6 +120,7 @@ def _preview_page(
     author_id=AUTHOR_ID,
     include_metadata=True,
     second_preview=None,
+    reply_target=None,
 ):
     thread_user = _author(777)
     thread = SimpleNamespace(
@@ -161,6 +163,13 @@ def _preview_page(
         author_id=author_id,
         user=_author(author_id, complete=include_metadata),
     )
+    if reply_target is not None:
+        reply_name, reply_user_id = reply_target
+        preview.reply_to_id = reply_user_id
+        preview.contents = _Contents(
+            "reply body",
+            [FragText("回复 "), FragAt(f"@{reply_name}", reply_user_id), FragText("reply body")],
+        )
     post_user = _author(888)
     reply_post = SimpleNamespace(
         pid=parent_pid,
@@ -205,6 +214,7 @@ def _detail_page(
     parent_pid=PARENT_PID,
     fid=FID,
     author_id=AUTHOR_ID,
+    reply_to_user_id=0,
 ):
     comment = SimpleNamespace(
         pid=cid,
@@ -217,7 +227,7 @@ def _detail_page(
         author_id=author_id,
         user=user if user is not None else _author(author_id, complete=False),
         contents=_Contents("complete comment body", [FragImage()]),
-        reply_to_id=0,
+        reply_to_id=reply_to_user_id,
         agree=0,
         disagree=0,
         is_thread_author=False,
@@ -393,6 +403,391 @@ async def test_preview_conflicts_preserve_known_detail_metadata():
             assert "verified_content_api" not in comment.field_sources_json["forum_level"]
     finally:
         engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_preview_reply_display_name_requires_leading_reply_prefix_and_matching_target_uid():
+    engine, sessionmaker = _sessionmaker()
+    observed_at = datetime(2026, 4, 2, tzinfo=UTC)
+    target_uid = 987654321012345682
+    preview_page = _preview_page(observed_at, reply_target=("synthetic target", target_uid))
+    detail_page = _detail_page(datetime(2026, 4, 1, tzinfo=UTC), reply_to_user_id=target_uid)
+    try:
+        records = build_research_records(preview_page)
+        target_observation = next(
+            observation
+            for observation in records.api_field_observations
+            if observation.field_name == "reply_to_display_name"
+        )
+        assert target_observation.target_id == CID
+        assert target_observation.normalized_value_json == "synthetic target"
+        assert target_observation.raw_value_json["reply_to_user_id"] == target_uid
+        await persist_research_page(sessionmaker, detail_page)
+        await persist_research_page(sessionmaker, preview_page)
+
+        non_reply_page = _preview_page(
+            datetime(2026, 4, 3, tzinfo=UTC),
+            reply_target=("synthetic mention", target_uid),
+        )
+        comment_preview = non_reply_page.raw.objs[1].comments[0]
+        comment_preview.contents = _Contents(
+            "a body with a mention",
+            [FragText("ordinary text "), FragAt("@synthetic mention", target_uid)],
+        )
+        non_reply_records = build_research_records(non_reply_page)
+        assert all(
+            observation.field_name != "reply_to_display_name"
+            for observation in non_reply_records.api_field_observations
+        )
+
+        with Session(engine) as database:
+            comment = database.get(ResearchComment, CID)
+            assert comment.reply_to_user_id == target_uid
+            assert comment.reply_to_display_name == "synthetic target"
+            assert comment.field_sources_json["reply_to_display_name"]["verified_content_api"]["source_path"] == (
+                "api.comments_preview.reply_target.display_name"
+            )
+            assert comment.text == "complete comment body"
+            marker = database.scalar(
+                select(ResearchContentObservation).where(
+                    ResearchContentObservation.owner_type == "comment",
+                    ResearchContentObservation.owner_id == CID,
+                )
+            )
+            assert _aware(marker.observed_at) == detail_page.observed_at
+            assert database.scalar(
+                select(func.count()).select_from(MediaAsset).where(
+                    MediaAsset.owner_type == "comment", MediaAsset.owner_id == CID
+                )
+            ) == 1
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_preview_reply_name_is_suppressed_when_canonical_reply_uid_conflicts():
+    engine, sessionmaker = _sessionmaker()
+    target_uid = 987654321012345682
+    canonical_uid = target_uid + 1
+    try:
+        await persist_research_page(
+            sessionmaker,
+            _detail_page(datetime(2026, 5, 1, tzinfo=UTC), reply_to_user_id=canonical_uid),
+        )
+        await persist_research_page(
+            sessionmaker,
+            _preview_page(
+                datetime(2026, 5, 2, tzinfo=UTC),
+                reply_target=("synthetic target", target_uid),
+            ),
+        )
+
+        with Session(engine) as database:
+            comment = database.get(ResearchComment, CID)
+            assert comment.reply_to_user_id == canonical_uid
+            assert comment.reply_to_display_name is None
+            assert comment.missing_reasons_json["reply_to_display_name"] == "api_reply_target_uid_conflict"
+            conflict = comment.field_sources_json["reply_to_display_name"]["api_conflicts"][-1]
+            assert conflict["value"] == "synthetic target"
+            assert comment.source_payload_json["reply_target_candidates"][-1]["raw"]["reply_to_user_id"] == target_uid
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_preview_verified_reply_uid_keeps_name_paired_across_later_detail_refresh():
+    engine, sessionmaker = _sessionmaker()
+    first_reply_uid = 987654321012345682
+    try:
+        await persist_research_page(
+            sessionmaker,
+            _detail_page(datetime(2026, 5, 10, tzinfo=UTC), reply_to_user_id=first_reply_uid),
+        )
+        await persist_research_page(
+            sessionmaker,
+            _preview_page(
+                datetime(2026, 5, 11, tzinfo=UTC),
+                reply_target=("synthetic target A", first_reply_uid),
+            ),
+        )
+        await persist_research_page(
+            sessionmaker,
+            _detail_page(datetime(2026, 5, 12, tzinfo=UTC), reply_to_user_id=first_reply_uid + 1),
+        )
+
+        with Session(engine) as database:
+            comment = database.get(ResearchComment, CID)
+            assert comment.reply_to_user_id == first_reply_uid
+            assert comment.reply_to_display_name == "synthetic target A"
+            assert comment.field_sources_json["reply_to_user_id"]["verified_content_api"]["value"] == first_reply_uid
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_verified_web_reply_uid_suppresses_mismatched_detail_name_but_keeps_raw_candidate():
+    engine, sessionmaker = _sessionmaker()
+    observed_at = datetime(2026, 5, 20, tzinfo=UTC)
+    retained_uid = 987654321012345682
+    incoming_uid = retained_uid + 1
+    try:
+        await persist_research_page(sessionmaker, _detail_page(observed_at, reply_to_user_id=retained_uid))
+        with Session(engine) as database, database.begin():
+            comment = database.get(ResearchComment, CID)
+            comment.reply_to_user_id = retained_uid
+            comment.reply_to_display_name = None
+            comment.field_sources_json = {
+                "reply_to_user_id": {
+                    "verified_web": {
+                        "source_kind": "web_network",
+                        "value": retained_uid,
+                        "observed_at": observed_at.isoformat(),
+                    }
+                }
+            }
+
+        detail_page = _detail_page(datetime(2026, 5, 21, tzinfo=UTC), reply_to_user_id=incoming_uid)
+        detail_comment = detail_page.raw.objs[0]
+        detail_comment.contents = _Contents(
+            "reply body",
+            [FragText("回复 "), FragAt("@synthetic target B", incoming_uid), FragText("reply body")],
+        )
+        await persist_research_page(sessionmaker, detail_page)
+
+        with Session(engine) as database:
+            comment = database.get(ResearchComment, CID)
+            assert comment.reply_to_user_id == retained_uid
+            assert comment.reply_to_display_name is None
+            assert comment.missing_reasons_json["reply_to_display_name"] == "api_reply_target_uid_conflict"
+            assert comment.source_payload_json["reply_target_evidence"]["raw"]["reply_to_user_id"] == incoming_uid
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bound_uid", "confidence"),
+    [(987654321012345682, "explicit_prefix_type4_uid"), (None, "display_name_only")],
+)
+async def test_verified_web_reply_name_binding_blocks_incoming_api_uid_without_name(bound_uid, confidence):
+    engine, sessionmaker = _sessionmaker()
+    observed_at = datetime(2026, 5, 30, tzinfo=UTC)
+    incoming_uid = (bound_uid or 987654321012345682) + 1
+    try:
+        await persist_research_page(sessionmaker, _detail_page(observed_at))
+        with Session(engine) as database, database.begin():
+            comment = database.get(ResearchComment, CID)
+            comment.reply_to_display_name = "synthetic target A"
+            comment.field_sources_json = {
+                "reply_to_display_name": {
+                    "verified_web": {
+                        "source_kind": "web_network",
+                        "value": "synthetic target A",
+                        "reply_target_user_id": bound_uid,
+                        "confidence": confidence,
+                        "observed_at": observed_at.isoformat(),
+                    }
+                }
+            }
+
+        await persist_research_page(
+            sessionmaker,
+            _detail_page(datetime(2026, 5, 31, tzinfo=UTC), reply_to_user_id=incoming_uid),
+        )
+        await persist_research_page(
+            sessionmaker,
+            _preview_page(
+                datetime(2026, 6, 1, tzinfo=UTC),
+                reply_target=("synthetic target B", incoming_uid),
+            ),
+        )
+
+        with Session(engine) as database:
+            comment = database.get(ResearchComment, CID)
+            assert comment.reply_to_user_id is None
+            assert comment.reply_to_display_name == "synthetic target A"
+            assert comment.missing_reasons_json["reply_to_user_id"] in {
+                "api_reply_target_uid_conflicts_with_verified_name_binding",
+                "api_reply_target_uid_unlinked_from_display_name",
+            }
+            assert comment.source_payload_json["reply_target_candidates"][-1]["raw"]["reply_to_user_id"] == (
+                incoming_uid
+            )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_api_reply_name_binding_is_saved_and_blocks_later_mismatched_uid():
+    engine, sessionmaker = _sessionmaker()
+    bound_uid = 987654321012345682
+    try:
+        await persist_research_page(
+            sessionmaker,
+            _detail_page(datetime(2026, 6, 1, tzinfo=UTC)),
+        )
+        await persist_research_page(
+            sessionmaker,
+            _preview_page(
+                datetime(2026, 6, 2, tzinfo=UTC),
+                reply_target=("synthetic target A", bound_uid),
+            ),
+        )
+        with Session(engine) as database, database.begin():
+            comment = database.get(ResearchComment, CID)
+            assert comment.field_sources_json["reply_to_display_name"]["verified_content_api"][
+                "reply_target_user_id"
+            ] == bound_uid
+            comment.reply_to_user_id = None
+            sources = dict(comment.field_sources_json)
+            sources.pop("reply_to_user_id", None)
+            comment.field_sources_json = sources
+
+        await persist_research_page(
+            sessionmaker,
+            _detail_page(datetime(2026, 6, 3, tzinfo=UTC), reply_to_user_id=bound_uid + 1),
+        )
+
+        with Session(engine) as database:
+            comment = database.get(ResearchComment, CID)
+            assert comment.reply_to_user_id == bound_uid
+            assert comment.reply_to_display_name == "synthetic target A"
+            assert any(
+                candidate["raw"].get("reply_to_user_id") == bound_uid + 1
+                for candidate in comment.source_payload_json["reply_target_candidates"]
+            )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_matching_explicit_api_reply_name_and_uid_upgrade_web_display_only_name():
+    engine, sessionmaker = _sessionmaker()
+    target_uid = 987654321012345682
+    try:
+        await persist_research_page(
+            sessionmaker,
+            _detail_page(datetime(2026, 6, 10, tzinfo=UTC)),
+        )
+        with Session(engine) as database, database.begin():
+            comment = database.get(ResearchComment, CID)
+            comment.reply_to_display_name = "synthetic target A"
+            comment.field_sources_json = {
+                "reply_to_display_name": {
+                    "verified_web": {
+                        "source_kind": "web_network",
+                        "value": "synthetic target A",
+                        "reply_target_user_id": None,
+                        "confidence": "display_name_only",
+                    }
+                }
+            }
+
+        await persist_research_page(
+            sessionmaker,
+            _preview_page(
+                datetime(2026, 6, 11, tzinfo=UTC),
+                reply_target=("synthetic target A", target_uid),
+            ),
+        )
+
+        with Session(engine) as database:
+            comment = database.get(ResearchComment, CID)
+            assert comment.reply_to_user_id == target_uid
+            assert comment.reply_to_display_name == "synthetic target A"
+            assert comment.field_sources_json["reply_to_display_name"]["verified_content_api"][
+                "reply_target_user_id"
+            ] == target_uid
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_api_display_only_reply_name_blocks_uid_only_then_upgrades_with_matching_pair():
+    engine, sessionmaker = _sessionmaker()
+    target_uid = 987654321012345682
+    try:
+        await persist_research_page(
+            sessionmaker,
+            _detail_page(datetime(2026, 6, 20, tzinfo=UTC)),
+        )
+        display_only = _detail_page(datetime(2026, 6, 21, tzinfo=UTC))
+        display_comment = display_only.raw.objs[0]
+        display_comment.contents = _Contents(
+            "reply body",
+            [FragText("回复 "), FragAt("@synthetic target A", 0), FragText("reply body")],
+        )
+        await persist_research_page(sessionmaker, display_only)
+
+        await persist_research_page(
+            sessionmaker,
+            _detail_page(datetime(2026, 6, 22, tzinfo=UTC), reply_to_user_id=target_uid),
+        )
+        with Session(engine) as database:
+            comment = database.get(ResearchComment, CID)
+            assert comment.reply_to_user_id is None
+            assert comment.reply_to_display_name == "synthetic target A"
+            assert comment.field_sources_json["reply_to_display_name"]["verified_content_api"][
+                "confidence"
+            ] == "display_name_only"
+            assert comment.field_sources_json["reply_to_display_name"]["verified_content_api"][
+                "reply_target_user_id"
+            ] is None
+
+        matched = _detail_page(datetime(2026, 6, 23, tzinfo=UTC), reply_to_user_id=target_uid)
+        matched_comment = matched.raw.objs[0]
+        matched_comment.contents = _Contents(
+            "reply body",
+            [FragText("回复 "), FragAt("@synthetic target A", target_uid), FragText("reply body")],
+        )
+        await persist_research_page(sessionmaker, matched)
+
+        with Session(engine) as database:
+            comment = database.get(ResearchComment, CID)
+            assert comment.reply_to_user_id == target_uid
+            assert comment.reply_to_display_name == "synthetic target A"
+            assert comment.field_sources_json["reply_to_display_name"]["verified_content_api"][
+                "reply_target_user_id"
+            ] == target_uid
+    finally:
+        engine.dispose()
+
+
+def test_growth_icon_url_requires_explicit_api_field():
+    user = _author()
+    user.global_growth_icon_url = "https://example.invalid/growth-icon.webp"
+    page = _detail_page(datetime(2026, 6, 1, tzinfo=UTC), user=user)
+
+    record = build_research_records(page).comments[0]
+    assert record.global_growth_icon_url == user.global_growth_icon_url
+    assert "global_growth_icon_url" not in record.missing_reasons_json
+    assert record.source_payload_json["author"]["global_growth_icon_url"] == user.global_growth_icon_url
+
+
+def test_growth_icon_url_is_marked_unavailable_without_sdk_field():
+    record = build_research_records(_detail_page(datetime(2026, 6, 1, tzinfo=UTC))).comments[0]
+
+    assert record.global_growth_icon_url is None
+    assert record.missing_reasons_json["global_growth_icon_url"] == "not_exposed_by_aiotieba_parsed_content"
+
+
+def test_comments_mapper_keeps_exact_reply_prefix_mention_provenance():
+    target_uid = 987654321012345682
+    page = _detail_page(datetime(2026, 7, 1, tzinfo=UTC), reply_to_user_id=target_uid)
+    comment = page.raw.objs[0]
+    comment.contents = _Contents(
+        "reply body",
+        [FragText("回复 "), FragAt("@synthetic target", target_uid), FragText("reply body")],
+    )
+
+    record = build_research_records(page).comments[0]
+
+    assert record.reply_to_user_id == target_uid
+    assert record.reply_to_display_name == "synthetic target"
+    assert record.field_sources_json["reply_to_display_name"]["verified_content_api"]["confidence"] == (
+        "explicit_leading_reply_prefix_and_type4_uid"
+    )
+    assert record.source_payload_json["reply_target_evidence"]["raw"]["mention"]["user_id"] == target_uid
 
 
 def _table_counts(engine):

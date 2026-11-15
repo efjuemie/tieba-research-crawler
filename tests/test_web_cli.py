@@ -181,6 +181,7 @@ async def test_read_canonical_snapshot_uses_real_sqlite_session():
 
     assert snapshot["status"] == "found"
     assert snapshot["source_api"] == "synthetic.api"
+    assert not {"post_url", "parent_post_url", "comment_url"}.intersection(snapshot["urls"])
     assert snapshot["fields"]["ip_location_text"] == {
         "canonical_value": None,
         "csv_value": "",
@@ -189,6 +190,33 @@ async def test_read_canonical_snapshot_uses_real_sqlite_session():
             "verified_web": {"source_kind": "web_network", "value": "合成地区"}
         },
     }
+
+
+def test_cli_field_choices_track_web_field_types_and_new_identity_fields():
+    args = cli._build_parser().parse_args([
+        "field-backfill",
+        "--run-id",
+        "synthetic-run",
+        "--target-type",
+        "comment",
+        "--field",
+        "global_growth_icon_url",
+        "--field",
+        "reply_to_display_name",
+        "--dry-run",
+    ])
+    assert args.field == ["global_growth_icon_url", "reply_to_display_name"]
+
+    with pytest.raises(SystemExit):
+        cli._build_parser().parse_args([
+            "field-backfill",
+            "--run-id",
+            "synthetic-run",
+            "--target-type",
+            "thread",
+            "--field",
+            "role_name",
+        ])
 
 
 def test_cli_target_filters_keep_post_and_comment_ids_distinct():

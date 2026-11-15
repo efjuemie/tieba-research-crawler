@@ -66,8 +66,11 @@ _COMMENT_PREVIEW_FIELDS = frozenset(
         "author_portrait",
         "forum_level",
         "global_growth_level",
+        "global_growth_icon_url",
         "is_bawu",
         "ip_location_text",
+        "reply_to_display_name",
+        "reply_to_user_id",
     }
 )
 
@@ -117,6 +120,7 @@ async def _persist_research_records(session: Any, records: ResearchRecords) -> d
     persisted_media_count = 0
     persisted_post_count = 0
     persisted_comment_count = 0
+    await _exclude_known_first_post_duplicates(session, records)
     await _validate_api_preview_identity_rows(session, records.api_preview_comment_identities)
     if records.comments:
         await _fill_parent_post_authors(session, records.comments)
@@ -186,6 +190,52 @@ async def _persist_research_records(session: Any, records: ResearchRecords) -> d
         ),
         "media_assets": persisted_media_count,
     }
+
+
+async def _exclude_known_first_post_duplicates(session: Any, records: ResearchRecords) -> None:
+    post_tids = {_positive_id(row.tid) for row in records.posts}
+    post_tids.discard(None)
+    if not post_tids:
+        return
+
+    result = await session.execute(
+        select(ResearchThread.tid, ResearchThread.first_pid)
+        .where(ResearchThread.tid.in_(post_tids))
+        .with_for_update()
+    )
+    first_pid_by_tid = dict(result.all())
+    for thread in records.threads:
+        thread_tid = _positive_id(thread.tid)
+        thread_first_pid = _positive_id(thread.first_pid)
+        if thread_tid is not None and thread_first_pid is not None:
+            if first_pid_by_tid.get(thread_tid) is None:
+                first_pid_by_tid[thread_tid] = thread_first_pid
+
+    excluded = {
+        (post.tid, post.pid)
+        for post in records.posts
+        if first_pid_by_tid.get(post.tid) == post.pid
+    }
+    if not excluded:
+        return
+
+    records.posts[:] = [post for post in records.posts if (post.tid, post.pid) not in excluded]
+    records.content_observations[:] = [
+        row
+        for row in records.content_observations
+        if not (
+            row.owner_type == "post"
+            and (row.tid, row.owner_id) in excluded
+        )
+    ]
+    records.media_assets[:] = [
+        row
+        for row in records.media_assets
+        if not (
+            row.owner_type == "post"
+            and (row.tid, row.owner_id) in excluded
+        )
+    ]
 
 
 def _content_identity_fields(model: type) -> tuple[str, ...]:
@@ -333,25 +383,115 @@ async def _apply_latest_api_comment_observations(session: Any, comment_ids: set[
             source = sources.get(field_name)
             source = dict(source) if isinstance(source, dict) else {}
             current_value = getattr(current, field_name)
+            reply_target_uid = None
+            display_only_reply_target = False
+            if field_name == "reply_to_display_name":
+                raw_reply_target = observation.raw_value_json
+                if isinstance(raw_reply_target, Mapping):
+                    reply_target_uid = _positive_id(raw_reply_target.get("reply_to_user_id"))
+                name_bindings = _reply_name_binding_uids(sources)
+                _, unbound_names = _reply_name_provenance_state(sources)
+                current_reply_uid = _positive_id(current.reply_to_user_id)
+                binding_conflict = bool(name_bindings) and (
+                    reply_target_uid is None or name_bindings != {reply_target_uid}
+                )
+                name_conflict = bool(unbound_names) and value not in unbound_names
+                uid_conflict = reply_target_uid is not None and (
+                    current_reply_uid is not None and current_reply_uid != reply_target_uid
+                )
+                unbound_uid_conflict = reply_target_uid is None and current_reply_uid is not None
+                if binding_conflict or name_conflict or uid_conflict or unbound_uid_conflict:
+                    _append_api_field_conflict(source, observation, value)
+                    sources[field_name] = source
+                    if binding_conflict:
+                        missing[field_name] = "api_reply_target_uid_conflicts_with_verified_name_binding"
+                    elif name_conflict:
+                        missing[field_name] = "api_reply_target_uid_unlinked_from_display_name"
+                    elif unbound_uid_conflict:
+                        missing[field_name] = "api_reply_target_uid_missing_for_known_canonical_uid"
+                    else:
+                        missing[field_name] = "api_reply_target_uid_conflict"
+                    _record_reply_target_candidate(current, observation, "uid_or_name_binding_conflict")
+                    changed = True
+                    continue
+                display_only_reply_target = reply_target_uid is None
+                _record_reply_target_candidate(
+                    current,
+                    observation,
+                    "display_name_only" if display_only_reply_target else "uid_match",
+                )
+                changed = True
+                if reply_target_uid is not None and current_reply_uid is None:
+                    current.reply_to_user_id = reply_target_uid
+                    missing.pop("reply_to_user_id", None)
+                current.reply_target_source = (
+                    "api_preview_reply_prefix_type4_display_only"
+                    if display_only_reply_target
+                    else "api_preview_reply_prefix_type4_mention"
+                )
+                current.reply_target_confidence = (
+                    "display_name_only"
+                    if display_only_reply_target
+                    else "explicit_leading_reply_prefix_and_type4_uid"
+                )
+                current.reply_resolution_note = (
+                    "Target name came from the exact leading reply prefix and type-4 mention; its UID was unavailable."
+                    if display_only_reply_target
+                    else "Target name and UID came from the exact leading reply prefix and type-4 mention."
+                )
+                if reply_target_uid is not None:
+                    uid_source = dict(sources.get("reply_to_user_id") or {})
+                    uid_field_source = dict(_api_field_source(observation, reply_target_uid))
+                    uid_field_source["source_path"] = "api.comments_preview.reply_target.user_id"
+                    uid_field_source["confidence"] = "explicit_leading_reply_prefix_and_type4_uid"
+                    uid_source["verified_content_api"] = uid_field_source
+                    sources["reply_to_user_id"] = uid_source
             web_value = source.get("verified_web")
             if isinstance(web_value, dict):
                 if current_value != value:
                     _append_api_field_conflict(source, observation, value)
-                    sources[field_name] = source
                     changed = True
+                elif field_name == "reply_to_display_name":
+                    content_api_source = _api_field_source(observation, value)
+                    content_api_source["confidence"] = (
+                        "display_name_only"
+                        if display_only_reply_target
+                        else "explicit_leading_reply_prefix_and_type4_uid"
+                    )
+                    content_api_source["reply_target_user_id"] = reply_target_uid
+                    source["verified_content_api"] = content_api_source
+                    changed = True
+                if changed:
+                    sources[field_name] = source
                 continue
             if not _comment_preview_value_is_unknown(field_name, current_value, missing):
                 if current_value != value:
                     _append_api_field_conflict(source, observation, value)
                 else:
-                    source["verified_content_api"] = _api_field_source(observation, value)
+                    content_api_source = _api_field_source(observation, value)
+                    if field_name == "reply_to_display_name":
+                        content_api_source["confidence"] = (
+                            "display_name_only"
+                            if display_only_reply_target
+                            else "explicit_leading_reply_prefix_and_type4_uid"
+                        )
+                        content_api_source["reply_target_user_id"] = reply_target_uid
+                    source["verified_content_api"] = content_api_source
                 sources[field_name] = source
                 changed = True
                 missing.pop(field_name, None)
                 continue
 
             setattr(current, field_name, value)
-            source["verified_content_api"] = _api_field_source(observation, value)
+            content_api_source = _api_field_source(observation, value)
+            if field_name == "reply_to_display_name":
+                content_api_source["confidence"] = (
+                    "display_name_only"
+                    if display_only_reply_target
+                    else "explicit_leading_reply_prefix_and_type4_uid"
+                )
+                content_api_source["reply_target_user_id"] = reply_target_uid
+            source["verified_content_api"] = content_api_source
             sources[field_name] = source
             missing.pop(field_name, None)
             if field_name == "ip_location_text":
@@ -361,6 +501,25 @@ async def _apply_latest_api_comment_observations(session: Any, comment_ids: set[
         if changed:
             current.field_sources_json = sources or None
             current.missing_reasons_json = missing
+
+
+def _record_reply_target_candidate(
+    current: ResearchComment,
+    observation: ResearchFieldObservation,
+    resolution: str,
+) -> None:
+    payload = dict(current.source_payload_json or {})
+    candidates = list(payload.get("reply_target_candidates") or [])
+    candidate = {
+        "source_path": observation.source_path,
+        "observed_at": _utc_datetime(observation.observed_at).isoformat(),
+        "raw": _jsonable(observation.raw_value_json),
+        "resolution": resolution,
+    }
+    if candidate not in candidates:
+        candidates.append(candidate)
+    payload["reply_target_candidates"] = candidates
+    current.source_payload_json = payload
 
 
 def _api_field_source(observation: ResearchFieldObservation, value: Any) -> dict[str, Any]:
@@ -388,9 +547,16 @@ def _append_api_field_conflict(source: dict[str, Any], observation: ResearchFiel
 
 
 def _comment_preview_value_is_known(field_name: str, value: Any) -> bool:
-    if field_name in {"author_user_name", "author_nickname", "author_portrait", "ip_location_text"}:
+    if field_name in {
+        "author_user_name",
+        "author_nickname",
+        "author_portrait",
+        "global_growth_icon_url",
+        "ip_location_text",
+        "reply_to_display_name",
+    }:
         return isinstance(value, str) and bool(value.strip())
-    if field_name in {"forum_level", "global_growth_level"}:
+    if field_name in {"forum_level", "global_growth_level", "reply_to_user_id"}:
         return isinstance(value, int) and not isinstance(value, bool) and value > 0
     return field_name == "is_bawu" and value is True
 
@@ -398,7 +564,7 @@ def _comment_preview_value_is_known(field_name: str, value: Any) -> bool:
 def _comment_preview_value_is_unknown(field_name: str, value: Any, missing: Any) -> bool:
     if value is None or (isinstance(value, str) and not value.strip()):
         return True
-    if field_name in {"forum_level", "global_growth_level"}:
+    if field_name in {"forum_level", "global_growth_level", "reply_to_user_id"}:
         return isinstance(value, int) and not isinstance(value, bool) and value <= 0
     if field_name == "is_bawu":
         return value is False
@@ -472,6 +638,7 @@ def _records_from_threads_page(page: ResearchPage) -> ResearchRecords:
             author_tieba_uid=_safe_tieba_uid(getattr(user, "tieba_uid", None), "author_tieba_uid", missing),
             forum_level=_protobuf_int_field(getattr(user, "level", None), "forum_level", missing),
             global_growth_level=_protobuf_int_field(getattr(user, "glevel", None), "global_growth_level", missing),
+            global_growth_icon_url=_optional_text(getattr(user, "global_growth_icon_url", None)),
             is_bawu=_content_is_bawu(getattr(user, "is_bawu", None), missing),
             author_icons=_jsonable(getattr(user, "icons", None)),
             role_type=None,
@@ -510,9 +677,48 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
     response = page.raw
     raw_thread = getattr(response, "thread", None)
     thread_tid = _positive_id(getattr(raw_thread, "tid", None))
-    first_pid = _positive_id(getattr(raw_thread, "pid", None))
+    raw_thread_fid = _positive_id(getattr(raw_thread, "fid", None))
+    forum_fid = _positive_id(getattr(getattr(response, "forum", None), "fid", None))
+    if raw_thread_fid is not None and forum_fid is not None and raw_thread_fid != forum_fid:
+        raise ValueError("get_posts thread TID/FID does not match its response forum.")
+    thread_fid = raw_thread_fid or forum_fid
+    first_pid = None
+    first_post = None
     page_posts = tuple(getattr(response, "objs", ()) or ())
     if thread_tid is not None:
+        floor_one_posts = [post for post in page_posts if _is_floor_one_post(post)]
+        first_post_candidates = []
+        for post in floor_one_posts:
+            raw_post_tid = _positive_id(getattr(post, "tid", None))
+            raw_post_fid = _positive_id(getattr(post, "fid", None))
+            if (raw_post_tid is not None and raw_post_tid != thread_tid) or (
+                raw_post_fid is not None and thread_fid is not None and raw_post_fid != thread_fid
+            ):
+                raise ValueError("get_posts floor=1 post TID/FID does not match its thread.")
+            post_tid = raw_post_tid or thread_tid
+            post_fid = raw_post_fid or thread_fid
+            if post_tid == thread_tid and thread_fid is not None and post_fid == thread_fid:
+                first_post_candidates.append(post)
+
+        candidate_pids = {_positive_id(getattr(post, "pid", None)) for post in first_post_candidates}
+        if None in candidate_pids:
+            raise ValueError("get_posts floor=1 post is missing a valid pid.")
+        if len(candidate_pids) > 1:
+            raise ValueError("get_posts page contains multiple floor=1 post IDs for one thread.")
+
+        if first_post_candidates:
+            first_post = first_post_candidates[0]
+            raw_user = getattr(raw_thread, "user", None)
+            thread_author_id = _author_user_id(raw_thread, raw_user)
+            for candidate in first_post_candidates:
+                post_author_id = _author_user_id(candidate, getattr(candidate, "user", None))
+                if (
+                    thread_author_id is not None
+                    and post_author_id is not None
+                    and thread_author_id != post_author_id
+                ):
+                    raise ValueError("get_posts floor=1 post author does not match its thread author.")
+
         is_share = bool(getattr(raw_thread, "is_share", False))
         thread_contents = getattr(raw_thread, "contents", None)
         thread_fragments = _content_fragments(thread_contents)
@@ -522,40 +728,16 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
             missing.setdefault(field_name, "not_exposed_by_get_posts_author")
         missing["role_badge_id"] = "icon_semantics_unverified"
         missing["role_badge_url"] = "not_exposed_by_get_posts_author"
-        if _positive_id(getattr(raw_thread, "fid", None)) is None:
+        if thread_fid is None:
             missing["fid"] = "aiotieba_zero_sentinel"
 
-        raw_first_pid = _positive_id(getattr(raw_thread, "pid", None))
-        first_post = next(
-            (
-                post
-                for post in page_posts
-                if _positive_id(getattr(post, "pid", None)) == raw_first_pid
-                and _positive_id(getattr(post, "tid", None)) in (None, thread_tid)
-            ),
-            None,
-        )
-        if first_post is None:
-            first_post = next(
-                (
-                    post
-                    for post in page_posts
-                    if getattr(post, "floor", None) == 1
-                    and _positive_id(getattr(post, "tid", None)) in (None, thread_tid)
-                ),
-                None,
-            )
         first_post_pid = _positive_id(getattr(first_post, "pid", None)) if first_post is not None else None
-        first_pid = raw_first_pid or first_post_pid
-        if first_pid is None:
-            missing["first_pid"] = "aiotieba_zero_sentinel"
-        else:
-            missing.pop("first_pid", None)
+        first_pid = first_post_pid
 
         # Thread_p is returned on every page, but an empty parsed Contents object
         # does not prove that the first post itself was observed on this page.
-        # Only a matching Post object (or explicit floor 1 Post) makes its body
-        # and media authoritative for replacement.
+        # Only a uniquely matched floor 1 Post makes its body and media
+        # authoritative for replacement.
         if first_post is not None:
             first_contents = getattr(first_post, "contents", None)
             if _has_content_data(first_contents):
@@ -599,7 +781,7 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
             thread_row = ResearchThread(
                 tid=thread_tid,
                 first_pid=first_pid,
-                fid=_positive_id(getattr(raw_thread, "fid", None)),
+                fid=thread_fid,
                 fname=_optional_text(getattr(raw_thread, "fname", None)),
                 title=_optional_text(getattr(raw_thread, "title", None)),
                 body_text=None if body_missing else _content_text(contents),
@@ -617,6 +799,7 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
                 global_growth_level=_protobuf_int_field(
                     getattr(raw_user, "glevel", None), "global_growth_level", missing
                 ),
+                global_growth_icon_url=_optional_text(getattr(raw_user, "global_growth_icon_url", None)),
                 is_bawu=_content_is_bawu(getattr(raw_user, "is_bawu", None), missing),
                 author_icons=_jsonable(getattr(raw_user, "icons", None)),
                 forum_level_name=None,
@@ -657,27 +840,33 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
                 )
             )
             records.media_assets.extend(_media_rows("thread", thread_tid, thread_tid, fragments, page))
-
-        _append_user_observations(
-            records,
-            raw_user,
-            _positive_id(getattr(raw_thread, "fid", None)),
-            _optional_text(getattr(raw_thread, "fname", None)),
-            page,
-            record=raw_thread,
-        )
+            _append_user_observations(
+                records,
+                raw_user,
+                thread_fid,
+                _optional_text(getattr(raw_thread, "fname", None)),
+                page,
+                record=raw_thread,
+            )
 
     thread_author_id = _author_user_id(raw_thread, getattr(raw_thread, "user", None))
     seen_preview_comments: dict[int, tuple[tuple[int, int, int, int], dict[str, Any]]] = {}
     if thread_tid is not None:
         for post in page_posts:
-            _append_comment_preview_observations(records, page, raw_thread, post, seen_preview_comments)
+            _append_comment_preview_observations(
+                records,
+                page,
+                raw_thread,
+                post,
+                seen_preview_comments,
+                thread_fid_override=thread_fid,
+            )
 
     for post in page_posts:
         pid = _positive_id(getattr(post, "pid", None))
         if pid is None:
             raise ValueError("get_posts response contains a post without a valid pid.")
-        if pid == first_pid or getattr(post, "floor", None) == 1:
+        if first_post is not None and pid == first_pid and _is_floor_one_post(post):
             continue
 
         user = getattr(post, "user", None)
@@ -686,7 +875,7 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
             raise ValueError("get_posts response contains a post without a valid tid.")
         contents = getattr(post, "contents", None)
         fragments = _content_fragments(contents)
-        post_fid = _positive_id(getattr(post, "fid", None)) or _positive_id(getattr(raw_thread, "fid", None))
+        post_fid = _positive_id(getattr(post, "fid", None)) or thread_fid
         post_fname = _optional_text(getattr(post, "fname", None)) or _optional_text(getattr(raw_thread, "fname", None))
         missing = _missing_user_reasons(user, page.source_api, record=post)
         records.posts.append(
@@ -710,6 +899,7 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
                 thread_author_user_id=thread_author_id,
                 forum_level=_protobuf_int_field(getattr(user, "level", None), "forum_level", missing),
                 global_growth_level=_protobuf_int_field(getattr(user, "glevel", None), "global_growth_level", missing),
+                global_growth_icon_url=_optional_text(getattr(user, "global_growth_icon_url", None)),
                 is_bawu=_content_is_bawu(getattr(user, "is_bawu", None), missing),
                 author_icons=_jsonable(getattr(user, "icons", None)),
                 forum_level_name=None,
@@ -754,13 +944,15 @@ def _append_comment_preview_observations(
     thread: Any,
     post: Any,
     seen: dict[int, tuple[tuple[int, int, int, int], dict[str, Any]]],
+    *,
+    thread_fid_override: int | None = None,
 ) -> None:
     comments = getattr(post, "comments", ()) or ()
     if not comments:
         return
 
     tid = _positive_id(getattr(thread, "tid", None))
-    thread_fid = _positive_id(getattr(thread, "fid", None))
+    thread_fid = _positive_id(getattr(thread, "fid", None)) or thread_fid_override
     parent_pid = _positive_id(getattr(post, "pid", None))
     post_tid = _positive_id(getattr(post, "tid", None))
     post_fid = _positive_id(getattr(post, "fid", None))
@@ -789,28 +981,47 @@ def _append_comment_preview_observations(
             "author_portrait": getattr(user, "portrait", None),
             "forum_level": getattr(user, "level", None),
             "global_growth_level": getattr(user, "glevel", None),
+            "global_growth_icon_url": getattr(user, "global_growth_icon_url", None),
             "is_bawu": getattr(user, "is_bawu", None),
             "ip_location_text": getattr(user, "ip", None),
         }
+        reply_target = _reply_target_candidate(comment)
         values = {
             "author_user_name": _identity_text(raw_values["author_user_name"]),
             "author_nickname": _identity_text(raw_values["author_nickname"]),
             "author_portrait": _identity_text(raw_values["author_portrait"]),
             "forum_level": _positive_metadata_int(raw_values["forum_level"]),
             "global_growth_level": _positive_metadata_int(raw_values["global_growth_level"]),
+            "global_growth_icon_url": _optional_text(raw_values["global_growth_icon_url"]),
             "is_bawu": raw_values["is_bawu"] is True,
             "ip_location_text": _ip_location_text(user),
         }
+        raw_reply_to_id = _positive_id(getattr(comment, "reply_to_id", None))
+        reply_conflict_reason = None
+        if reply_target is not None:
+            if reply_target["display_name"] is None:
+                reply_conflict_reason = "reply_target_missing_display_name"
+            elif reply_target["user_id"] is None:
+                raw_values["reply_to_display_name"] = reply_target["raw"]
+                values["reply_to_display_name"] = reply_target["display_name"]
+            elif raw_reply_to_id is not None and raw_reply_to_id != reply_target["user_id"]:
+                reply_conflict_reason = "reply_target_uid_conflicts_with_aiotieba_reply_to_id"
+            else:
+                raw_values["reply_to_display_name"] = reply_target["raw"]
+                values["reply_to_display_name"] = reply_target["display_name"]
+        signature_values = dict(values)
+        if reply_target is not None:
+            signature_values["_reply_target_user_id"] = reply_target["user_id"]
         values = {field_name: value for field_name, value in values.items() if value is not None and value is not False}
 
         previous = seen.get(cid)
         if previous is not None:
             if previous[0] != identity:
                 raise ValueError("Repeated get_posts preview CID has conflicting identity tuples.")
-            if previous[1] != values:
+            if previous[1] != signature_values:
                 raise ValueError("Repeated get_posts preview CID has conflicting metadata values.")
             continue
-        seen[cid] = (identity, values)
+        seen[cid] = (identity, signature_values)
         records.api_preview_comment_identities.append((cid, tid, parent_pid, thread_fid, record_author_id))
 
         identity_evidence = {
@@ -827,10 +1038,14 @@ def _append_comment_preview_observations(
                 "user_user_id": user_author_id,
             },
         }
+        if reply_target is not None:
+            identity_evidence["reply_target"] = reply_target["raw"]
         for field_name, value in values.items():
             source_path = f"api.comments_preview.author.{field_name}"
             if field_name == "ip_location_text":
                 source_path = "api.comments_preview.author.ip"
+            elif field_name == "reply_to_display_name":
+                source_path = "api.comments_preview.reply_target.display_name"
             raw_value = _jsonable(raw_values[field_name])
             evidence_key = {
                 "target_type": "comment",
@@ -877,6 +1092,53 @@ def _append_comment_preview_observations(
                     applied_at=None,
                 )
             )
+        if reply_target is not None and reply_conflict_reason is not None:
+            source_path = "api.comments_preview.reply_target.display_name"
+            evidence_key = {
+                "target_type": "comment",
+                "target_id": cid,
+                "tid": tid,
+                "parent_post_pid": parent_pid,
+                "author_user_id": record_author_id,
+                "fid": thread_fid,
+                "field_name": "reply_to_display_name",
+                "raw_value": reply_target["raw"],
+                "normalized_value": None,
+                "source_path": source_path,
+                "observed_at": page.observed_at.isoformat(),
+            }
+            encoded = json.dumps(evidence_key, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            records.api_field_observations.append(
+                ResearchFieldObservation(
+                    observation_id=str(uuid4()),
+                    observation_key=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                    task_key=None,
+                    run_id=None,
+                    target_type="comment",
+                    target_id=cid,
+                    tid=tid,
+                    pid=None,
+                    cid=cid,
+                    parent_post_pid=parent_pid,
+                    author_user_id=record_author_id,
+                    fid=thread_fid,
+                    field_name="reply_to_display_name",
+                    raw_value_json=reply_target["raw"],
+                    normalized_value_json=None,
+                    source_url=None,
+                    source_path=source_path,
+                    source_kind="api_raw",
+                    observed_at=page.observed_at,
+                    temporal_scope="api_observation_time_not_publication_time",
+                    parser_version="aiotieba-parsed-response-v1",
+                    identity_evidence_json=identity_evidence,
+                    validation_status="conflict",
+                    applied_status="observed_only",
+                    missing_reason=reply_conflict_reason,
+                    created_at=page.observed_at,
+                    applied_at=None,
+                )
+            )
 
 
 def _records_from_comments_page(page: ResearchPage) -> ResearchRecords:
@@ -903,6 +1165,90 @@ def _records_from_comments_page(page: ResearchPage) -> ResearchRecords:
             missing["parent_post_pid"] = "aiotieba_zero_sentinel"
         contents = getattr(comment, "contents", None)
         fragments = _content_fragments(contents)
+        reply_target = _reply_target_candidate(comment)
+        reply_to_display_name = None
+        reply_source = None
+        reply_confidence = None
+        reply_note = None
+        comment_field_sources: dict[str, Any] = {}
+        source_payload = _comment_payload(comment, user)
+        if reply_target is None:
+            missing["reply_to_display_name"] = (
+                "aiotieba_parser_removed_reply_prefix_fragments"
+                if reply_to_user_id is not None
+                else "no_explicit_reply_target"
+            )
+            reply_note = (
+                "aiotieba 4.8.2 exposes reply_to_id but removes the leading reply and type-4 mention fragments."
+                if reply_to_user_id is not None
+                else "No explicit leading reply prefix and type-4 mention were observed."
+            )
+        else:
+            source_payload["reply_target_evidence"] = {
+                "source_path": "api.get_comments.reply_prefix.type4_mention",
+                "observed_at": page.observed_at.isoformat(),
+                "raw": reply_target["raw"],
+            }
+            if reply_target["display_name"] is None:
+                missing["reply_to_display_name"] = "reply_target_missing_display_name"
+                reply_note = "A leading type-4 mention did not contain a usable display name."
+            elif reply_target["user_id"] is None and reply_to_user_id is not None:
+                missing["reply_to_display_name"] = "reply_target_uid_missing_for_known_reply_to_user_id"
+                reply_note = "A leading type-4 mention had no UID while reply_to_id was already known."
+            elif reply_target["user_id"] is None:
+                reply_to_display_name = reply_target["display_name"]
+                missing.pop("reply_to_display_name", None)
+                reply_source = "api_raw_reply_prefix_type4_display_only"
+                reply_confidence = "display_name_only"
+                reply_note = (
+                    "Target name came from the exact leading reply prefix and type-4 mention; its UID was unavailable."
+                )
+                comment_field_sources["reply_to_display_name"] = {
+                    "verified_content_api": {
+                        "source_kind": "api_raw",
+                        "source_path": "api.get_comments.reply_prefix.type4_mention",
+                        "observed_at": page.observed_at.isoformat(),
+                        "temporal_scope": "api_observation_time_not_publication_time",
+                        "confidence": reply_confidence,
+                        "reply_target_user_id": None,
+                        "value": reply_to_display_name,
+                    }
+                }
+            elif reply_to_user_id is not None and reply_to_user_id != reply_target["user_id"]:
+                missing["reply_to_display_name"] = "reply_target_uid_conflicts_with_aiotieba_reply_to_id"
+                source_payload["reply_target_evidence"]["conflict"] = missing["reply_to_display_name"]
+                reply_note = "The leading type-4 mention UID conflicts with aiotieba reply_to_id."
+            else:
+                reply_to_user_id = reply_target["user_id"]
+                missing.pop("reply_to_user_id", None)
+                missing.pop("reply_to_display_name", None)
+                reply_to_display_name = reply_target["display_name"]
+                reply_source = "api_raw_reply_prefix_type4_mention"
+                reply_confidence = "explicit_leading_reply_prefix_and_type4_uid"
+                reply_note = "Target name and UID came from the exact leading reply prefix and type-4 mention."
+                source_path = "api.get_comments.reply_prefix.type4_mention"
+                source_observed_at = page.observed_at.isoformat()
+                comment_field_sources["reply_to_display_name"] = {
+                    "verified_content_api": {
+                        "source_kind": "api_raw",
+                        "source_path": source_path,
+                        "observed_at": source_observed_at,
+                        "temporal_scope": "api_observation_time_not_publication_time",
+                        "confidence": reply_confidence,
+                        "reply_target_user_id": reply_to_user_id,
+                        "value": reply_to_display_name,
+                    }
+                }
+                comment_field_sources["reply_to_user_id"] = {
+                    "verified_content_api": {
+                        "source_kind": "api_raw",
+                        "source_path": "api.get_comments.reply_prefix.type4_mention.uid",
+                        "observed_at": source_observed_at,
+                        "temporal_scope": "api_observation_time_not_publication_time",
+                        "confidence": reply_confidence,
+                        "value": reply_to_user_id,
+                    }
+                }
         comment_fid = _positive_id(getattr(comment, "fid", None)) or response_fid
         comment_fname = _optional_text(getattr(comment, "fname", None)) or response_fname
         records.comments.append(
@@ -926,6 +1272,7 @@ def _records_from_comments_page(page: ResearchPage) -> ResearchRecords:
                 author_tieba_uid=_safe_tieba_uid(getattr(user, "tieba_uid", None), "author_tieba_uid", missing),
                 forum_level=_protobuf_int_field(getattr(user, "level", None), "forum_level", missing),
                 global_growth_level=_protobuf_int_field(getattr(user, "glevel", None), "global_growth_level", missing),
+                global_growth_icon_url=_optional_text(getattr(user, "global_growth_icon_url", None)),
                 is_bawu=_content_is_bawu(getattr(user, "is_bawu", None), missing),
                 author_icons=_jsonable(getattr(user, "icons", None)),
                 forum_level_name=None,
@@ -937,22 +1284,21 @@ def _records_from_comments_page(page: ResearchPage) -> ResearchRecords:
                 ip_location_source=_ip_location_source(page, comment) if _ip_location_text(user) else None,
                 ip_location_observed_at=page.observed_at if _ip_location_text(user) else None,
                 reply_to_user_id=reply_to_user_id,
+                reply_to_display_name=reply_to_display_name,
                 reply_to_id_raw=raw_reply_to_id,
-                reply_target_source=("aiotieba_parsed_reply_prefix" if reply_to_user_id is not None else "unresolved"),
-                reply_target_confidence=("parsed_from_reply_prefix" if reply_to_user_id is not None else "unknown"),
-                reply_resolution_note=(
-                    "aiotieba 4.8.2 derives this user ID from a leading reply prefix and at-mention fragment; "
-                    "live direction has not been verified."
-                    if reply_to_user_id is not None
-                    else "aiotieba 4.8.2 uses zero when no reply target is parsed."
-                ),
+                reply_target_source=reply_source
+                or ("aiotieba_parsed_reply_prefix" if reply_to_user_id is not None else "unresolved"),
+                reply_target_confidence=reply_confidence
+                or ("parsed_from_reply_prefix" if reply_to_user_id is not None else "unknown"),
+                reply_resolution_note=reply_note,
                 agree_count=_count_value(getattr(comment, "agree", None), "agree_count", missing),
                 disagree_count=_count_value(getattr(comment, "disagree", None), "disagree_count", missing),
                 is_thread_author=_optional_bool(getattr(comment, "is_thread_author", None)),
                 source_api=page.source_api,
                 observed_at=page.observed_at,
-                source_payload_json=_comment_payload(comment, user),
+                source_payload_json=source_payload,
                 missing_reasons_json=missing,
+                field_sources_json=comment_field_sources or None,
             )
         )
         records.content_observations.append(
@@ -1482,11 +1828,119 @@ async def _upsert_content_rows(session: Any, model: type, rows: list[Any]) -> No
         incoming_values = _row_values(incoming)
         updates: dict[str, Any] = {}
         protected_fields: set[str] = set()
+        incoming_missing = dict(incoming.missing_reasons_json or {})
+        retained_reply_uid = (
+            _reply_uid_after_refresh(current, incoming, field_sources) if model is ResearchComment else None
+        )
+        reply_name_bindings, unbound_reply_names = (
+            _reply_name_provenance_state(field_sources) if model is ResearchComment else (set(), set())
+        )
+        reply_pair_conflict = False
         for column in model.__table__.columns:
             name = column.name
             if name in primary_key or name in {"field_sources_json", "missing_reasons_json"}:
                 continue
             value = incoming_values[name]
+            if model is ResearchComment and name == "reply_to_user_id" and _positive_id(value) is not None:
+                incoming_uid = _positive_id(value)
+                current_uid = _positive_id(current.reply_to_user_id)
+                mention_uid = _reply_target_uid_from_payload(incoming.source_payload_json)
+                incoming_name = _identity_text(incoming.reply_to_display_name)
+                binding_conflict = reply_name_bindings and reply_name_bindings != {incoming_uid}
+                unbound_pair_matches = (
+                    mention_uid == incoming_uid
+                    and incoming_name in unbound_reply_names
+                    and current_uid in (None, incoming_uid)
+                )
+                unbound_conflict = bool(unbound_reply_names) and not unbound_pair_matches
+                if binding_conflict or unbound_conflict:
+                    reason = (
+                        "api_reply_target_uid_conflicts_with_verified_name_binding"
+                        if binding_conflict
+                        else "api_reply_target_uid_unlinked_from_display_name"
+                    )
+                    _append_reply_uid_binding_conflict(
+                        field_sources,
+                        incoming,
+                        incoming_uid=incoming_uid,
+                        name_bindings=reply_name_bindings,
+                        reason=reason,
+                    )
+                    payload = dict(incoming.source_payload_json or {})
+                    candidates = list(payload.get("reply_target_candidates") or [])
+                    candidate = {
+                        "source_path": f"{incoming.source_api}.reply_to_id",
+                        "observed_at": _utc_datetime(incoming.observed_at).isoformat(),
+                        "raw": {
+                            "reply_to_user_id": incoming_uid,
+                            "reply_to_id_raw": incoming.reply_to_id_raw,
+                        },
+                        "resolution": reason,
+                    }
+                    if candidate not in candidates:
+                        candidates.append(candidate)
+                    payload["reply_target_candidates"] = candidates
+                    incoming.source_payload_json = payload
+                    incoming_values["source_payload_json"] = payload
+                    incoming_missing["reply_to_user_id"] = reason
+                    protected_fields.add(name)
+                    reply_pair_conflict = True
+                    continue
+            if model is ResearchComment and name == "reply_to_display_name" and _comment_preview_value_is_known(
+                name, value
+            ):
+                mention_uid = _reply_target_uid_from_payload(incoming.source_payload_json)
+                has_display_only_source = _reply_name_display_only_source(incoming.field_sources_json)
+                display_only_allowed = (
+                    has_display_only_source
+                    and retained_reply_uid is None
+                    and not reply_name_bindings
+                    and not unbound_reply_names
+                )
+                if not display_only_allowed and (mention_uid is None or mention_uid != retained_reply_uid):
+                    reason = (
+                        "api_reply_target_uid_conflict"
+                        if mention_uid is not None
+                        else "api_reply_target_uid_unverified"
+                    )
+                    _append_content_reply_target_conflict(
+                        field_sources,
+                        incoming,
+                        mention_uid=mention_uid,
+                        retained_uid=retained_reply_uid,
+                        reason=reason,
+                    )
+                    evidence = dict((incoming.source_payload_json or {}).get("reply_target_evidence") or {})
+                    evidence["conflict"] = reason
+                    incoming.source_payload_json = {
+                        **dict(incoming.source_payload_json or {}),
+                        "reply_target_evidence": evidence,
+                    }
+                    incoming_values["source_payload_json"] = incoming.source_payload_json
+                    incoming_missing["reply_to_display_name"] = reason
+                    protected_fields.add(name)
+                    reply_pair_conflict = True
+                    continue
+                if unbound_reply_names and value not in unbound_reply_names:
+                    reason = "api_reply_target_uid_unlinked_from_display_name"
+                    _append_content_reply_target_conflict(
+                        field_sources,
+                        incoming,
+                        mention_uid=mention_uid,
+                        retained_uid=retained_reply_uid,
+                        reason=reason,
+                    )
+                    incoming_missing["reply_to_display_name"] = reason
+                    protected_fields.add(name)
+                    reply_pair_conflict = True
+                    continue
+            if model is ResearchComment and reply_pair_conflict and name in {
+                "reply_target_source",
+                "reply_target_confidence",
+                "reply_resolution_note",
+            }:
+                protected_fields.add(name)
+                continue
             if _protect_verified_web_field(current, name, value, incoming, field_sources):
                 protected_fields.add(name)
                 continue
@@ -1505,10 +1959,42 @@ async def _upsert_content_rows(session: Any, model: type, rows: list[Any]) -> No
                 continue
             updates[name] = value
 
-        incoming_missing = dict(incoming.missing_reasons_json or {})
         for field_name in protected_fields:
             if _api_value_is_unknown(field_name, incoming_values.get(field_name), incoming_missing):
                 incoming_missing.pop(field_name, None)
+        if model is ResearchComment:
+            for field_name, incoming_source in (incoming.field_sources_json or {}).items():
+                verified_content_api = (
+                    incoming_source.get("verified_content_api") if isinstance(incoming_source, dict) else None
+                )
+                if not isinstance(verified_content_api, dict):
+                    continue
+                current_source = field_sources.get(field_name)
+                current_source = dict(current_source) if isinstance(current_source, dict) else {}
+                if field_name in protected_fields:
+                    if field_name == "reply_to_display_name" and current.reply_to_display_name == incoming_values.get(
+                        field_name
+                    ):
+                        mention_uid = _reply_target_uid_from_payload(incoming.source_payload_json)
+                        display_only = _reply_name_display_only_source(incoming.field_sources_json)
+                        pair_matches = (
+                            mention_uid == retained_reply_uid
+                            if mention_uid is not None
+                            else display_only and retained_reply_uid is None
+                        )
+                        if pair_matches:
+                            current_source["verified_content_api"] = verified_content_api
+                            field_sources[field_name] = current_source
+                    continue
+                if isinstance(current_source.get("verified_web"), dict):
+                    continue
+                if not _comment_preview_value_is_unknown(
+                    field_name,
+                    incoming_values.get(field_name),
+                    incoming_missing,
+                ):
+                    current_source["verified_content_api"] = verified_content_api
+                    field_sources[field_name] = current_source
         updates["missing_reasons_json"] = incoming_missing
         updates["field_sources_json"] = field_sources or None
         await session.execute(
@@ -1516,6 +2002,140 @@ async def _upsert_content_rows(session: Any, model: type, rows: list[Any]) -> No
             .where(model.__table__.c[pk_name] == getattr(incoming, pk_name))
             .values(**updates)
         )
+
+
+def _reply_target_uid_from_payload(source_payload: Any) -> int | None:
+    if not isinstance(source_payload, Mapping):
+        return None
+    evidence = source_payload.get("reply_target_evidence")
+    if not isinstance(evidence, Mapping):
+        return None
+    raw = evidence.get("raw")
+    if not isinstance(raw, Mapping):
+        return None
+    return _positive_id(raw.get("reply_to_user_id"))
+
+
+def _reply_uid_after_refresh(
+    current: ResearchComment,
+    incoming: ResearchComment,
+    field_sources: Mapping[str, Any],
+) -> int | None:
+    current_uid = _positive_id(current.reply_to_user_id)
+    incoming_uid = _positive_id(incoming.reply_to_user_id)
+    source = field_sources.get("reply_to_user_id")
+    if current_uid is not None and isinstance(source, Mapping) and (
+        isinstance(source.get("verified_web"), Mapping)
+        or isinstance(source.get("verified_content_api"), Mapping)
+    ):
+        return current_uid
+    name_bindings = _reply_name_binding_uids(field_sources)
+    if current_uid is None and len(name_bindings) == 1:
+        return next(iter(name_bindings))
+    if current_uid is None and name_bindings:
+        return None
+    _, unbound_names = _reply_name_provenance_state(field_sources)
+    if current_uid is None and unbound_names:
+        incoming_name = _identity_text(incoming.reply_to_display_name)
+        candidate_uid = _reply_target_uid_from_payload(incoming.source_payload_json)
+        if candidate_uid is not None and incoming_uid == candidate_uid and incoming_name in unbound_names:
+            return candidate_uid
+        return None
+    return incoming_uid or current_uid
+
+
+def _reply_name_binding_uids(field_sources: Mapping[str, Any]) -> set[int]:
+    bindings, _ = _reply_name_provenance_state(field_sources)
+    return bindings
+
+
+def _reply_name_provenance_state(field_sources: Mapping[str, Any]) -> tuple[set[int], set[str]]:
+    source = field_sources.get("reply_to_display_name")
+    if not isinstance(source, Mapping):
+        return set(), set()
+    bindings = set()
+    unbound_names = set()
+    for provenance_key in ("verified_web", "verified_content_api"):
+        provenance = source.get(provenance_key)
+        if isinstance(provenance, Mapping):
+            display_name = _identity_text(provenance.get("value"))
+            uid = _positive_id(provenance.get("reply_target_user_id"))
+            if uid is not None:
+                bindings.add(uid)
+            elif display_name is not None:
+                unbound_names.add(display_name)
+    return bindings, unbound_names
+
+
+def _reply_name_display_only_source(field_sources: Mapping[str, Any] | None) -> bool:
+    source = (field_sources or {}).get("reply_to_display_name")
+    if not isinstance(source, Mapping):
+        return False
+    for provenance_key in ("verified_web", "verified_content_api"):
+        provenance = source.get(provenance_key)
+        if (
+            isinstance(provenance, Mapping)
+            and provenance.get("confidence") == "display_name_only"
+            and provenance.get("reply_target_user_id") is None
+        ):
+            return True
+    return False
+
+
+def _append_reply_uid_binding_conflict(
+    field_sources: dict[str, Any],
+    incoming: ResearchComment,
+    *,
+    incoming_uid: int,
+    name_bindings: set[int],
+    reason: str,
+) -> None:
+    source = field_sources.get("reply_to_user_id")
+    source = dict(source) if isinstance(source, dict) else {}
+    conflicts = list(source.get("api_conflicts") or [])
+    conflict = {
+        "source_api": incoming.source_api,
+        "observed_at": _utc_datetime(incoming.observed_at).isoformat(),
+        "value": incoming_uid,
+        "reply_target_user_id_bindings": sorted(name_bindings),
+        "reason": reason,
+    }
+    if conflict not in conflicts:
+        conflicts.append(conflict)
+    source["api_conflicts"] = conflicts
+    field_sources["reply_to_user_id"] = source
+
+
+def _append_content_reply_target_conflict(
+    field_sources: dict[str, Any],
+    incoming: ResearchComment,
+    *,
+    mention_uid: int | None,
+    retained_uid: int | None,
+    reason: str,
+) -> None:
+    source = field_sources.get("reply_to_display_name")
+    source = dict(source) if isinstance(source, dict) else {}
+    conflicts = list(source.get("api_conflicts") or [])
+    incoming_source = (incoming.field_sources_json or {}).get("reply_to_display_name")
+    incoming_verified = incoming_source.get("verified_content_api") if isinstance(incoming_source, dict) else None
+    conflict = {
+        "source_kind": "api_raw",
+        "source_path": (
+            incoming_verified.get("source_path")
+            if isinstance(incoming_verified, dict)
+            else "api.get_comments.reply_prefix.type4_mention"
+        ),
+        "observed_at": _utc_datetime(incoming.observed_at).isoformat(),
+        "value": _jsonable(incoming.reply_to_display_name),
+        "mention_user_id": mention_uid,
+        "retained_reply_to_user_id": retained_uid,
+        "reason": reason,
+    }
+    if conflict not in conflicts:
+        conflicts.append(conflict)
+    source["api_conflicts"] = conflicts
+    field_sources["reply_to_display_name"] = source
 
 
 def _protect_verified_content_api_field(
@@ -2169,6 +2789,7 @@ def _user_payload(user: Any) -> dict[str, Any] | None:
         "nick_name_old",
         "level",
         "glevel",
+        "global_growth_icon_url",
         "is_bawu",
         "icons",
     )
@@ -2253,6 +2874,10 @@ def _missing_user_reasons(user: Any, source_api: str, *, record: Any = None) -> 
             reasons[field_name] = "not_returned_by_source"
     if not hasattr(user, "glevel"):
         reasons["global_growth_level"] = "not_exposed_by_source"
+    if not hasattr(user, "global_growth_icon_url"):
+        reasons["global_growth_icon_url"] = "not_exposed_by_aiotieba_parsed_content"
+    elif _identity_text(getattr(user, "global_growth_icon_url", None)) is None:
+        reasons["global_growth_icon_url"] = "not_returned_by_source"
     if _ip_location_text(user) is None:
         raw_ip_value = _optional_text(getattr(user, "ip", None))
         if raw_ip_value and _is_ip_address(raw_ip_value):
@@ -2371,6 +2996,63 @@ def _content_fragments(contents: Any) -> list[Any]:
     return list(fragments or [])
 
 
+def _reply_target_candidate(comment: Any) -> dict[str, Any] | None:
+    raw_content = getattr(comment, "content", None)
+    if isinstance(raw_content, Mapping):
+        raw_content = raw_content.get("content", raw_content.get("objs"))
+    if raw_content is None:
+        contents = getattr(comment, "contents", None)
+        if isinstance(contents, Mapping):
+            raw_content = contents.get("content", contents.get("objs"))
+            fragments = list(raw_content or ())
+        else:
+            fragments = _content_fragments(contents)
+    elif isinstance(raw_content, (str, bytes)):
+        fragments = []
+    else:
+        fragments = list(getattr(raw_content, "objs", raw_content) or ())
+    if len(fragments) < 2:
+        return None
+
+    prefix, mention = fragments[:2]
+    prefix_text = prefix.get("text") if isinstance(prefix, Mapping) else getattr(prefix, "text", None)
+    prefix_type = prefix.get("type") if isinstance(prefix, Mapping) else getattr(prefix, "type", None)
+    prefix_type = _int_value(prefix_type)
+    if prefix_text != "回复 " or not (
+        prefix_type == 0 if prefix_type is not None else type(prefix).__name__.startswith("FragText")
+    ):
+        return None
+
+    mention_type = mention.get("type") if isinstance(mention, Mapping) else getattr(mention, "type", None)
+    mention_type = _int_value(mention_type)
+    is_type4_mention = (
+        mention_type == 4 if mention_type is not None else type(mention).__name__.startswith("FragAt")
+    )
+    if not is_type4_mention:
+        return None
+
+    mention_text = mention.get("text") if isinstance(mention, Mapping) else getattr(mention, "text", None)
+    mention_user_id = (
+        mention.get("uid", mention.get("user_id"))
+        if isinstance(mention, Mapping)
+        else getattr(mention, "user_id", getattr(mention, "uid", None))
+    )
+    display_name = _identity_text(mention_text)
+    if display_name is not None:
+        display_name = display_name.removeprefix("@")
+        display_name = _identity_text(display_name)
+    user_id = _positive_id(mention_user_id)
+    return {
+        "display_name": display_name,
+        "user_id": user_id,
+        "raw": {
+            "prefix": _jsonable(prefix),
+            "mention": _jsonable(mention),
+            "reply_to_user_id": user_id,
+        },
+    }
+
+
 def _content_text(contents: Any) -> str | None:
     if contents is None:
         return None
@@ -2436,6 +3118,11 @@ def _protobuf_int_field(value: Any, field_name: str, missing: dict[str, str]) ->
 def _positive_id(value: Any) -> int | None:
     integer = _int_value(value)
     return integer if integer is not None and integer > 0 else None
+
+
+def _is_floor_one_post(post: Any) -> bool:
+    floor = getattr(post, "floor", None)
+    return not isinstance(floor, bool) and _int_value(floor) == 1
 
 
 def _positive_metadata_int(value: Any) -> int | None:

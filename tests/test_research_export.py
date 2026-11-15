@@ -31,6 +31,7 @@ from src.research.models import (
     RESEARCH_TABLES,
     MediaAsset,
     ResearchComment,
+    ResearchContentObservation,
     ResearchPost,
     ResearchThread,
     ResearchUser,
@@ -109,9 +110,14 @@ def make_base_thread(tid: int, created_at: datetime):
 
 
 def read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
-    with path.open(encoding="utf-8-sig", newline="") as file:
-        reader = csv.DictReader(file)
-        return list(reader.fieldnames or []), list(reader)
+    field_limit = csv.field_size_limit()
+    try:
+        csv.field_size_limit(2**31 - 1)
+        with path.open(encoding="utf-8-sig", newline="") as file:
+            reader = csv.DictReader(file)
+            return list(reader.fieldnames or []), list(reader)
+    finally:
+        csv.field_size_limit(field_limit)
 
 
 @pytest.mark.asyncio
@@ -128,7 +134,8 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
     legacy_comment_cid = 654321098765432110
     research_only_comment_cid = 654321098765432111
     now = datetime(2025, 5, 6, 7, 8, 9, tzinfo=UTC)
-    long_text = '第一行，含逗号和"引号"\n第二行中文；不截断。'
+    body_fragments = ('第一段，含逗号和"引号"\n', "长正文片段。" * 35_000, "\n最后一段中文；不截断。")
+    long_text = "".join(body_fragments)
 
     engine = create_engine("sqlite:///:memory:")
     base_tables = [BaseUser.__table__, BaseThread.__table__, BasePost.__table__, BaseComment.__table__]
@@ -141,11 +148,23 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
             tid=research_tid,
             create_time=now,
             title="base title",
-            text="base first-post text",
+            text="get_threads list preview",
             contents=None,
             last_time=now,
             reply_num=0,
             author_level=2,
+            fid=7,
+            author_id=large_user_id,
+        ),
+        BasePost(
+            pid=first_pid,
+            create_time=now,
+            text='legacy full detail, with "quotes"\nand newline',
+            contents=None,
+            floor=1,
+            reply_num=0,
+            author_level=2,
+            tid=research_tid,
             fid=7,
             author_id=large_user_id,
         ),
@@ -203,23 +222,35 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
             fid=7,
             fname="测试吧",
             title="研究标题",
-            body_text=long_text,
-            contents_raw=[{"type": "text", "text": long_text}],
+            body_text=None,
+            contents_raw=None,
             create_time=now,
             author_user_id=large_user_id,
             author_user_name="research-user",
             author_nickname="研究昵称",
+            global_growth_icon_url="https://example.test/growth.png",
+            author_icons=["legacy-badge"],
+            role_name="历史吧务",
             reply_count=None,
+            agree_count=11,
+            disagree_count=3,
+            collect_count=4,
+            view_count=8,
+            share_count=2,
             source_api="aiotieba.get_posts",
             observed_at=now,
-            source_payload_json={"reply_num": 0},
-            missing_reasons_json={"reply_count": "zero_presence_unverified_in_parsed_object"},
+            source_payload_json={"reply_num": 0, "role_name": "历史吧务", "author_icons": ["legacy-badge"]},
+            missing_reasons_json={
+                "body_text": "floor1_post_not_returned_by_get_posts_objs",
+                "reply_count": "zero_presence_unverified_in_parsed_object",
+            },
         ),
         ResearchThread(
             tid=research_only_tid,
             first_pid=research_only_pid,
             title="extension only",
-            body_text="extension-only body",
+            body_text=long_text,
+            contents_raw=[{"type": "text", "text": fragment} for fragment in body_fragments],
             source_api="aiotieba.get_posts",
             observed_at=now,
             source_payload_json={},
@@ -235,7 +266,11 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
             author_user_name="research-user",
             author_nickname="研究昵称",
             forum_level=3,
-            subreply_count_reported=None,
+            global_growth_icon_url="https://example.test/growth.png",
+            role_name="历史吧务",
+            agree_count=9,
+            disagree_count=4,
+            subreply_count_reported=6,
             source_api="aiotieba.get_posts",
             observed_at=now,
             source_payload_json={"reply_num": 0},
@@ -259,8 +294,12 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
             text="comment to exact user",
             author_user_id=123456789012345678,
             reply_to_user_id=large_user_id,
+            reply_to_display_name="合成回复对象",
             reply_to_id_raw=large_user_id,
             reply_target_source="explicit_api_user_id",
+            global_growth_icon_url="https://example.test/growth.png",
+            agree_count=7,
+            disagree_count=2,
             source_api="aiotieba.get_comments",
             observed_at=now,
             source_payload_json={},
@@ -314,7 +353,7 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
             forum_level_name="初级会员",
             role_name="吧务",
             status="available",
-            source_payload_json={"level": 0},
+            source_payload_json={"level": 0, "role_name": "吧务", "icons": ["legacy-badge"]},
             missing_reasons_json={},
         ),
         UserForumSnapshot(
@@ -427,6 +466,7 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
     media_headers, media = read_csv(paths["media_assets"])
     thread_scope_headers, thread_scope_rows = read_csv(paths["thread_scope_quality_report"])
     quality_headers, quality = read_csv(paths["crawl_quality_report"])
+    _field_quality_headers, field_quality = read_csv(paths["field_quality_report"])
 
     assert thread_headers == list(THREAD_FIELDS)
     assert post_headers == list(POST_FIELDS)
@@ -436,6 +476,28 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
     assert media_headers == list(MEDIA_ASSET_FIELDS)
     assert thread_scope_headers == list(THREAD_SCOPE_QUALITY_FIELDS)
     assert quality_headers == list(CRAWL_QUALITY_FIELDS)
+    assert "global_growth_icon_url" in thread_headers
+    assert "global_growth_icon_url" in post_headers
+    assert {"global_growth_icon_url", "reply_to_display_name"}.issubset(comment_headers)
+    assert "view_count" in thread_headers
+    removed_main_fields = {
+        "author_icons",
+        "role_type",
+        "role_name",
+        "role_badge_id",
+        "role_badge_url",
+        "disagree_count",
+        "share_count",
+        "post_url",
+        "post_url_validation_status",
+        "parent_post_url",
+        "parent_post_url_validation_status",
+        "comment_url",
+        "comment_url_validation_status",
+        "subreply_count_reported",
+    }
+    for fields in (thread_headers, post_headers, comment_headers, snapshot_headers):
+        assert removed_main_fields.isdisjoint(fields)
     assert (
         len(threads),
         len(posts),
@@ -447,7 +509,7 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
         len(quality),
     ) == (
         3,
-        3,
+        4,
         3,
         3,
         2,
@@ -465,45 +527,67 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
         assert row["thread_url_validation_status"] == "not_live_verified"
         assert row["thread_url_observed_at"] == ""
     assert threads_by_id[str(research_tid)]["first_pid"] == str(first_pid)
-    assert threads_by_id[str(research_tid)]["body_text"] == long_text
+    assert threads_by_id[str(research_tid)]["body_text"] == 'legacy full detail, with "quotes"\nand newline'
+    assert json.loads(threads_by_id[str(research_tid)]["legacy_base_snapshot_json"])["record"]["text"] == (
+        "get_threads list preview"
+    )
+    assert json.loads(threads_by_id[str(research_tid)]["field_sources_json"])["body_text"][
+        "legacy_base_fallback"
+    ]["source"] == "BasePost.floor=1"
+    assert threads_by_id[str(research_only_tid)]["body_text"] == long_text
+    assert len(long_text) > 131_072
+    assert [fragment["text"] for fragment in json.loads(threads_by_id[str(research_only_tid)]["contents_raw"])] == list(
+        body_fragments
+    )
+    assert paths["threads"].read_bytes().startswith(b"\xef\xbb\xbf")
     assert threads_by_id[str(research_tid)]["reply_count"] == ""
+    assert threads_by_id[str(research_tid)]["view_count"] == "8"
+    assert threads_by_id[str(research_tid)]["global_growth_icon_url"] == "https://example.test/growth.png"
     assert json.loads(threads_by_id[str(research_tid)]["source_payload_json"])["reply_num"] == 0
+    assert json.loads(threads_by_id[str(research_tid)]["source_payload_json"])["role_name"] == "历史吧务"
     assert threads_by_id[str(legacy_tid)]["record_source"] == "legacy_base_unverified"
     assert threads_by_id[str(research_tid)]["latest_scope_status"] == "no_evidence"
     assert threads_by_id[str(research_tid)]["latest_comment_scope_status"] == "missing_completion_evidence"
-    assert threads_by_id[str(legacy_tid)]["body_text"] == 'legacy body, with "quotes"\nand newline'
+    assert threads_by_id[str(legacy_tid)]["body_text"] == "legacy first post"
+    legacy_snapshot = json.loads(threads_by_id[str(legacy_tid)]["legacy_base_snapshot_json"])
+    assert legacy_snapshot["record"]["text"] == 'legacy body, with "quotes"\nand newline'
+    legacy_body_source = json.loads(threads_by_id[str(legacy_tid)]["field_sources_json"])
+    assert legacy_body_source["body_text"]["legacy_base_fallback"]["source"] == "BasePost.floor=1"
+    assert legacy_body_source["body_text"]["legacy_base_fallback"]["source_quality"] == "legacy_detail"
     assert threads_by_id[str(legacy_tid)]["first_pid"] == str(legacy_first_pid)
     assert json.loads(threads_by_id[str(legacy_tid)]["missing_reasons_json"])["record_source"]
 
     posts_by_id = {row["pid"]: row for row in posts}
     assert len(posts_by_id) == len(posts)
     assert posts_by_id[str(research_post_pid)]["text"] == long_text
-    assert posts_by_id[str(research_post_pid)]["subreply_count_reported"] == ""
+    assert json.loads(posts_by_id[str(research_post_pid)]["media_urls"]) == [
+        "https://example.test/image-1.jpg",
+        "https://example.test/video-2.mp4",
+    ]
+    assert posts_by_id[str(research_post_pid)]["agree_count"] == "9"
+    assert posts_by_id[str(research_post_pid)]["global_growth_icon_url"] == "https://example.test/growth.png"
     assert json.loads(posts_by_id[str(research_post_pid)]["source_payload_json"])["reply_num"] == 0
     assert posts_by_id[str(legacy_first_pid)]["is_first_post"] == "true"
     assert posts_by_id[str(legacy_first_pid)]["record_source"] == "legacy_base_unverified"
     assert posts_by_id[str(research_post_pid)]["thread_url"] == f"https://tieba.baidu.com/p/{research_tid}"
-    assert posts_by_id[str(research_post_pid)]["post_url"] == ""
-    assert posts_by_id[str(research_post_pid)]["post_url_validation_status"] == "identity_unverified"
-    assert json.loads(posts_by_id[str(research_post_pid)]["missing_reasons_json"])["post_url"] == (
-        "not_live_verified_identity_unverified"
-    )
+    assert "post_url" not in posts_by_id[str(research_post_pid)]
+    assert "post_url" not in json.loads(posts_by_id[str(research_post_pid)]["missing_reasons_json"])
     for row in posts:
         assert row["tid"] in threads_by_id
 
     comments_by_id = {row["cid"]: row for row in comments}
     assert len(comments_by_id) == len(comments)
     assert comments_by_id[str(research_comment_cid)]["reply_to_user_id"] == str(large_user_id)
+    assert comments_by_id[str(research_comment_cid)]["reply_to_display_name"] == "合成回复对象"
+    assert comments_by_id[str(research_comment_cid)]["agree_count"] == "7"
+    assert comments_by_id[str(research_comment_cid)]["reply_target_source"] == "explicit_api_user_id"
+    assert comments_by_id[str(research_comment_cid)]["global_growth_icon_url"] == "https://example.test/growth.png"
     assert comments_by_id[str(research_comment_cid)]["parent_post_pid"] == str(first_pid)
     assert comments_by_id[str(research_only_comment_cid)]["reply_to_user_id"] == ""
     assert comments_by_id[str(research_comment_cid)]["thread_url"] == f"https://tieba.baidu.com/p/{research_tid}"
-    assert comments_by_id[str(research_comment_cid)]["parent_post_url"] == ""
-    assert comments_by_id[str(research_comment_cid)]["comment_url"] == ""
-    assert comments_by_id[str(research_comment_cid)]["parent_post_url_validation_status"] == "identity_unverified"
-    assert comments_by_id[str(research_comment_cid)]["comment_url_validation_status"] == "identity_unverified"
     comment_reasons = json.loads(comments_by_id[str(research_comment_cid)]["missing_reasons_json"])
-    assert comment_reasons["parent_post_url"] == "not_live_verified_identity_unverified"
-    assert comment_reasons["comment_url"] == "not_live_verified_identity_unverified"
+    assert "parent_post_url" not in comment_reasons
+    assert "comment_url" not in comment_reasons
     assert json.loads(comments_by_id[str(research_only_comment_cid)]["source_payload_json"])["reply_to_id"] == 0
     assert comments_by_id[str(legacy_comment_cid)]["reply_to_user_id"] == "0"
     for row in comments:
@@ -524,6 +608,18 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
     assert snapshots_by_api["aiotieba.get_posts"]["ip_location_source"] == "aiotieba.get_posts.author.ip"
     assert media[0]["owner_id"] == str(research_post_pid)
     assert {row["position"] for row in media} == {"0", "1"}
+    field_quality_by_name = {(row["entity_type"], row["field_name"]): row for row in field_quality}
+    assert field_quality_by_name[("thread", "view_count")]["canonical_nonempty_count"] == "1"
+    assert field_quality_by_name[("thread", "disagree_count")]["canonical_nonempty_count"] == "1"
+    assert field_quality_by_name[("thread", "share_count")]["canonical_nonempty_count"] == "1"
+    assert field_quality_by_name[("post", "subreply_count_reported")]["canonical_nonempty_count"] == "3"
+    assert field_quality_by_name[("comment", "disagree_count")]["canonical_nonempty_count"] == "1"
+    assert database.get(ResearchThread, research_tid).role_name == "历史吧务"
+    assert database.get(ResearchThread, research_tid).author_icons == ["legacy-badge"]
+    forum_snapshot = database.query(UserForumSnapshot).filter_by(
+        source_api="aiotieba.get_user_forum_info"
+    ).one()
+    assert forum_snapshot.role_name == "吧务"
     assert quality[0]["count_mismatch"] == "true"
     assert quality[0]["tid"] == str(research_tid)
     thread_scope_by_id = {row["tid"]: row for row in thread_scope_rows}
@@ -546,6 +642,372 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
     assert manifest["csv_row_counts"]["crawl_quality_report"] == len(quality)
     assert manifest["csv_row_counts"]["thread_scope_quality_report"] == len(thread_scope_rows)
     assert str(large_user_id) not in manifest_text
+
+    database.close()
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_content_rows_include_exact_ordered_deduped_media_urls(tmp_path):
+    engine, database = create_export_database()
+    now = datetime(2025, 6, 1, tzinfo=UTC)
+    database.add_all(
+        [
+            make_base_thread(100, now),
+            make_base_thread(200, now),
+            make_base_thread(300, now),
+            BasePost(
+                pid=1001,
+                create_time=now,
+                text="legacy first post",
+                contents=None,
+                floor=1,
+                reply_num=0,
+                author_level=0,
+                tid=100,
+                fid=7,
+                author_id=1,
+            ),
+            BasePost(
+                pid=1010,
+                create_time=now,
+                text="post with media",
+                contents=None,
+                floor=2,
+                reply_num=0,
+                author_level=0,
+                tid=100,
+                fid=7,
+                author_id=1,
+            ),
+            BasePost(
+                pid=2001,
+                create_time=now,
+                text="other first post",
+                contents=None,
+                floor=1,
+                reply_num=0,
+                author_level=0,
+                tid=200,
+                fid=7,
+                author_id=1,
+            ),
+            BasePost(
+                pid=3001,
+                create_time=now,
+                text="empty current media snapshot",
+                contents=None,
+                floor=1,
+                reply_num=0,
+                author_level=0,
+                tid=300,
+                fid=7,
+                author_id=1,
+            ),
+            BasePost(
+                pid=2010,
+                create_time=now,
+                text="legacy post with media",
+                contents=None,
+                floor=2,
+                reply_num=0,
+                author_level=0,
+                tid=200,
+                fid=7,
+                author_id=1,
+            ),
+            BaseComment(
+                cid=1010,
+                create_time=now,
+                text="comment sharing a numeric ID with a post",
+                contents=None,
+                author_level=0,
+                reply_to_id=0,
+                pid=1010,
+                tid=100,
+                fid=7,
+                author_id=2,
+            ),
+            BaseComment(
+                cid=2020,
+                create_time=now,
+                text="legacy comment with media",
+                contents=None,
+                author_level=0,
+                reply_to_id=0,
+                pid=2001,
+                tid=200,
+                fid=7,
+                author_id=2,
+            ),
+        ]
+    )
+
+    def asset(owner_type, owner_id, position, tid, media_type, **urls):
+        return MediaAsset(
+            owner_type=owner_type,
+            owner_id=owner_id,
+            position=position,
+            tid=tid,
+            media_type=media_type,
+            api_fragment_type=f"synthetic-{media_type}",
+            raw_fragment_json={},
+            source_api="synthetic.research",
+            observed_at=now,
+            **urls,
+        )
+
+    database.add_all(
+        [
+            ResearchContentObservation(
+                owner_type="thread_first_post",
+                owner_id=100,
+                tid=100,
+                source_api="synthetic.current",
+                observed_at=now,
+            ),
+            ResearchContentObservation(
+                owner_type="thread_first_post",
+                owner_id=300,
+                tid=300,
+                source_api="synthetic.current",
+                observed_at=now,
+            ),
+            asset(
+                "thread",
+                100,
+                0,
+                100,
+                "image",
+                src_url="https://example.test/thread-small.jpg",
+                original_url="https://example.test/thread-original.jpg",
+            ),
+            asset(
+                "thread",
+                100,
+                1,
+                100,
+                "video",
+                cover_url="https://example.test/cover.jpg",
+                source_url="https://example.test/thread-video.mp4",
+            ),
+            asset("thread", 100, 2, 100, "emoji", src_url="https://example.test/emoji.png"),
+            asset("thread", 100, 3, 100, "image", src_url="https://example.test/thread-original.jpg"),
+            asset("thread", 100, 4, 999, "image", src_url="https://example.test/wrong-thread.jpg"),
+            asset("thread_first_post", 1001, 0, 100, "image", original_url="https://example.test/stale-thread.jpg"),
+            asset("thread_first_post", 2001, 0, 200, "image", original_url="https://example.test/legacy-thread.jpg"),
+            asset(
+                "thread_first_post",
+                3001,
+                0,
+                300,
+                "image",
+                original_url="https://example.test/stale-empty-thread.jpg",
+            ),
+            asset("post", 1010, 0, 100, "image", src_url="https://example.test/post.jpg"),
+            asset("post", 1010, 1, 100, "image", original_url="https://example.test/post.jpg"),
+            asset("post", 1010, 2, 200, "image", src_url="https://example.test/wrong-tid.jpg"),
+            asset("post", 2010, 0, 200, "image", original_url="https://example.test/legacy-post.jpg"),
+            asset(
+                "comment",
+                1010,
+                0,
+                100,
+                "video",
+                cover_url="https://example.test/comment-cover.jpg",
+                source_url="https://example.test/comment.mp4",
+            ),
+            asset("comment", 2020, 0, 200, "image", src_url="https://example.test/legacy-comment.jpg"),
+        ]
+    )
+    database.commit()
+
+    def async_sessionmaker_():
+        return AsyncSessionFromSync(database)
+
+    paths = await export_research_csvs(async_sessionmaker_, tmp_path / "media-urls", ())
+    _thread_headers, threads = read_csv(paths["threads"])
+    _post_headers, posts = read_csv(paths["posts"])
+    _comment_headers, comments = read_csv(paths["comments"])
+
+    threads_by_tid = {row["tid"]: row for row in threads}
+    posts_by_pid = {row["pid"]: row for row in posts}
+    comments_by_cid = {row["cid"]: row for row in comments}
+    assert json.loads(threads_by_tid["100"]["media_urls"]) == [
+        "https://example.test/thread-original.jpg",
+        "https://example.test/thread-video.mp4",
+    ]
+    assert json.loads(threads_by_tid["200"]["media_urls"]) == ["https://example.test/legacy-thread.jpg"]
+    assert json.loads(threads_by_tid["300"]["media_urls"]) == []
+    assert json.loads(posts_by_pid["1010"]["media_urls"]) == ["https://example.test/post.jpg"]
+    assert json.loads(posts_by_pid["2010"]["media_urls"]) == ["https://example.test/legacy-post.jpg"]
+    assert json.loads(comments_by_cid["1010"]["media_urls"]) == ["https://example.test/comment.mp4"]
+    assert json.loads(comments_by_cid["2020"]["media_urls"]) == ["https://example.test/legacy-comment.jpg"]
+    assert json.loads(posts_by_pid["1001"]["media_urls"]) == []
+
+    database.close()
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_thread_body_fallback_requires_author_match_and_marks_list_content_unverified(tmp_path):
+    engine, database = create_export_database()
+    now = datetime(2025, 6, 1, tzinfo=UTC)
+    base_threads = [
+        (100, 1, "detail list preview"),
+        (101, 2, "list only body"),
+        (102, 3, "matching list body"),
+        (103, 4, "old list body"),
+        (104, 3, "conflicting thread author list body"),
+    ]
+    database.add_all(
+        [
+            BaseThread(
+                tid=tid,
+                create_time=now,
+                title=f"synthetic {tid}",
+                text=text,
+                contents=None,
+                last_time=now,
+                reply_num=0,
+                author_level=0,
+                fid=7,
+                author_id=author_id,
+            )
+            for tid, author_id, text in base_threads
+        ]
+        + [
+            ResearchThread(
+                tid=100,
+                first_pid=1001,
+                author_user_id=1,
+                body_text=None,
+                contents_raw=None,
+                source_api="aiotieba.get_posts",
+                observed_at=now,
+                source_payload_json={},
+                missing_reasons_json={"body_text": "not_returned_by_source"},
+            ),
+            ResearchThread(
+                tid=101,
+                first_pid=1011,
+                author_user_id=2,
+                body_text=None,
+                contents_raw=None,
+                source_api="aiotieba.get_posts",
+                observed_at=now,
+                source_payload_json={},
+                missing_reasons_json={"body_text": "not_returned_by_source"},
+            ),
+            ResearchThread(
+                tid=102,
+                first_pid=1021,
+                author_user_id=3,
+                body_text=None,
+                contents_raw=None,
+                source_api="aiotieba.get_posts",
+                observed_at=now,
+                source_payload_json={},
+                missing_reasons_json={"body_text": "not_returned_by_source"},
+            ),
+            ResearchThread(
+                tid=104,
+                first_pid=1041,
+                author_user_id=9,
+                body_text=None,
+                contents_raw=None,
+                source_api="aiotieba.get_posts",
+                observed_at=now,
+                source_payload_json={},
+                missing_reasons_json={"body_text": "not_returned_by_source"},
+            ),
+            ResearchThread(
+                tid=103,
+                first_pid=1031,
+                author_user_id=4,
+                body_text="verified research body",
+                contents_raw=[{"type": "text", "text": "verified research body"}],
+                source_api="aiotieba.get_posts",
+                observed_at=now,
+                source_payload_json={},
+                missing_reasons_json={},
+            ),
+            BasePost(
+                pid=1001,
+                create_time=now,
+                text="legacy detail body",
+                contents=None,
+                floor=1,
+                reply_num=0,
+                author_level=0,
+                tid=100,
+                fid=7,
+                author_id=1,
+            ),
+            BasePost(
+                pid=1021,
+                create_time=now,
+                text="wrong author detail body",
+                contents=None,
+                floor=1,
+                reply_num=0,
+                author_level=0,
+                tid=102,
+                fid=7,
+                author_id=9,
+            ),
+            BasePost(
+                pid=1031,
+                create_time=now,
+                text="older legacy detail body",
+                contents=None,
+                floor=1,
+                reply_num=0,
+                author_level=0,
+                tid=103,
+                fid=7,
+                author_id=4,
+            ),
+        ]
+    )
+    database.commit()
+
+    def async_sessionmaker_():
+        return AsyncSessionFromSync(database)
+
+    paths = await export_research_csvs(async_sessionmaker_, tmp_path / "fallbacks", ())
+    rows = {row["tid"]: row for row in read_csv(paths["threads"])[1]}
+
+    detail = rows["100"]
+    assert detail["body_text"] == "legacy detail body"
+    detail_sources = json.loads(detail["field_sources_json"])["body_text"]["legacy_base_fallback"]
+    assert detail_sources["source"] == "BasePost.floor=1"
+    assert detail_sources["source_quality"] == "legacy_detail"
+    assert "body_text" not in json.loads(detail["missing_reasons_json"])
+
+    list_fallback = rows["101"]
+    assert list_fallback["body_text"] == "list only body"
+    list_source = json.loads(list_fallback["field_sources_json"])["body_text"]["legacy_list_content"]
+    assert list_source == {"source": "BaseThread.text/contents", "completeness": "unverified"}
+    assert json.loads(list_fallback["missing_reasons_json"])["body_text"] == (
+        "legacy_list_content_completeness_unverified"
+    )
+
+    conflicting_detail = rows["102"]
+    assert conflicting_detail["body_text"] == "matching list body"
+    detail_conflict_sources = json.loads(conflicting_detail["field_sources_json"])["body_text"]
+    assert "legacy_base_fallback" not in detail_conflict_sources
+    assert "legacy_list_content" in detail_conflict_sources
+
+    conflicting_thread = rows["104"]
+    assert conflicting_thread["body_text"] == ""
+    assert "legacy_list_content" not in json.loads(conflicting_thread["field_sources_json"] or "{}").get(
+        "body_text", {}
+    )
+
+    verified = rows["103"]
+    assert verified["body_text"] == "verified research body"
+    assert "legacy_base_fallback" not in json.loads(verified["field_sources_json"] or "{}").get("body_text", {})
 
     database.close()
     engine.dispose()
@@ -838,6 +1300,18 @@ async def test_completed_threads_uses_latest_cross_run_scopes_and_keeps_whole_re
                 missing_reasons_json={},
             ),
             MediaAsset(
+                owner_type="thread",
+                owner_id=100,
+                position=0,
+                tid=100,
+                media_type="image",
+                src_url="https://example.test/thread-current.jpg",
+                api_fragment_type="img",
+                raw_fragment_json={},
+                source_api="synthetic.research",
+                observed_at=now,
+            ),
+            MediaAsset(
                 owner_type="thread_first_post",
                 owner_id=1001,
                 position=0,
@@ -950,12 +1424,14 @@ async def test_completed_threads_uses_latest_cross_run_scopes_and_keeps_whole_re
     assert len(users) == 1
     assert len(snapshots) == 1
     assert {(row["owner_type"], row["owner_id"]) for row in media} == {
+        ("thread", "100"),
         ("thread_first_post", "1001"),
         ("post", "1002"),
         ("comment", "10001"),
     }
 
     thread_by_id = {row["tid"]: row for row in threads}
+    assert json.loads(thread_by_id["100"]["media_urls"]) == ["https://example.test/thread-current.jpg"]
     assert thread_by_id["100"]["latest_scope_status"] == "completed"
     assert thread_by_id["100"]["latest_scope_run_id"] == "run-new"
     assert thread_by_id["100"]["latest_scope_generation"] == "3"

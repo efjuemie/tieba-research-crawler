@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, case, func, literal, or_, select, union
+from sqlalchemy import and_, case, func, literal, or_, select, tuple_, union
 from sqlalchemy.orm import aliased
 from tiebameow.models.orm import Comment as BaseComment
 from tiebameow.models.orm import Post as BasePost
@@ -33,6 +33,7 @@ from src.core.models import ResearchTaskScope
 from .models import (
     MediaAsset,
     ResearchComment,
+    ResearchContentObservation,
     ResearchFieldObservation,
     ResearchPost,
     ResearchThread,
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     type QualitySummary = Mapping[str, object]
 
 EXPORT_BATCH_SIZE = 1000
+MEDIA_OWNER_BATCH_SIZE = 250
 _CSV_FIELD_LIMIT_LOCK = threading.Lock()
 _UNKNOWN_ZERO_REASONS = frozenset({"zero_presence_unverified", "zero_presence_unverified_in_parsed_object"})
 
@@ -66,6 +68,7 @@ THREAD_FIELDS = (
     "title",
     "body_text",
     "contents_raw",
+    "media_urls",
     "create_time",
     "create_time_raw",
     "last_time",
@@ -77,22 +80,16 @@ THREAD_FIELDS = (
     "author_tieba_uid",
     "forum_level",
     "global_growth_level",
+    "global_growth_icon_url",
     "is_bawu",
-    "author_icons",
     "forum_level_name",
-    "role_type",
-    "role_name",
-    "role_badge_id",
-    "role_badge_url",
     "ip_location_text",
     "ip_location_source",
     "ip_location_observed_at",
     "reply_count",
     "agree_count",
-    "disagree_count",
     "collect_count",
     "view_count",
-    "share_count",
     "thread_type",
     "is_top",
     "is_good",
@@ -131,6 +128,7 @@ POST_FIELDS = (
     "text",
     "sign",
     "contents_raw",
+    "media_urls",
     "author_user_id",
     "author_user_name",
     "author_nickname",
@@ -139,19 +137,13 @@ POST_FIELDS = (
     "thread_author_user_id",
     "forum_level",
     "global_growth_level",
+    "global_growth_icon_url",
     "is_bawu",
-    "author_icons",
     "forum_level_name",
-    "role_type",
-    "role_name",
-    "role_badge_id",
-    "role_badge_url",
     "ip_location_text",
     "ip_location_source",
     "ip_location_observed_at",
     "agree_count",
-    "disagree_count",
-    "subreply_count_reported",
     "is_thread_author",
     "source_api",
     "observed_at",
@@ -164,8 +156,6 @@ POST_FIELDS = (
     "thread_url_source",
     "thread_url_validation_status",
     "thread_url_observed_at",
-    "post_url",
-    "post_url_validation_status",
 )
 
 COMMENT_FIELDS = (
@@ -181,6 +171,7 @@ COMMENT_FIELDS = (
     "scraped_at",
     "text",
     "contents_raw",
+    "media_urls",
     "author_user_id",
     "author_user_name",
     "author_nickname",
@@ -188,23 +179,19 @@ COMMENT_FIELDS = (
     "author_tieba_uid",
     "forum_level",
     "global_growth_level",
+    "global_growth_icon_url",
     "is_bawu",
-    "author_icons",
     "forum_level_name",
-    "role_type",
-    "role_name",
-    "role_badge_id",
-    "role_badge_url",
     "ip_location_text",
     "ip_location_source",
     "ip_location_observed_at",
     "reply_to_user_id",
+    "reply_to_display_name",
     "reply_to_id_raw",
     "reply_target_source",
     "reply_target_confidence",
     "reply_resolution_note",
     "agree_count",
-    "disagree_count",
     "is_thread_author",
     "source_api",
     "observed_at",
@@ -217,10 +204,6 @@ COMMENT_FIELDS = (
     "thread_url_source",
     "thread_url_validation_status",
     "thread_url_observed_at",
-    "parent_post_url",
-    "parent_post_url_validation_status",
-    "comment_url",
-    "comment_url_validation_status",
 )
 
 USER_FIELDS = (
@@ -253,9 +236,6 @@ USER_FORUM_SNAPSHOT_FIELDS = (
     "global_growth_level",
     "forum_level_name",
     "is_bawu",
-    "role_name",
-    "role_type",
-    "icons",
     "ip_location_text",
     "ip_location_source",
     "status",
@@ -413,7 +393,19 @@ async def export_research_csvs(
             )
             csv_counts: dict[str, int] = {}
             for name, statement, fields, row_mapper, _unique_fields in specs:
-                written = await _write_query_csv(session, paths[name], fields, statement, row_mapper)
+                media_owner_type = {
+                    "threads": "thread",
+                    "posts": "post",
+                    "comments": "comment",
+                }.get(name)
+                written = await _write_query_csv(
+                    session,
+                    paths[name],
+                    fields,
+                    statement,
+                    row_mapper,
+                    media_owner_type=media_owner_type,
+                )
                 if written != expected_counts[name]:
                     raise ResearchExportValidationError(
                         f"Export validation failed: {name} database and staged row counts differ."
@@ -889,33 +881,66 @@ async def _collect_field_quality_rows(
     return rows
 
 
-def _content_quality_fields(entity_type: str) -> tuple[str, ...]:
-    field_types = {
-        "thread": THREAD_FIELDS,
-        "post": POST_FIELDS,
-        "comment": COMMENT_FIELDS,
-    }[entity_type]
-    quality_fields = {
+_CONTENT_QUALITY_FIELDS = {
+    "thread": (
         "author_user_name",
         "author_nickname",
         "author_portrait",
         "forum_level",
         "global_growth_level",
+        "global_growth_icon_url",
         "is_bawu",
         "forum_level_name",
-        "role_type",
-        "role_name",
-        "role_badge_id",
-        "role_badge_url",
         "ip_location_text",
+        "reply_count",
         "agree_count",
         "disagree_count",
-        "reply_count",
         "collect_count",
         "view_count",
         "share_count",
-    }
-    return tuple(name for name in field_types if name in quality_fields)
+    ),
+    "post": (
+        "author_user_name",
+        "author_nickname",
+        "author_portrait",
+        "forum_level",
+        "global_growth_level",
+        "global_growth_icon_url",
+        "is_bawu",
+        "forum_level_name",
+        "ip_location_text",
+        "agree_count",
+        "disagree_count",
+        "subreply_count_reported",
+    ),
+    "comment": (
+        "author_user_name",
+        "author_nickname",
+        "author_portrait",
+        "forum_level",
+        "global_growth_level",
+        "global_growth_icon_url",
+        "is_bawu",
+        "forum_level_name",
+        "ip_location_text",
+        "reply_to_user_id",
+        "reply_to_display_name",
+        "agree_count",
+        "disagree_count",
+    ),
+}
+
+
+def _content_quality_fields(entity_type: str) -> tuple[str, ...]:
+    return _CONTENT_QUALITY_FIELDS[entity_type]
+
+
+def _add_internal_quality_values(values: dict[str, object], record: object, fields: tuple[str, ...]) -> None:
+    for field in fields:
+        value = getattr(record, field, None)
+        if field == "subreply_count_reported" and value is None:
+            value = getattr(record, "reply_num", None)
+        values[field] = value
 
 
 async def _write_rows_csv(path: Path, fields: tuple[str, ...], rows: Iterable[Mapping[str, object]]) -> int:
@@ -1184,11 +1209,34 @@ def _thread_query(entity_scope: str = "all"):
         (ResearchThread.tid.is_not(None), ResearchThread.author_user_id),
         else_=BaseThread.author_id,
     )
+    fallback_author_id = func.coalesce(ResearchThread.author_user_id, BaseThread.author_id)
     # This matches _thread_row's source selection: a research row is used as a
     # whole observation, so its NULL create_time must remain NULL for ordering.
     export_create_time = case(
         (ResearchThread.tid.is_not(None), ResearchThread.create_time),
         else_=BaseThread.create_time,
+    )
+    legacy_first_post_text = (
+        select(BasePost.text)
+        .where(
+            BasePost.tid == export_id,
+            BasePost.floor == 1,
+            BasePost.author_id == fallback_author_id,
+        )
+        .order_by(BasePost.create_time.asc(), BasePost.pid.asc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    legacy_first_post_contents = (
+        select(BasePost.contents)
+        .where(
+            BasePost.tid == export_id,
+            BasePost.floor == 1,
+            BasePost.author_id == fallback_author_id,
+        )
+        .order_by(BasePost.create_time.asc(), BasePost.pid.asc())
+        .limit(1)
+        .scalar_subquery()
     )
     latest_thread, _latest_comments, comment_summary, missing_summary = _scope_state_queries()
     latest_scope_status = func.coalesce(latest_thread.c.status, literal("no_evidence"))
@@ -1200,6 +1248,9 @@ def _thread_query(entity_scope: str = "all"):
             BaseThread,
             ResearchThread,
             BaseUser,
+            fallback_author_id.label("fallback_author_id"),
+            legacy_first_post_text.label("legacy_first_post_text"),
+            legacy_first_post_contents.label("legacy_first_post_contents"),
             latest_scope_status.label("latest_scope_status"),
             latest_thread.c.run_id.label("latest_scope_run_id"),
             latest_thread.c.generation.label("latest_scope_generation"),
@@ -1314,6 +1365,15 @@ def _media_query(entity_scope: str = "all"):
         .select_from(threads)
         .where(
             threads.c.export_id == MediaAsset.tid,
+            threads.c.export_id == MediaAsset.owner_id,
+        )
+        .exists()
+    )
+    legacy_thread_owner_exists = (
+        select(1)
+        .select_from(threads)
+        .where(
+            threads.c.export_id == MediaAsset.tid,
             threads.c.export_first_pid == MediaAsset.owner_id,
         )
         .exists()
@@ -1338,7 +1398,8 @@ def _media_query(entity_scope: str = "all"):
     )
     return statement.where(
         or_(
-            and_(MediaAsset.owner_type == "thread_first_post", thread_owner_exists),
+            and_(MediaAsset.owner_type == "thread", thread_owner_exists),
+            and_(MediaAsset.owner_type == "thread_first_post", legacy_thread_owner_exists),
             and_(MediaAsset.owner_type == "post", post_owner_exists),
             and_(MediaAsset.owner_type == "comment", comment_owner_exists),
         )
@@ -1352,6 +1413,9 @@ def _thread_row(row: Any) -> dict[str, object]:
         base,
         research,
         author,
+        fallback_author_id,
+        legacy_first_post_text,
+        legacy_first_post_contents,
         latest_scope_status,
         latest_scope_run_id,
         latest_scope_generation,
@@ -1381,6 +1445,19 @@ def _thread_row(row: Any) -> dict[str, object]:
             "missing_reasons_json": _legacy_missing_reasons(),
             "record_source": "legacy_base_unverified",
         }
+    _add_legacy_first_post_fallback(
+        values,
+        legacy_first_post_text,
+        legacy_first_post_contents,
+        base,
+        fallback_author_id,
+        prefer_legacy=research is None,
+    )
+    _add_internal_quality_values(
+        values,
+        research if research is not None else base,
+        ("disagree_count", "share_count"),
+    )
     values["legacy_base_snapshot_json"] = _legacy_snapshot(base, author)
     _add_thread_url_metadata(values)
     values["latest_scope_status"] = latest_scope_status
@@ -1423,9 +1500,9 @@ def _post_row(row: Any) -> dict[str, object]:
             "missing_reasons_json": _legacy_missing_reasons(),
             "record_source": "legacy_base_unverified",
         }
+    _add_internal_quality_values(values, post, ("disagree_count", "subreply_count_reported"))
     values["legacy_base_snapshot_json"] = _legacy_snapshot(base, author)
     _add_thread_url_metadata(values)
-    _mark_unverified_deep_links(values, ("post_url",))
     return values
 
 
@@ -1457,9 +1534,9 @@ def _comment_row(row: Any) -> dict[str, object]:
             ),
             "record_source": "legacy_base_unverified",
         }
+    _add_internal_quality_values(values, research if research is not None else base, ("disagree_count",))
     values["legacy_base_snapshot_json"] = _legacy_snapshot(base, author)
     _add_thread_url_metadata(values)
-    _mark_unverified_deep_links(values, ("parent_post_url", "comment_url"))
     return values
 
 
@@ -1474,12 +1551,79 @@ def _add_thread_url_metadata(values: dict[str, object]) -> None:
         _add_missing_reasons(values, {"thread_url": "invalid_tid"})
 
 
-def _mark_unverified_deep_links(values: dict[str, object], url_fields: tuple[str, ...]) -> None:
-    reasons = dict.fromkeys(url_fields, "not_live_verified_identity_unverified")
-    for field in url_fields:
-        values[field] = None
-        values[f"{field}_validation_status"] = "identity_unverified"
-    _add_missing_reasons(values, reasons)
+def _add_legacy_first_post_fallback(
+    values: dict[str, object],
+    first_post_text: object,
+    first_post_contents: object,
+    base: object | None,
+    expected_author_id: object,
+    *,
+    prefer_legacy: bool,
+) -> None:
+    if not prefer_legacy and (values.get("body_text") is not None or values.get("contents_raw")):
+        return
+    has_text = isinstance(first_post_text, str) and bool(first_post_text)
+    has_contents = isinstance(first_post_contents, (dict, list)) and bool(first_post_contents)
+    if has_text or has_contents:
+        values["body_text"] = first_post_text
+        values["contents_raw"] = first_post_contents
+        _add_body_source_metadata(
+            values,
+            "legacy_base_fallback",
+            {
+                "source": "BasePost.floor=1",
+                "source_quality": "legacy_detail",
+                "completeness": "response_returned_unverified",
+            },
+            clear_missing_reason=True,
+        )
+        return
+
+    if base is None:
+        return
+    base_author_id = getattr(base, "author_id", None)
+    if expected_author_id is not None and base_author_id is not None and base_author_id != expected_author_id:
+        return
+    list_text = getattr(base, "text", None)
+    list_contents = getattr(base, "contents", None)
+    has_list_text = isinstance(list_text, str) and bool(list_text)
+    has_list_contents = isinstance(list_contents, (dict, list)) and bool(list_contents)
+    if not has_list_text and not has_list_contents:
+        return
+
+    values["body_text"] = list_text
+    values["contents_raw"] = list_contents
+    _add_body_source_metadata(
+        values,
+        "legacy_list_content",
+        {
+            "source": "BaseThread.text/contents",
+            "completeness": "unverified",
+        },
+        clear_missing_reason=False,
+    )
+    _add_missing_reasons(values, {"body_text": "legacy_list_content_completeness_unverified"})
+
+
+def _add_body_source_metadata(
+    values: dict[str, object],
+    source_name: str,
+    metadata: dict[str, object],
+    *,
+    clear_missing_reason: bool,
+) -> None:
+    sources = values.get("field_sources_json")
+    source_map = dict(sources) if isinstance(sources, Mapping) else {}
+    body_source = source_map.get("body_text")
+    body_source_map = dict(body_source) if isinstance(body_source, Mapping) else {}
+    body_source_map[source_name] = metadata
+    source_map["body_text"] = body_source_map
+    values["field_sources_json"] = source_map
+    if clear_missing_reason:
+        reasons = values.get("missing_reasons_json")
+        reason_map = dict(reasons) if isinstance(reasons, Mapping) else {}
+        reason_map.pop("body_text", None)
+        values["missing_reasons_json"] = reason_map
 
 
 def _add_missing_reasons(values: dict[str, object], additions: Mapping[str, str]) -> None:
@@ -1544,6 +1688,8 @@ async def _write_query_csv(
     fields: tuple[str, ...],
     statement: Any,
     row_mapper: Any,
+    *,
+    media_owner_type: str | None = None,
 ) -> int:
     row_count = 0
 
@@ -1553,14 +1699,125 @@ async def _write_query_csv(
         writer.writeheader()
         result = await session.stream(statement.execution_options(yield_per=EXPORT_BATCH_SIZE))
         try:
+            rows: list[Any] = []
+
+            async def write_batch() -> None:
+                nonlocal row_count
+                owner_keys = (
+                    [_media_owner_keys(row, media_owner_type) for row in rows]
+                    if media_owner_type is not None
+                    else []
+                )
+                urls_by_owner = await _load_media_urls(
+                    session,
+                    list(dict.fromkeys(key for keys in owner_keys for key in keys)),
+                ) if owner_keys else {}
+                for index, row in enumerate(rows):
+                    values = row_mapper(row)
+                    if media_owner_type is not None:
+                        media_urls = next(
+                            (urls_by_owner[key] for key in owner_keys[index] if urls_by_owner.get(key)),
+                            [],
+                        )
+                        values["media_urls"] = json.dumps(media_urls, ensure_ascii=False, separators=(",", ":"))
+                    writer.writerow(_csv_row(values, fields))
+                    row_count += 1
+                rows.clear()
+
             async for row in result:
-                writer.writerow(_csv_row(row_mapper(row), fields))
-                row_count += 1
+                rows.append(row)
+                if len(rows) >= EXPORT_BATCH_SIZE:
+                    await write_batch()
+            if rows:
+                await write_batch()
         finally:
             await result.close()
 
     await _write_atomically(path, write)
     return row_count
+
+
+def _media_owner_keys(row: Any, owner_type: str) -> tuple[tuple[str, int, int], ...]:
+    owner_id = row[0]
+    if owner_type == "thread":
+        tid = owner_id
+        keys = [("thread", owner_id, tid)]
+        first_pid = row[1]
+        if first_pid is not None:
+            # Older snapshots keyed the thread's first-post media by its PID.
+            keys.append(("thread_first_post", first_pid, tid))
+        return tuple(keys)
+    return ((owner_type, owner_id, row[1]),)
+
+
+async def _load_media_urls(
+    session: AsyncSession,
+    owner_keys: list[tuple[str, int, int]],
+) -> dict[tuple[str, int, int], list[str]]:
+    urls_by_owner: dict[tuple[str, int, int], list[str]] = {}
+    seen_by_owner: dict[tuple[str, int, int], set[str]] = {}
+    for start in range(0, len(owner_keys), MEDIA_OWNER_BATCH_SIZE):
+        owner_key_batch = owner_keys[start : start + MEDIA_OWNER_BATCH_SIZE]
+        thread_tids = {key[2] for key in owner_key_batch if key[0] == "thread_first_post"}
+        observed_thread_tids = await _load_observed_thread_media_tids(session, thread_tids)
+        owner_key_batch = [
+            key
+            for key in owner_key_batch
+            if not (key[0] == "thread_first_post" and key[2] in observed_thread_tids)
+        ]
+        if not owner_key_batch:
+            continue
+        result = await session.stream(
+            select(
+                MediaAsset.owner_type,
+                MediaAsset.owner_id,
+                MediaAsset.tid,
+                MediaAsset.media_type,
+                MediaAsset.position,
+                MediaAsset.original_url,
+                MediaAsset.src_url,
+                MediaAsset.source_url,
+            )
+            .where(
+                tuple_(MediaAsset.owner_type, MediaAsset.owner_id, MediaAsset.tid).in_(owner_key_batch),
+                MediaAsset.media_type.in_(("image", "video")),
+            )
+            .order_by(MediaAsset.owner_type, MediaAsset.owner_id, MediaAsset.tid, MediaAsset.position)
+            .execution_options(yield_per=EXPORT_BATCH_SIZE)
+        )
+        try:
+            async for asset in result:
+                owner_key = (asset[0], asset[1], asset[2])
+                url = next(
+                    (value for value in (asset[5], asset[6], asset[7]) if isinstance(value, str) and value.strip()),
+                    None,
+                )
+                if url is None:
+                    continue
+                seen = seen_by_owner.setdefault(owner_key, set())
+                if url not in seen:
+                    seen.add(url)
+                    urls_by_owner.setdefault(owner_key, []).append(url)
+        finally:
+            await result.close()
+    return urls_by_owner
+
+
+async def _load_observed_thread_media_tids(session: AsyncSession, tids: set[int]) -> set[int]:
+    if not tids:
+        return set()
+    result = await session.stream(
+        select(ResearchContentObservation.owner_id).where(
+            ResearchContentObservation.owner_type == "thread_first_post",
+            tuple_(ResearchContentObservation.owner_id, ResearchContentObservation.tid).in_(
+                [(tid, tid) for tid in sorted(tids)]
+            ),
+        ).execution_options(yield_per=EXPORT_BATCH_SIZE)
+    )
+    try:
+        return {row[0] async for row in result}
+    finally:
+        await result.close()
 
 
 async def _write_quality_csv(

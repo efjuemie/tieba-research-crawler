@@ -794,11 +794,8 @@ async def _read_canonical_snapshot(sessions: Any, plan: WebEnrichmentTargetPlan)
     links = {}
     for name in (
         "thread_url",
+        "thread_url_source",
         "thread_url_validation_status",
-        "post_url",
-        "post_url_validation_status",
-        "comment_url",
-        "comment_url_validation_status",
     ):
         if hasattr(record, name):
             links[name] = getattr(record, name)

@@ -27,15 +27,27 @@ def test_web_fallback_defaults_are_bounded_and_serialized_in_examples():
 
 
 @pytest.mark.parametrize(
+    ("max_pages", "max_expansions"),
+    [(2, 2), (10, 10)],
+)
+def test_web_fallback_config_accepts_bounded_pagination(max_pages, max_expansions):
+    settings = WebFallbackConfig(max_pages=max_pages, max_expansions=max_expansions)
+
+    assert settings.max_pages == max_pages
+    assert settings.max_expansions == max_expansions
+
+
+@pytest.mark.parametrize(
     "values",
     [
-        {"max_pages": 2},
-        {"max_expansions": 2},
+        {"max_pages": 0},
         {"max_expansions": -1},
+        {"max_pages": 11},
+        {"max_expansions": 11},
         {"timeout_seconds": 0},
         {"timeout_seconds": 121},
     ],
 )
-def test_web_fallback_config_rejects_unbounded_settings(values):
+def test_web_fallback_config_rejects_out_of_bounds_settings(values):
     with pytest.raises(ValidationError):
         WebFallbackConfig(**values)

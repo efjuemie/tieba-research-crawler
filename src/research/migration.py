@@ -29,6 +29,7 @@ async def create_research_tables(engine: AsyncEngine) -> None:
         await connection.run_sync(Base.metadata.create_all, tables=RESEARCH_MIGRATION_TABLES)
         await connection.run_sync(_ensure_research_user_global_growth_level)
         await connection.run_sync(_ensure_content_field_sources)
+        await connection.run_sync(_ensure_content_metadata_columns)
         await connection.run_sync(_ensure_api_field_observation_nullability)
 
 
@@ -64,6 +65,31 @@ def _ensure_content_field_sources(connection) -> None:
             columns = {column["name"] for column in inspector.get_columns(table_name)}
             if "field_sources_json" not in columns:
                 connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN field_sources_json JSON")
+        return
+
+    raise ValueError(f"Unsupported database dialect for research migration: {connection.dialect.name}.")
+
+
+def _ensure_content_metadata_columns(connection) -> None:
+    columns_by_table = {
+        "research_thread": ("global_growth_icon_url",),
+        "research_post": ("global_growth_icon_url",),
+        "research_comment": ("global_growth_icon_url", "reply_to_display_name"),
+    }
+    if connection.dialect.name == "postgresql":
+        for table_name, columns in columns_by_table.items():
+            for column_name in columns:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} TEXT"
+                )
+        return
+
+    if connection.dialect.name == "sqlite":
+        for table_name, expected_columns in columns_by_table.items():
+            existing_columns = {column["name"] for column in inspect(connection).get_columns(table_name)}
+            for column_name in expected_columns:
+                if column_name not in existing_columns:
+                    connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {column_name} TEXT")
         return
 
     raise ValueError(f"Unsupported database dialect for research migration: {connection.dialect.name}.")

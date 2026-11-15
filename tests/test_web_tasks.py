@@ -16,6 +16,7 @@ from src.research.models import (
 )
 from src.research.web_fallback.reconcile import fail_web_enrichment_task
 from src.research.web_fallback.tasks import (
+    _normalize_requested_fields,
     cancel_web_enrichment_task,
     enqueue_web_enrichment_tasks,
     lease_web_enrichment_tasks,
@@ -74,6 +75,33 @@ class _AsyncSessionMaker:
 
     def __call__(self):
         return _AsyncSessionAdapter(Session(self.engine))
+
+
+def test_new_task_fields_follow_content_specific_scope():
+    assert _normalize_requested_fields(
+        ["agree_count", "reply_count", "collect_count", "view_count"], "thread"
+    ) == ("agree_count", "collect_count", "reply_count", "view_count")
+    assert _normalize_requested_fields(["agree_count"], "post") == ("agree_count",)
+    assert _normalize_requested_fields(
+        ["agree_count", "global_growth_icon_url", "reply_to_display_name", "reply_to_user_id"],
+        "comment",
+    ) == (
+        "agree_count",
+        "global_growth_icon_url",
+        "reply_to_display_name",
+        "reply_to_user_id",
+    )
+    for target_type, field_name in (
+        ("thread", "disagree_count"),
+        ("thread", "share_count"),
+        ("post", "reply_count"),
+        ("post", "collect_count"),
+        ("comment", "view_count"),
+        ("comment", "role_name"),
+        ("post", "forum_level_name"),
+    ):
+        with pytest.raises(ValueError, match="Unsupported web fields|Fields unsupported"):
+            _normalize_requested_fields([field_name], target_type)
 
 
 @pytest.fixture
@@ -196,14 +224,14 @@ async def test_enqueue_deduplicates_exact_identity_field_sets_and_uses_primary_i
     summary = await enqueue_web_enrichment_tasks(
         maker,
         "run-web-001",
-        ["forum_level_name", "global_growth_level"],
+        ["author_nickname", "global_growth_level"],
         target_type="thread",
         tid=1001,
     )
     reordered = await enqueue_web_enrichment_tasks(
         maker,
         "run-web-001",
-        ["global_growth_level", "forum_level_name"],
+        ["global_growth_level", "author_nickname"],
         target_type="thread",
         tid=1001,
     )
@@ -215,7 +243,7 @@ async def test_enqueue_deduplicates_exact_identity_field_sets_and_uses_primary_i
     post_summary = await enqueue_web_enrichment_tasks(
         maker,
         "run-web-001",
-        ["forum_level_name"],
+        ["author_nickname"],
         target_type="post",
         target_ids=[2102],
         tid=1001,
@@ -250,7 +278,7 @@ async def test_same_names_text_and_parent_still_produce_distinct_target_ids(rese
     posts = await enqueue_web_enrichment_tasks(
         maker,
         "run-web-001",
-        ["forum_level_name"],
+        ["author_nickname"],
         target_type="post",
         target_ids=[2101, 2102],
         tid=1001,
@@ -384,7 +412,7 @@ async def test_unfiltered_plan_preserves_tid_and_parent_filters_across_target_ty
             ]
         )
 
-    fields = ["forum_level_name", "global_growth_level"]
+    fields = ["author_nickname", "global_growth_level"]
     all_targets = await enqueue_web_enrichment_tasks(maker, "run-web-001", fields)
     assert all_targets.planned_count == 9
     assert {target.target_type for target in all_targets.planned_targets} == {"thread", "post", "comment"}

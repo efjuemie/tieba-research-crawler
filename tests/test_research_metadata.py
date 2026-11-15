@@ -25,6 +25,7 @@ from src.research.models import (
     MediaAsset,
     ResearchComment,
     ResearchContentObservation,
+    ResearchFieldObservation,
     ResearchPost,
     ResearchThread,
     ResearchUser,
@@ -1019,8 +1020,15 @@ def test_first_floor_post_pid_backfills_missing_thread_pid():
     user = _synthetic_user()
     first_post = _synthetic_post(first_pid, tid, 1, user, Contents("first"))
     thread = _synthetic_thread(tid, 0, user, Contents(""))
+    thread.fid = 0
+    first_post.tid = 0
+    first_post.fid = 0
     page = research_client_module.ResearchPage(
-        raw=SimpleNamespace(thread=thread, objs=[first_post]),
+        raw=SimpleNamespace(
+            thread=thread,
+            objs=[first_post],
+            forum=SimpleNamespace(fid=7654321, fname="合成贴吧"),
+        ),
         dto=object(),
         observed_at=datetime.now(UTC),
         source_api="aiotieba.get_posts",
@@ -1029,7 +1037,69 @@ def test_first_floor_post_pid_backfills_missing_thread_pid():
     records = build_research_records(page)
 
     assert records.threads[0].first_pid == first_pid
+    assert records.threads[0].fid == 7654321
     assert "first_pid" not in records.threads[0].missing_reasons_json
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("different_floor_one_pids", "multiple floor=1 post IDs"),
+        ("foreign_tid", "TID/FID does not match"),
+        ("foreign_fid", "TID/FID does not match"),
+        ("different_author", "post author does not match"),
+    ],
+)
+def test_get_posts_rejects_conflicting_floor_one_identity(case, message):
+    tid = 987654321012345678
+    first_pid = 987654321012345679
+    thread_user = _synthetic_user(user_id=111)
+    thread = _synthetic_thread(tid, first_pid, thread_user, Contents("first"))
+    first_post = _synthetic_post(first_pid, tid, 1, _synthetic_user(user_id=111), Contents("first"))
+    posts = [first_post]
+
+    if case == "different_floor_one_pids":
+        posts.append(_synthetic_post(first_pid + 1, tid, 1, _synthetic_user(user_id=111), Contents("duplicate")))
+    elif case == "foreign_tid":
+        first_post.tid = tid + 100
+    elif case == "foreign_fid":
+        first_post.fid = thread.fid + 100
+    elif case == "different_author":
+        first_post.author_id = 222
+        first_post.user = _synthetic_user(user_id=222)
+
+    page = research_client_module.ResearchPage(
+        raw=SimpleNamespace(thread=thread, objs=posts),
+        dto=object(),
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        build_research_records(page)
+
+
+@pytest.mark.parametrize("floor", [None, 0])
+def test_unknown_floor_does_not_promote_raw_thread_pid_to_first_post(floor):
+    tid = 987654321012345678
+    post_pid = 987654321012345679
+    user = _synthetic_user()
+    thread = _synthetic_thread(tid, post_pid, user, Contents("not authoritative"))
+    page_head = _synthetic_post(post_pid, tid, floor, user, Contents("ordinary page post"))
+    page = research_client_module.ResearchPage(
+        raw=SimpleNamespace(thread=thread, objs=[page_head]),
+        dto=object(),
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
+    )
+
+    records = build_research_records(page)
+
+    assert records.threads == []
+    assert [post.pid for post in records.posts] == [post_pid]
+    assert ("thread_first_post", tid) not in {
+        (row.owner_type, row.owner_id) for row in records.content_observations
+    }
 
 
 def test_ip_location_text_keeps_region_and_observation_source():
@@ -1048,13 +1118,17 @@ def test_ip_location_text_keeps_region_and_observation_source():
 
     records = build_research_records(page)
 
-    thread_snapshot = next(
+    post_snapshot = next(
         snapshot
         for snapshot in records.user_forum_snapshots
-        if snapshot.ip_location_source == "aiotieba.get_posts.thread.author.ip"
+        if snapshot.ip_location_source == "aiotieba.get_posts.author.ip"
     )
-    assert thread_snapshot.ip_location_text == "湖北"
-    assert thread_snapshot.observed_at == observed_at
+    assert post_snapshot.ip_location_text == "湖北"
+    assert post_snapshot.observed_at == observed_at
+    assert all(
+        snapshot.ip_location_source != "aiotieba.get_posts.thread.author.ip"
+        for snapshot in records.user_forum_snapshots
+    )
     assert records.threads == []  # this page did not return the first-post object
     assert records.posts[0].ip_location_text == "湖北"
     assert records.posts[0].ip_location_source == "aiotieba.get_posts.author.ip"
@@ -1208,15 +1282,18 @@ async def test_research_persistence_deduplicates_batch_identities_and_replays_id
 async def test_later_posts_page_replay_does_not_clear_first_post_body_or_media():
     tid = 987654321012345678
     first_pid = 987654321012345679
-    user = _synthetic_user()
+    user = _synthetic_user(user_id=111, ip="福建")
     image = FragImage("https://example.invalid/first-post.jpg")
     observed_at = datetime.now(UTC)
+    later_observed_at = observed_at + timedelta(hours=1)
     first_contents = Contents('first post\n"complete"', [image])
     first_post = _synthetic_post(first_pid, tid, 1, user, first_contents)
     first_post.reply_num = 2
+    first_thread = _synthetic_thread(tid, first_pid, user, first_contents)
+    first_thread.reply_num = 100
     first_page = research_client_module.ResearchPage(
         raw=SimpleNamespace(
-            thread=_synthetic_thread(tid, first_pid, user, first_contents),
+            thread=first_thread,
             objs=[first_post],
         ),
         dto=object(),
@@ -1224,14 +1301,30 @@ async def test_later_posts_page_replay_does_not_clear_first_post_body_or_media()
         source_api="aiotieba.get_posts",
     )
 
-    later_reply = _synthetic_post(first_pid + 1, tid, 2, user, None)
+    later_user = _synthetic_user(user_id=222, ip="上海")
+    later_reply = _synthetic_post(
+        first_pid + 1,
+        tid,
+        31,
+        _synthetic_user(user_id=333),
+        Contents("floor 31 body", [FragImage("https://example.invalid/floor-31.jpg")]),
+    )
+    second_later_reply = _synthetic_post(
+        first_pid + 2,
+        tid,
+        32,
+        _synthetic_user(user_id=444),
+        Contents("floor 32 body"),
+    )
+    later_thread = _synthetic_thread(tid, later_reply.pid, later_user, Contents("untrusted page header"))
+    later_thread.reply_num = 300
     later_page = research_client_module.ResearchPage(
         raw=SimpleNamespace(
-            thread=_synthetic_thread(tid, first_pid, user, Contents("")),
-            objs=[later_reply],
+            thread=later_thread,
+            objs=[later_reply, second_later_reply],
         ),
         dto=object(),
-        observed_at=observed_at,
+        observed_at=later_observed_at,
         source_api="aiotieba.get_posts",
     )
 
@@ -1245,6 +1338,9 @@ async def test_later_posts_page_replay_does_not_clear_first_post_body_or_media()
         (row.owner_type, row.owner_id) for row in later_records.content_observations
     }
     assert all(asset.owner_type != "thread" for asset in later_records.media_assets)
+    assert [post.pid for post in later_records.posts] == [later_reply.pid, second_later_reply.pid]
+    assert [post.text for post in later_records.posts] == ["floor 31 body", "floor 32 body"]
+    assert all(snapshot.user_id != later_user.user_id for snapshot in later_records.user_forum_snapshots)
 
     engine, sessionmaker = _sqlite_research_sessionmaker()
     try:
@@ -1256,6 +1352,11 @@ async def test_later_posts_page_replay_does_not_clear_first_post_body_or_media()
             stored_thread = database.scalar(select(ResearchThread).where(ResearchThread.tid == tid))
             assert stored_thread.body_text == 'first post\n"complete"'
             assert stored_thread.first_pid == first_pid
+            assert stored_thread.author_user_id == user.user_id
+            assert stored_thread.ip_location_text == "福建"
+            assert stored_thread.reply_count == 100
+            assert stored_thread.observed_at.replace(tzinfo=UTC) == observed_at
+            assert stored_thread.source_payload_json["first_post"]["observed_at"] == observed_at.isoformat()
             thread_media = database.scalars(
                 select(MediaAsset).where(MediaAsset.owner_type == "thread", MediaAsset.owner_id == tid)
             ).all()
@@ -1268,6 +1369,268 @@ async def test_later_posts_page_replay_does_not_clear_first_post_body_or_media()
                 )
             )
             assert marker.observed_at.replace(tzinfo=UTC) == observed_at
+            stored_posts = database.scalars(select(ResearchPost).order_by(ResearchPost.pid)).all()
+            assert [post.pid for post in stored_posts] == [later_reply.pid, second_later_reply.pid]
+            assert [post.text for post in stored_posts] == ["floor 31 body", "floor 32 body"]
+            floor_31_media = database.scalars(
+                select(MediaAsset).where(MediaAsset.owner_type == "post", MediaAsset.owner_id == later_reply.pid)
+            ).all()
+            assert len(floor_31_media) == 1
+            assert floor_31_media[0].src_url == "https://example.invalid/floor-31.jpg"
+            assert database.scalar(
+                select(UserForumSnapshot.user_id).where(UserForumSnapshot.user_id == later_user.user_id)
+            ) is None
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_changed_explicit_first_floor_pid_is_still_rejected():
+    tid = 987654321012345678
+    first_pid = 987654321012345679
+    user = _synthetic_user(user_id=111)
+    first_time = datetime(2026, 11, 12, 10, tzinfo=UTC)
+    changed_time = first_time + timedelta(hours=1)
+
+    def page(pid, observed_at, body):
+        first_post = _synthetic_post(pid, tid, 1, user, Contents(body))
+        return research_client_module.ResearchPage(
+            raw=SimpleNamespace(
+                thread=_synthetic_thread(tid, pid, user, Contents(body)),
+                objs=[first_post],
+            ),
+            dto=object(),
+            observed_at=observed_at,
+            source_api="aiotieba.get_posts",
+        )
+
+    engine, sessionmaker = _sqlite_research_sessionmaker()
+    try:
+        await persist_research_page(sessionmaker, page(first_pid, first_time, "original first body"))
+        with pytest.raises(ValueError, match="ResearchThread.first_pid identity changed"):
+            await persist_research_page(sessionmaker, page(first_pid + 100, changed_time, "changed body"))
+
+        with Session(engine) as database:
+            stored_thread = database.scalar(select(ResearchThread).where(ResearchThread.tid == tid))
+            assert stored_thread.first_pid == first_pid
+            assert stored_thread.body_text == "original first body"
+            assert stored_thread.observed_at.replace(tzinfo=UTC) == first_time
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stored_first_pid_filters_unknown_floor_duplicate_by_tid_only():
+    tid = 987654321012345678
+    other_tid = tid + 100
+    first_pid = 987654321012345679
+    page_head_pid = first_pid + 1
+    t1 = datetime(2026, 11, 12, 10, tzinfo=UTC)
+    t2 = t1 + timedelta(hours=1)
+    t3 = t2 + timedelta(hours=1)
+    thread_user = _synthetic_user(user_id=111)
+    first_image = FragImage("https://example.invalid/canonical-first.jpg")
+    first_contents = Contents("canonical first body", [first_image])
+    first_post = _synthetic_post(first_pid, tid, 1, thread_user, first_contents)
+    first_post.reply_num = 2
+    first_thread = _synthetic_thread(tid, first_pid, thread_user, first_contents)
+    first_thread.reply_num = 100
+    first_page = research_client_module.ResearchPage(
+        raw=SimpleNamespace(thread=first_thread, objs=[first_post]),
+        dto=object(),
+        observed_at=t1,
+        source_api="aiotieba.get_posts",
+    )
+
+    duplicate_post = _synthetic_post(
+        first_pid,
+        tid,
+        0,
+        _synthetic_user(user_id=222),
+        Contents("unknown-floor duplicate", [FragImage("https://example.invalid/duplicate.jpg")]),
+    )
+    preview_cid = first_pid + 50
+    preview_user = _synthetic_user(user_id=555)
+    duplicate_post.comments = [
+        SimpleNamespace(
+            pid=preview_cid,
+            tid=tid,
+            ppid=first_pid,
+            fid=7654321,
+            fname="合成贴吧",
+            author_id=preview_user.user_id,
+            user=preview_user,
+            contents=Contents("preview on canonical first post"),
+            reply_to_id=0,
+            agree=0,
+            disagree=0,
+            is_thread_author=False,
+        )
+    ]
+    page_head = _synthetic_post(
+        page_head_pid,
+        tid,
+        31,
+        _synthetic_user(user_id=333),
+        Contents("ordinary page head", [FragImage("https://example.invalid/page-head.jpg")]),
+    )
+    later_thread = _synthetic_thread(tid, page_head_pid, _synthetic_user(user_id=999), Contents("page header"))
+    later_thread.reply_num = 300
+    later_page = research_client_module.ResearchPage(
+        raw=SimpleNamespace(thread=later_thread, objs=[duplicate_post, page_head]),
+        dto=object(),
+        observed_at=t2,
+        source_api="aiotieba.get_posts",
+    )
+
+    other_tid_post = _synthetic_post(
+        first_pid,
+        other_tid,
+        0,
+        _synthetic_user(user_id=444),
+        Contents("same pid in another thread", [FragImage("https://example.invalid/other-thread.jpg")]),
+    )
+    other_thread = _synthetic_thread(other_tid, first_pid, _synthetic_user(user_id=777), Contents("other header"))
+    other_tid_page = research_client_module.ResearchPage(
+        raw=SimpleNamespace(thread=other_thread, objs=[other_tid_post]),
+        dto=object(),
+        observed_at=t3,
+        source_api="aiotieba.get_posts",
+    )
+
+    engine, sessionmaker = _sqlite_research_sessionmaker()
+    try:
+        await persist_research_page(sessionmaker, first_page)
+        result = await persist_research_page(sessionmaker, later_page)
+        assert result["posts"] == 1
+        assert result["media_assets"] == 1
+        await persist_research_page(sessionmaker, other_tid_page)
+
+        with Session(engine) as database:
+            stored_thread = database.scalar(select(ResearchThread).where(ResearchThread.tid == tid))
+            assert stored_thread.first_pid == first_pid
+            assert stored_thread.body_text == "canonical first body"
+            assert stored_thread.reply_count == 100
+            assert stored_thread.observed_at.replace(tzinfo=UTC) == t1
+
+            original_tid_posts = database.scalars(
+                select(ResearchPost).where(ResearchPost.tid == tid).order_by(ResearchPost.pid)
+            ).all()
+            assert [post.pid for post in original_tid_posts] == [page_head_pid]
+            same_pid_other_tid = database.scalar(select(ResearchPost).where(ResearchPost.pid == first_pid))
+            assert same_pid_other_tid.tid == other_tid
+
+            observations = database.scalars(
+                select(ResearchContentObservation).where(ResearchContentObservation.owner_type == "post")
+            ).all()
+            assert ("post", first_pid, tid) not in {
+                (row.owner_type, row.owner_id, row.tid) for row in observations
+            }
+            assert ("post", first_pid, other_tid) in {
+                (row.owner_type, row.owner_id, row.tid) for row in observations
+            }
+
+            assets = database.scalars(
+                select(MediaAsset).where(MediaAsset.owner_type == "post", MediaAsset.owner_id == first_pid)
+            ).all()
+            assert [(asset.tid, asset.src_url) for asset in assets] == [
+                (other_tid, "https://example.invalid/other-thread.jpg")
+            ]
+            first_marker = database.scalar(
+                select(ResearchContentObservation).where(
+                    ResearchContentObservation.owner_type == "thread_first_post",
+                    ResearchContentObservation.owner_id == tid,
+                )
+            )
+            assert first_marker.observed_at.replace(tzinfo=UTC) == t1
+
+            preview_observations = database.scalars(
+                select(ResearchFieldObservation).where(
+                    ResearchFieldObservation.target_type == "comment",
+                    ResearchFieldObservation.target_id == preview_cid,
+                    ResearchFieldObservation.parent_post_pid == first_pid,
+                )
+            ).all()
+            assert preview_observations
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_known_first_pid_filter_keeps_existing_duplicate_history():
+    tid = 987654321012345678
+    first_pid = 987654321012345679
+    t0 = datetime(2026, 11, 12, 9, tzinfo=UTC)
+    t1 = t0 + timedelta(hours=1)
+    t2 = t1 + timedelta(hours=1)
+    user = _synthetic_user(user_id=111)
+
+    historical_post = _synthetic_post(
+        first_pid,
+        tid,
+        0,
+        user,
+        Contents("historical duplicate", [FragImage("https://example.invalid/historical.jpg")]),
+    )
+    historical_page = research_client_module.ResearchPage(
+        raw=SimpleNamespace(
+            thread=_synthetic_thread(tid, first_pid, user, Contents("header")),
+            objs=[historical_post],
+        ),
+        dto=object(),
+        observed_at=t0,
+        source_api="aiotieba.get_posts",
+    )
+    first_floor = _synthetic_post(first_pid, tid, 1, user, Contents("canonical first"))
+    first_floor_page = research_client_module.ResearchPage(
+        raw=SimpleNamespace(
+            thread=_synthetic_thread(tid, first_pid, user, Contents("canonical first")),
+            objs=[first_floor],
+        ),
+        dto=object(),
+        observed_at=t1,
+        source_api="aiotieba.get_posts",
+    )
+    repeated_unknown_floor = _synthetic_post(
+        first_pid,
+        tid,
+        0,
+        user,
+        Contents("new duplicate value", [FragImage("https://example.invalid/new-duplicate.jpg")]),
+    )
+    repeated_page = research_client_module.ResearchPage(
+        raw=SimpleNamespace(
+            thread=_synthetic_thread(tid, first_pid + 100, user, Contents("header")),
+            objs=[repeated_unknown_floor],
+        ),
+        dto=object(),
+        observed_at=t2,
+        source_api="aiotieba.get_posts",
+    )
+
+    engine, sessionmaker = _sqlite_research_sessionmaker()
+    try:
+        await persist_research_page(sessionmaker, historical_page)
+        await persist_research_page(sessionmaker, first_floor_page)
+        await persist_research_page(sessionmaker, repeated_page)
+
+        with Session(engine) as database:
+            stored_post = database.scalar(select(ResearchPost).where(ResearchPost.pid == first_pid))
+            assert stored_post.tid == tid
+            assert stored_post.text == "historical duplicate"
+            marker = database.scalar(
+                select(ResearchContentObservation).where(
+                    ResearchContentObservation.owner_type == "post",
+                    ResearchContentObservation.owner_id == first_pid,
+                )
+            )
+            assert marker.observed_at.replace(tzinfo=UTC) == t0
+            media = database.scalars(
+                select(MediaAsset).where(MediaAsset.owner_type == "post", MediaAsset.owner_id == first_pid)
+            ).all()
+            assert [(asset.src_url, asset.observed_at.replace(tzinfo=UTC)) for asset in media] == [
+                ("https://example.invalid/historical.jpg", t0)
+            ]
     finally:
         engine.dispose()
 

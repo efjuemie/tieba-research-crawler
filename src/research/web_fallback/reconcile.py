@@ -29,8 +29,13 @@ from src.research.models import (
 )
 
 from .diagnostics import with_elapsed_seconds
-from .identity import IdentityError, ObservationCandidate, parse_positive_id
-from .tasks import WEB_FIELD_TYPES, _record_failure_audit, _safe_reason
+from .identity import (
+    IdentityError,
+    ObservationCandidate,
+    canonical_growth_icon_url,
+    parse_positive_id,
+)
+from .tasks import LEGACY_WEB_FIELD_TYPES, WEB_FIELD_TYPES, _record_failure_audit, _safe_reason
 
 
 class _ReconcileRejectedError(Exception):
@@ -254,7 +259,9 @@ def _validate_candidate(task: ResearchWebEnrichmentTask, candidate: ObservationC
         raise _ReconcileRejectedError("failed_final", "candidate_contract_invalid")
     if candidate.field_name not in tuple(task.requested_fields_json):
         raise _ReconcileRejectedError("failed_final", "candidate_field_not_requested")
-    expected_type = WEB_FIELD_TYPES.get(candidate.field_name)
+    expected_type = WEB_FIELD_TYPES.get(candidate.field_name) or LEGACY_WEB_FIELD_TYPES.get(
+        candidate.field_name
+    )
     if expected_type is None:
         raise _ReconcileRejectedError("failed_final", "candidate_field_not_allowlisted")
     value = candidate.normalized_value
@@ -266,6 +273,26 @@ def _validate_candidate(task: ResearchWebEnrichmentTask, candidate: ObservationC
         valid_type = isinstance(value, str) and bool(value.strip())
     if not valid_type:
         raise _ReconcileRejectedError("failed_final", "candidate_normalized_type_invalid")
+    if candidate.field_name == "reply_to_user_id" and value <= 0:
+        raise _ReconcileRejectedError("failed_final", "candidate_reply_to_user_id_invalid")
+    if candidate.field_name == "global_growth_icon_url":
+        if canonical_growth_icon_url(value) != value:
+            raise _ReconcileRejectedError("failed_final", "candidate_growth_icon_url_invalid")
+    if candidate.field_name == "reply_to_display_name":
+        raw_evidence = candidate.raw_value
+        if (
+            candidate.source_kind != "web_network"
+            or not isinstance(raw_evidence, Mapping)
+            or set(raw_evidence) != {"mention_type", "mention_uid"}
+            or raw_evidence.get("mention_type") != 4
+        ):
+            raise _ReconcileRejectedError("failed_final", "candidate_reply_to_mention_invalid")
+        mention_uid = raw_evidence.get("mention_uid")
+        if mention_uid is not None:
+            try:
+                parse_positive_id(mention_uid)
+            except IdentityError:
+                raise _ReconcileRejectedError("failed_final", "candidate_reply_to_mention_invalid") from None
     if candidate.field_name == "ip_location_text":
         try:
             ipaddress.ip_address(value.strip())
@@ -558,6 +585,67 @@ async def complete_web_enrichment_task(
             grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for item in validated:
                 grouped[item["candidate"].field_name].append(item)
+            reply_uid_candidates = {
+                item["normalized_value"]
+                for item in grouped.get("reply_to_user_id", ())
+                if item["candidate"].precision == "exact"
+            }
+            reply_name_uid_candidates: list[tuple[str, str]] = []
+            reply_name_only_candidates: list[str] = []
+            for item in grouped.get("reply_to_display_name", ()):
+                if item["candidate"].precision != "exact":
+                    continue
+                mention_uid = item["raw_value"].get("mention_uid")
+                if mention_uid is None:
+                    reply_name_only_candidates.append(item["normalized_value"])
+                    continue
+                try:
+                    reply_name_uid_candidates.append(
+                        (parse_positive_id(mention_uid), item["normalized_value"])
+                    )
+                except IdentityError:
+                    continue
+            reply_name_sources = sources.get("reply_to_display_name")
+            reply_name_bindings: list[str | None] = []
+            unbound_reply_names: list[str] = []
+            bound_reply_names: list[tuple[str, str | None]] = []
+            if isinstance(reply_name_sources, Mapping):
+                for provenance in reply_name_sources.values():
+                    if not isinstance(provenance, Mapping):
+                        continue
+                    binding = provenance.get("reply_target_user_id")
+                    value = provenance.get("value")
+                    if binding is not None:
+                        try:
+                            normalized_binding = parse_positive_id(binding)
+                            reply_name_bindings.append(normalized_binding)
+                        except IdentityError:
+                            normalized_binding = None
+                            reply_name_bindings.append(None)
+                        if isinstance(value, str):
+                            bound_reply_names.append((value, normalized_binding))
+                    elif provenance.get("confidence") == "display_name_only":
+                        if isinstance(value, str) and value.strip():
+                            unbound_reply_names.append(value)
+            unbound_reply_names = [
+                name
+                for name in unbound_reply_names
+                if not any(bound_name == name for bound_name, _uid in bound_reply_names)
+            ]
+            known_reply_uids: list[str | None] = []
+            if task.target_type == "comment" and row.reply_to_user_id is not None:
+                try:
+                    known_reply_uids.append(parse_positive_id(row.reply_to_user_id))
+                except IdentityError:
+                    known_reply_uids.append(None)
+            reply_sources = sources.get("reply_to_user_id")
+            verified_reply = reply_sources.get("verified_web") if isinstance(reply_sources, Mapping) else None
+            verified_reply_uid = verified_reply.get("value") if isinstance(verified_reply, Mapping) else None
+            if verified_reply_uid is not None:
+                try:
+                    known_reply_uids.append(parse_positive_id(verified_reply_uid))
+                except IdentityError:
+                    known_reply_uids.append(None)
 
             applied_fields: list[str] = []
             confirmed_fields: list[str] = []
@@ -588,6 +676,113 @@ async def complete_web_enrichment_task(
                     continue
 
                 candidate_value = exact_group[0]["normalized_value"]
+                if (
+                    field_name == "reply_to_user_id"
+                    and task.target_type == "comment"
+                ):
+                    candidate_uid = parse_positive_id(candidate_value)
+                    bound_uids = [
+                        *reply_name_bindings,
+                        *(uid for uid, _name in reply_name_uid_candidates),
+                    ]
+                    bound_uids.extend(known_reply_uids)
+                    same_label_upgrade = any(
+                        uid == candidate_uid
+                        and name in unbound_reply_names
+                        and all(existing_name == name for existing_name in unbound_reply_names)
+                        for uid, name in reply_name_uid_candidates
+                    )
+                    if (
+                        row.reply_to_user_id is None
+                        and not known_reply_uids
+                        and (unbound_reply_names or reply_name_only_candidates)
+                        and (reply_name_only_candidates or not same_label_upgrade)
+                    ):
+                        missing_reasons["reply_to_user_id"] = "reply_to_uid_unbound_display_name"
+                        conflict_fields.append(field_name)
+                        candidate_status_by_field[field_name] = "conflict"
+                        for item in exact_group:
+                            observation_statuses[id(item)] = "conflict"
+                        continue
+                    if any(uid is None or uid != candidate_uid for uid in bound_uids):
+                        if bound_uids:
+                            missing_reasons["reply_to_user_id"] = "reply_to_uid_binding_conflict"
+                        conflict_fields.append(field_name)
+                        candidate_status_by_field[field_name] = "conflict"
+                        for item in exact_group:
+                            observation_statuses[id(item)] = "conflict"
+                        continue
+                if field_name == "reply_to_display_name":
+                    mention_uids = {
+                        item["raw_value"].get("mention_uid")
+                        for item in exact_group
+                    }
+                    if len(mention_uids) != 1:
+                        conflict_fields.append(field_name)
+                        candidate_status_by_field[field_name] = "conflict"
+                        for item in exact_group:
+                            observation_statuses[id(item)] = "conflict"
+                        continue
+                    mention_uid = next(iter(mention_uids))
+                    if mention_uid is None:
+                        if known_reply_uids or reply_name_bindings:
+                            reason = "reply_to_mention_uid_missing"
+                            missing_reasons[field_name] = reason
+                            outcomes[field_name] = {"status": "needs_evidence", "reason": reason}
+                            for item in exact_group:
+                                observation_statuses[id(item)] = "audit_only"
+                            continue
+                    else:
+                        try:
+                            mention_uid = parse_positive_id(mention_uid)
+                        except IdentityError:
+                            conflict_fields.append(field_name)
+                            candidate_status_by_field[field_name] = "conflict"
+                            for item in exact_group:
+                                observation_statuses[id(item)] = "conflict"
+                            continue
+                        if unbound_reply_names and any(
+                            name != candidate_value for name in unbound_reply_names
+                        ):
+                            conflict_fields.append(field_name)
+                            candidate_status_by_field[field_name] = "conflict"
+                            for item in exact_group:
+                                observation_statuses[id(item)] = "conflict"
+                            continue
+                    uid_matches = True
+                    if mention_uid is not None and known_reply_uids:
+                        try:
+                            uid_matches = all(
+                                known_uid is not None and mention_uid == known_uid
+                                for known_uid in known_reply_uids
+                            )
+                        except IdentityError:
+                            uid_matches = False
+                        if not uid_matches:
+                            conflict_fields.append(field_name)
+                            candidate_status_by_field[field_name] = "conflict"
+                            for item in exact_group:
+                                observation_statuses[id(item)] = "conflict"
+                            continue
+                    if uid_matches and mention_uid is not None and reply_name_bindings:
+                        uid_matches = all(
+                            bound_uid is not None and mention_uid == bound_uid
+                            for bound_uid in reply_name_bindings
+                        )
+                    if uid_matches and mention_uid is not None and reply_uid_candidates:
+                        try:
+                            uid_matches = (
+                                len(reply_uid_candidates) == 1
+                                and mention_uid == parse_positive_id(next(iter(reply_uid_candidates)))
+                            )
+                        except IdentityError:
+                            uid_matches = False
+                    if not uid_matches:
+                        conflict_fields.append(field_name)
+                        candidate_status_by_field[field_name] = "conflict"
+                        for item in exact_group:
+                            observation_statuses[id(item)] = "conflict"
+                        continue
                 current_value = getattr(row, field_name)
                 unknown = _unknown_canonical_value(current_value, field_name, missing_reasons)
                 if current_value == candidate_value:
@@ -595,6 +790,27 @@ async def complete_web_enrichment_task(
                     candidate_status_by_field[field_name] = "confirmed"
                     for item in exact_group:
                         observation_statuses[id(item)] = "confirmed"
+                    if field_name == "reply_to_display_name":
+                        first = exact_group[0]
+                        sources[field_name] = {
+                            **(
+                                sources.get(field_name)
+                                if isinstance(sources.get(field_name), dict)
+                                else {}
+                            ),
+                            "verified_web": {
+                                "observation_time": first["observed_at"].isoformat(),
+                                "source_kind": first["candidate"].source_kind,
+                                "parser_version": first["candidate"].parser_version,
+                                "value": candidate_value,
+                                "confidence": (
+                                    "display_name_only"
+                                    if mention_uid is None
+                                    else "explicit_type4_mention"
+                                ),
+                                "reply_target_user_id": mention_uid,
+                            },
+                        }
                     continue
                 if not unknown:
                     conflict_fields.append(field_name)
@@ -617,6 +833,18 @@ async def complete_web_enrichment_task(
                         "source_kind": first["candidate"].source_kind,
                         "parser_version": first["candidate"].parser_version,
                         "value": candidate_value,
+                        **(
+                            {
+                                "confidence": (
+                                    "display_name_only"
+                                    if mention_uid is None
+                                    else "explicit_type4_mention"
+                                ),
+                                "reply_target_user_id": mention_uid,
+                            }
+                            if field_name == "reply_to_display_name"
+                            else {}
+                        ),
                     },
                 }
                 if field_name == "ip_location_text":
@@ -661,7 +889,11 @@ async def complete_web_enrichment_task(
                     "identity_evidence_json": item["identity"],
                     "validation_status": "verified",
                     "applied_status": status,
-                    "missing_reason": None,
+                    "missing_reason": (
+                        outcomes.get(candidate.field_name, {}).get("reason")
+                        if status == "audit_only"
+                        else None
+                    ),
                     "created_at": current_time,
                     "applied_at": current_time if status in {"applied", "confirmed"} else None,
                 }

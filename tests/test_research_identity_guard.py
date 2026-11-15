@@ -238,7 +238,19 @@ async def test_api_conflicts_are_deep_copied_and_persist_for_all_content_rows():
                 "parser_version": "synthetic-v1",
                 "value": 3,
             }
-        }
+        },
+        "global_growth_icon_url": {
+            "verified_web": {
+                "source_kind": "web_network",
+                "value": "https://example.invalid/growth-icon.webp",
+            }
+        },
+        "reply_to_display_name": {
+            "verified_web": {
+                "source_kind": "web_dom",
+                "value": "synthetic reply target",
+            }
+        },
     }
     with Session(engine) as session, session.begin():
         session.add_all(
@@ -249,6 +261,7 @@ async def test_api_conflicts_are_deep_copied_and_persist_for_all_content_rows():
                     fid=7654321,
                     author_user_id=501,
                     agree_count=3,
+                    global_growth_icon_url="https://example.invalid/growth-icon.webp",
                     field_sources_json=source,
                     source_api="aiotieba.get_threads",
                     observed_at=t1,
@@ -261,6 +274,7 @@ async def test_api_conflicts_are_deep_copied_and_persist_for_all_content_rows():
                     fid=7654321,
                     author_user_id=501,
                     agree_count=3,
+                    global_growth_icon_url="https://example.invalid/growth-icon.webp",
                     field_sources_json=source,
                     source_api="aiotieba.get_posts",
                     observed_at=t1,
@@ -274,6 +288,8 @@ async def test_api_conflicts_are_deep_copied_and_persist_for_all_content_rows():
                     fid=7654321,
                     author_user_id=777,
                     agree_count=3,
+                    global_growth_icon_url="https://example.invalid/growth-icon.webp",
+                    reply_to_display_name="synthetic reply target",
                     field_sources_json=source,
                     source_api="aiotieba.get_comments",
                     observed_at=t1,
@@ -330,6 +346,7 @@ async def test_api_conflicts_are_deep_copied_and_persist_for_all_content_rows():
         ]
         for row in rows:
             assert row.agree_count == 3
+            assert row.global_growth_icon_url == "https://example.invalid/growth-icon.webp"
             assert row.field_sources_json["agree_count"]["verified_web"]["value"] == 3
             assert row.field_sources_json["agree_count"]["api_conflicts"] == [
                 {
@@ -338,4 +355,8 @@ async def test_api_conflicts_are_deep_copied_and_persist_for_all_content_rows():
                     "value": 9,
                 }
             ]
+        assert rows[2].reply_to_display_name == "synthetic reply target"
+        assert rows[2].field_sources_json["reply_to_display_name"]["verified_web"]["value"] == (
+            "synthetic reply target"
+        )
     engine.dispose()

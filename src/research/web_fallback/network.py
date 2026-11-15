@@ -15,6 +15,7 @@ from .identity import (
     ImmutableRequestContext,
     ObservationCandidate,
     Target,
+    canonical_growth_icon_url,
     make_identity_evidence,
     parse_json_unique,
     parse_positive_id,
@@ -120,6 +121,216 @@ def extract_page_pc_thread_counts(
             (thread, "share_num", "share_count", "page_pc.thread.share_num"),
         ),
     )
+    growth_candidate, growth_outcome = _growth_icon_candidate(
+        target,
+        author,
+        "page_pc.thread.author",
+        identity,
+        request_context,
+    )
+    if growth_candidate is not None:
+        candidates.append(growth_candidate)
+        outcomes.pop("global_growth_icon_url", None)
+    elif growth_outcome is not None:
+        outcomes["global_growth_icon_url"] = growth_outcome
+    return NetworkExtractionResult("ok", None, True, tuple(candidates), outcomes)
+
+
+def extract_page_pc_post(
+    target: Target,
+    response_text: str,
+    request_context: ImmutableRequestContext,
+    *,
+    response_status: int = 200,
+) -> NetworkExtractionResult:
+    payload, failure = _page_pc_payload(
+        target, response_text, request_context, "post", response_status
+    )
+    if failure is not None:
+        return failure
+    if payload is None:
+        return _page_pc_failed(target, "dom_changed", "response_root_not_object")
+    if target.pid is None or target.author_user_id is None or target.fid is None:
+        return _page_pc_failed(target, "identity_unverified", "post_target_identity_missing")
+
+    forum = payload.get("forum")
+    thread = payload.get("thread")
+    post_list = payload.get("post_list")
+    if not isinstance(forum, dict) or not isinstance(thread, dict):
+        return _page_pc_failed(target, "identity_unverified", "page_pc_identity_structure_missing")
+    try:
+        forum_id = parse_positive_id(forum["id"])
+        thread_id = parse_positive_id(thread["id"])
+    except (IdentityError, KeyError):
+        return _page_pc_failed(target, "identity_unverified", "page_pc_identity_id_invalid")
+    if forum_id != target.fid:
+        return _page_pc_failed(target, "identity_unverified", "response_fid_mismatch")
+    if thread_id != target.tid:
+        return _page_pc_failed(target, "identity_unverified", "response_tid_mismatch")
+    for obj, aliases, expected, reason in (
+        (forum, ("fid",), target.fid, "response_fid_mismatch"),
+        (thread, ("tid", "thread_id"), target.tid, "response_tid_mismatch"),
+        (thread, ("fid", "forum_id"), target.fid, "response_fid_mismatch"),
+    ):
+        failure_reason = _page_pc_alias_failure(obj, aliases, expected, reason)
+        if failure_reason:
+            return _page_pc_failed(target, "identity_unverified", failure_reason)
+    if not isinstance(post_list, list):
+        return _page_pc_failed(target, "dom_changed", "post_list_missing")
+
+    matching_posts = []
+    seen_post_ids = set()
+    for index, post in enumerate(post_list):
+        if not isinstance(post, dict) or "id" not in post:
+            return _page_pc_failed(target, "identity_unverified", "response_post_id_missing")
+        try:
+            post_id = parse_positive_id(post["id"])
+        except IdentityError:
+            return _page_pc_failed(target, "identity_unverified", "response_post_id_invalid")
+        if post_id in seen_post_ids:
+            return _page_pc_failed(target, "identity_unverified", "duplicate_response_post_id")
+        seen_post_ids.add(post_id)
+        for aliases, expected, reason in (
+            (("pid", "post_id"), post_id, "response_post_id_mismatch"),
+            (("fid", "forum_id"), target.fid, "response_fid_mismatch"),
+            (("tid", "thread_id"), target.tid, "response_tid_mismatch"),
+        ):
+            failure_reason = _page_pc_alias_failure(post, aliases, expected, reason)
+            if failure_reason:
+                return _page_pc_failed(target, "identity_unverified", failure_reason)
+        if post_id == target.pid:
+            matching_posts.append((index, post))
+    if not matching_posts:
+        return _page_pc_failed(target, "not_tested", "target_post_missing_from_response")
+    if len(matching_posts) != 1:
+        return _page_pc_failed(target, "identity_unverified", "duplicate_target_post")
+
+    post_index, post = matching_posts[0]
+    try:
+        author_id = parse_positive_id(post["author_id"])
+    except (IdentityError, KeyError):
+        return _page_pc_failed(target, "identity_unverified", "response_author_id_invalid")
+    if author_id != target.author_user_id:
+        return _page_pc_failed(target, "identity_unverified", "response_author_id_mismatch")
+    for source, aliases, reason in (
+        (post, ("author_user_id",), "response_author_id_disagreement"),
+        (post.get("author"), ("id",), "response_author_id_disagreement"),
+    ):
+        failure_reason = _page_pc_alias_failure(source, aliases, author_id, reason)
+        if failure_reason:
+            return _page_pc_failed(target, "identity_unverified", failure_reason)
+
+    users = payload.get("user_list")
+    if not isinstance(users, list):
+        return _page_pc_failed(target, "identity_unverified", "user_list_missing")
+    matching_users = []
+    seen_user_ids = set()
+    for index, user in enumerate(users):
+        if not isinstance(user, dict) or "id" not in user:
+            return _page_pc_failed(target, "identity_unverified", "response_user_id_missing")
+        try:
+            user_id = parse_positive_id(user["id"])
+        except IdentityError:
+            return _page_pc_failed(target, "identity_unverified", "response_user_id_invalid")
+        if user_id in seen_user_ids:
+            return _page_pc_failed(target, "identity_unverified", "duplicate_response_user_id")
+        seen_user_ids.add(user_id)
+        if user_id == author_id:
+            matching_users.append((index, user))
+    if len(matching_users) != 1:
+        return _page_pc_failed(target, "identity_unverified", "response_user_id_not_unique")
+
+    identity = make_identity_evidence(
+        target,
+        (
+            "page_tid",
+            "request_tid",
+            "response_forum_id",
+            "response_thread_id",
+            "unique_response_post_id",
+            "response_author_id",
+            "unique_response_user_id",
+        ),
+        request_context,
+    )
+    user_index, user = matching_users[0]
+    outcomes = {
+        name: {"status": "not_tested", "reason": "not_observed_in_response"}
+        for name in target.requested_fields
+    }
+    candidates = []
+    ip_address = user.get("ip_address")
+    if "ip_location_text" in target.requested_fields:
+        if isinstance(ip_address, str) and ip_address.strip() and not _is_literal_ip(ip_address.strip()):
+            outcomes.pop("ip_location_text", None)
+            candidates.append(
+                _page_pc_candidate(
+                    target,
+                    "ip_location_text",
+                    ip_address,
+                    ip_address,
+                    f"page_pc.user_list[{user_index}].ip_address",
+                    request_context,
+                    identity,
+                )
+            )
+        elif isinstance(ip_address, str):
+            outcomes["ip_location_text"] = {
+                "status": "absent_on_page",
+                "reason": "ip_location_empty_in_response",
+            }
+
+    growth = user.get("user_growth")
+    if "global_growth_level" in target.requested_fields and isinstance(growth, dict) and "level_id" in growth:
+        level = _nonnegative_integer(growth["level_id"])
+        if level == 0:
+            outcomes["global_growth_level"] = {
+                "status": "absent_on_page",
+                "reason": "global_growth_level_zero_is_unknown",
+            }
+        elif level is None:
+            outcomes["global_growth_level"] = {
+                "status": "needs_evidence",
+                "reason": "invalid_global_growth_level",
+            }
+        else:
+            outcomes.pop("global_growth_level", None)
+            candidates.append(
+                _page_pc_candidate(
+                    target,
+                    "global_growth_level",
+                    growth["level_id"],
+                    level,
+                    f"page_pc.user_list[{user_index}].user_growth.level_id",
+                    request_context,
+                    identity,
+                )
+            )
+
+    growth_candidate, growth_outcome = _growth_icon_candidate(
+        target,
+        user,
+        f"page_pc.user_list[{user_index}]",
+        identity,
+        request_context,
+    )
+    if growth_candidate is not None:
+        candidates.append(growth_candidate)
+        outcomes.pop("global_growth_icon_url", None)
+    elif growth_outcome is not None:
+        outcomes["global_growth_icon_url"] = growth_outcome
+
+    agree_candidates, agree_outcomes = _page_pc_count_candidates(
+        target,
+        identity,
+        request_context,
+        ((post.get("agree"), "agree_num", "agree_count", f"page_pc.post_list[{post_index}].agree.agree_num"),),
+    )
+    candidates.extend(agree_candidates)
+    if "agree_count" in agree_outcomes:
+        outcomes["agree_count"] = agree_outcomes["agree_count"]
+    for candidate in candidates:
+        outcomes.pop(candidate.field_name, None)
     return NetworkExtractionResult("ok", None, True, tuple(candidates), outcomes)
 
 
@@ -353,6 +564,101 @@ def extract_page_pc_comment(
                 identity,
             )
         )
+    growth = user.get("user_growth")
+    if "global_growth_level" in target.requested_fields and isinstance(growth, dict) and "level_id" in growth:
+        level = _nonnegative_integer(growth["level_id"])
+        if level == 0:
+            outcomes["global_growth_level"] = {
+                "status": "absent_on_page",
+                "reason": "global_growth_level_zero_is_unknown",
+            }
+        elif level is None:
+            outcomes["global_growth_level"] = {
+                "status": "needs_evidence",
+                "reason": "invalid_global_growth_level",
+            }
+        else:
+            outcomes.pop("global_growth_level", None)
+            candidates.append(
+                _page_pc_candidate(
+                    target,
+                    "global_growth_level",
+                    growth["level_id"],
+                    level,
+                    f"page_pc.user_list[{user_index}].user_growth.level_id",
+                    request_context,
+                    identity,
+                )
+            )
+
+    growth_candidate, growth_outcome = _growth_icon_candidate(
+        target,
+        user,
+        f"page_pc.user_list[{user_index}]",
+        identity,
+        request_context,
+    )
+    if growth_candidate is not None:
+        candidates.append(growth_candidate)
+        outcomes.pop("global_growth_icon_url", None)
+    elif growth_outcome is not None:
+        outcomes["global_growth_icon_url"] = growth_outcome
+
+    content = comment.get("content")
+    reply_name, reply_uid = _reply_prefix_mention(content)
+    if reply_name is None:
+        has_exact_prefix = (
+            isinstance(content, list)
+            and bool(content)
+            and isinstance(content[0], dict)
+            and content[0].get("type") == 0
+            and content[0].get("text") == "回复 "
+        )
+        outcome = {
+            "status": "needs_evidence" if has_exact_prefix else "absent_on_page",
+            "reason": "reply_mention_not_exposed" if has_exact_prefix else "reply_prefix_not_present",
+        }
+        for field_name in ("reply_to_display_name", "reply_to_user_id"):
+            if field_name in outcomes:
+                outcomes[field_name] = outcome
+    else:
+        comment_base = (
+            f"page_pc.post_list[{post_index}].sub_post_list.sub_post_list[{comment_index}].content[1]"
+        )
+        if "reply_to_display_name" in outcomes:
+            outcomes.pop("reply_to_display_name", None)
+            candidates.append(
+                _page_pc_candidate(
+                    target,
+                    "reply_to_display_name",
+                    {"mention_type": 4, "mention_uid": reply_uid},
+                    reply_name,
+                    f"{comment_base}.text",
+                    request_context,
+                    identity,
+                )
+            )
+        if "reply_to_user_id" in outcomes:
+            if reply_uid is None:
+                outcomes["reply_to_user_id"] = {
+                    "status": "absent_on_page",
+                    "reason": "reply_mention_uid_not_valid",
+                }
+            else:
+                outcomes.pop("reply_to_user_id", None)
+                reply_uid_int = int(reply_uid)
+                candidates.append(
+                    _page_pc_candidate(
+                        target,
+                        "reply_to_user_id",
+                        reply_uid_int,
+                        reply_uid_int,
+                        f"{comment_base}.uid",
+                        request_context,
+                        identity,
+                    )
+                )
+
     counts, count_outcomes = _page_pc_count_candidates(
         target,
         identity,
@@ -362,20 +668,20 @@ def extract_page_pc_comment(
                 comment.get("agree"),
                 "agree_num",
                 "agree_count",
-                f"page_pc.post_list[{post_index}].sub_post_list.sub_post_list[{comment_index}]"
-                ".agree.agree_num",
+                f"page_pc.post_list[{post_index}].sub_post_list.sub_post_list[{comment_index}].agree.agree_num",
             ),
             (
                 comment.get("agree"),
                 "disagree_num",
                 "disagree_count",
-                f"page_pc.post_list[{post_index}].sub_post_list.sub_post_list[{comment_index}]"
-                ".agree.disagree_num",
+                f"page_pc.post_list[{post_index}].sub_post_list.sub_post_list[{comment_index}].agree.disagree_num",
             ),
         ),
     )
     candidates.extend(counts)
-    outcomes.update(count_outcomes)
+    for field_name in ("agree_count", "disagree_count"):
+        if field_name in count_outcomes:
+            outcomes[field_name] = count_outcomes[field_name]
     for candidate in candidates:
         outcomes.pop(candidate.field_name, None)
     return NetworkExtractionResult("ok", None, True, tuple(candidates), outcomes)
@@ -390,10 +696,14 @@ def _page_pc_payload(target, response_text, request_context, target_type, respon
         return None, _page_pc_failed(target, "dom_changed", f"http_{response_status}")
     if target.target_type != target_type:
         return None, _page_pc_failed(target, "identity_unverified", "page_pc_target_type_mismatch")
-    context_check = validate_page_pc_request_context(target, request_context)
-    if not context_check.identity_verified:
+    context_reason = (
+        _page_pc_post_request_reason(target, request_context)
+        if target_type == "post"
+        else _page_pc_request_reason(target, request_context)
+    )
+    if context_reason is not None:
         return None, _page_pc_failed(
-            target, "identity_unverified", context_check.reason or "request_context_invalid"
+            target, "identity_unverified", context_reason
         )
     try:
         payload = parse_json_unique(response_text)
@@ -410,6 +720,63 @@ def _page_pc_payload(target, response_text, request_context, target_type, respon
     if error_code != 0:
         return None, _page_pc_failed(target, "dom_changed", "response_error_code_nonzero")
     return payload, None
+
+
+def _page_pc_request_reason(target, request_context):
+    context_check = validate_page_pc_request_context(target, request_context)
+    if not context_check.identity_verified:
+        return context_check.reason or "request_context_invalid"
+    return None
+
+
+def _page_pc_post_request_reason(target, request_context):
+    if request_context.reason:
+        return request_context.reason
+    if target != request_context.target:
+        return "request_context_target_mismatch"
+    if target.target_type != "post":
+        return "page_pc_target_type_mismatch"
+    if request_context.request_method != "POST":
+        return "request_method_mismatch"
+    parsed = urlparse(request_context.request_url)
+    host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return "page_pc_request_context_mismatch"
+    if (
+        parsed.scheme != "https"
+        or host not in {"tieba.baidu.com", "www.tieba.baidu.com"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or parsed.path != PAGE_PC_PATH
+        or request_context.page_origin != f"https://{host}"
+    ):
+        return "page_pc_request_context_mismatch"
+    if request_context.page_tid != target.tid:
+        return "page_tid_mismatch"
+    if request_context.request_tid != target.tid:
+        return "request_tid_mismatch"
+    if target.fid is None:
+        return "target_fid_missing"
+    if request_context.request_fid is not None and request_context.request_fid != target.fid:
+        return "request_fid_mismatch"
+    return None
+
+
+def _page_pc_alias_failure(source, aliases, expected, reason):
+    if not isinstance(source, dict):
+        return None
+    for alias in aliases:
+        if alias not in source:
+            continue
+        try:
+            if parse_positive_id(source[alias]) != expected:
+                return reason
+        except IdentityError:
+            return "page_pc_identity_id_invalid"
+    return None
 
 
 def _page_pc_failed(target, status, reason):
@@ -449,7 +816,17 @@ def _page_pc_count_candidates(target, identity, request_context, sources):
     return candidates, outcomes
 
 
-def _page_pc_candidate(target, field_name, raw, normalized, path, request_context, identity):
+def _page_pc_candidate(
+    target,
+    field_name,
+    raw,
+    normalized,
+    path,
+    request_context,
+    identity,
+    *,
+    observed_at=None,
+):
     return ObservationCandidate(
         field_name=field_name,
         raw_value=raw,
@@ -457,7 +834,7 @@ def _page_pc_candidate(target, field_name, raw, normalized, path, request_contex
         source_kind="web_network",
         source_path=path,
         source_url=request_context.request_url,
-        observed_at=request_context.observed_at,
+        observed_at=observed_at or request_context.observed_at,
         identity=identity,
         temporal_scope="content_observation",
     )
@@ -600,6 +977,20 @@ def extract_nested_floor(
         if isinstance(value, str) and value:
             add(field_name, value, f"{base}.author.{api_key}")
 
+    growth_candidate, growth_outcome = _growth_icon_candidate(
+        target,
+        author,
+        f"{base}.author",
+        identity,
+        request_context,
+        observed_at=observed_at,
+    )
+    if growth_candidate is not None:
+        candidates.append(growth_candidate)
+        field_outcomes.pop("global_growth_icon_url", None)
+    elif growth_outcome is not None and "global_growth_icon_url" in field_outcomes:
+        field_outcomes["global_growth_icon_url"] = growth_outcome
+
     region = author.get("ip_address")
     if isinstance(region, str) and region.strip() and not _is_literal_ip(region.strip()):
         add("ip_location_text", region, f"{base}.author.ip_address")
@@ -616,12 +1007,37 @@ def extract_nested_floor(
     growth = author.get("user_growth")
     if isinstance(growth, dict) and "level_id" in growth:
         normalized_growth = _nonnegative_integer(growth["level_id"])
-        if normalized_growth is not None:
+        if normalized_growth == 0 and "global_growth_level" in field_outcomes:
+            field_outcomes["global_growth_level"] = {
+                "status": "absent_on_page",
+                "reason": "global_growth_level_zero_is_unknown",
+            }
+        elif normalized_growth is not None and normalized_growth > 0:
             add(
                 "global_growth_level",
                 growth["level_id"],
                 f"{base}.author.user_growth.level_id",
                 normalized=normalized_growth,
+            )
+
+    reply_name, reply_uid = _reply_prefix_mention(item.get("content"))
+    if reply_name is not None:
+        if reply_uid is not None:
+            add("reply_to_user_id", int(reply_uid), f"{base}.content[1].uid")
+        if "reply_to_display_name" in target.requested_fields:
+            field_outcomes.pop("reply_to_display_name", None)
+            candidates.append(
+                ObservationCandidate(
+                    field_name="reply_to_display_name",
+                    raw_value={"mention_type": 4, "mention_uid": reply_uid},
+                    normalized_value=reply_name,
+                    source_kind="web_network",
+                    source_path=f"{base}.content[1].text",
+                    source_url=request_context.request_url,
+                    observed_at=observed_at,
+                    identity=identity,
+                    temporal_scope="content_observation",
+                )
             )
 
     _add_forum_level_candidates(target, item, base, add)
@@ -659,6 +1075,64 @@ def _add_forum_level_candidates(target: Target, item: dict[str, Any], base: str,
         if isinstance(custom_data.get("level_name"), str) and custom_data["level_name"]:
             add("forum_level_name", custom_data["level_name"], f"{forum_path}.level_name")
         return
+
+
+def _growth_icon_candidate(target, author, base, identity, request_context, *, observed_at=None):
+    if "global_growth_icon_url" not in target.requested_fields:
+        return None, None
+    show_info = author.get("user_show_info") if isinstance(author, dict) else None
+    feed_head = show_info.get("feed_head") if isinstance(show_info, dict) else None
+    main_data = feed_head.get("main_data") if isinstance(feed_head, dict) else None
+    if not isinstance(main_data, list):
+        return None, {"status": "not_tested", "reason": "growth_icon_not_exposed_in_response"}
+    matches = []
+    for index, entry in enumerate(main_data):
+        if not isinstance(entry, dict):
+            continue
+        business = entry.get("business_info_map")
+        if not isinstance(business, dict) or business.get("icon_tip") != "贴吧成长等级":
+            continue
+        icon = entry.get("icon")
+        url = canonical_growth_icon_url(icon.get("url")) if isinstance(icon, dict) else None
+        matches.append((index, url))
+    if len(matches) != 1:
+        reason = "growth_icon_not_present_in_response" if not matches else "ambiguous_growth_icon_response"
+        status = "absent_on_page" if not matches else "needs_evidence"
+        return None, {"status": status, "reason": reason}
+    index, url = matches[0]
+    if url is None:
+        return None, {"status": "needs_evidence", "reason": "growth_icon_url_not_official_webp"}
+    return (
+        _page_pc_candidate(
+            target,
+            "global_growth_icon_url",
+            url,
+            url,
+            f"{base}.user_show_info.feed_head.main_data[{index}].icon.url",
+            request_context,
+            identity,
+            observed_at=observed_at,
+        ),
+        None,
+    )
+
+
+def _reply_prefix_mention(content):
+    if not isinstance(content, list) or len(content) < 2:
+        return None, None
+    prefix, mention = content[0], content[1]
+    if not isinstance(prefix, dict) or prefix.get("type") != 0 or prefix.get("text") != "回复 ":
+        return None, None
+    if not isinstance(mention, dict) or mention.get("type") != 4:
+        return None, None
+    display_name = mention.get("text")
+    if not isinstance(display_name, str) or not display_name.strip():
+        return None, None
+    try:
+        uid = parse_positive_id(mention.get("uid"))
+    except IdentityError:
+        uid = None
+    return display_name, uid
 
 
 def _forum_id_from_schema(schema: str) -> str | None:

@@ -190,6 +190,28 @@ def sanitize_source_url(url: str) -> str:
     return urlunparse(("https", host, parsed.path, "", urlencode(safe_query), ""))
 
 
+def canonical_growth_icon_url(value: Any) -> str | None:
+    """Accept an HTTPS Tieba growth badge asset from the observed official CDN."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    parsed = urlparse(value.strip())
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != "tieba-ares.cdn.bcebos.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or not parsed.path
+        or parsed.path == "/"
+    ):
+        return None
+    return urlunparse(("https", "tieba-ares.cdn.bcebos.com", parsed.path, "", parsed.query, ""))
+
+
 def _is_trusted_tieba_url(parsed, *, allow_www: bool = True) -> bool:
     allowed_hosts = {"tieba.baidu.com", "www.tieba.baidu.com"} if allow_www else {"tieba.baidu.com"}
     if parsed.scheme != "https" or (parsed.hostname or "").lower() not in allowed_hosts:

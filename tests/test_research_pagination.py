@@ -14,8 +14,12 @@ from conftest import (
     make_posts_response,
     make_thread,
     make_threads_response,
+    make_user,
 )
 from tiebameow.client.tieba_client import RetriableApiError
+from tiebameow.models.dto import PostUserDTO
+from tiebameow.models.orm import Comment as CommentModel
+from tiebameow.models.orm import Post as PostModel
 
 from src.research.client import ResearchPage
 from src.scraper.router import QueueRouter
@@ -193,7 +197,7 @@ async def test_first_post_comments_use_floor_one_pid_when_raw_thread_pid_is_zero
     first_post = make_post(pid=500, tid=9, floor=1, reply_num=20)
     posts_page = make_posts_response([first_post])
     research_response = ResearchPage(
-        raw=SimpleNamespace(thread=SimpleNamespace(pid=0, fid=0, fname="")),
+        raw=SimpleNamespace(thread=SimpleNamespace(pid=0, tid=9, fid=10, fname="bar")),
         dto=posts_page,
         observed_at=datetime.now(UTC),
         source_api="aiotieba.get_posts",
@@ -228,10 +232,21 @@ async def test_first_post_comments_use_floor_one_pid_when_raw_thread_pid_is_zero
 
 
 @pytest.mark.asyncio
-async def test_first_post_comments_fall_back_to_stored_first_pid():
-    posts_page = make_posts_response([])
+async def test_page_head_reply_uses_stored_canonical_first_pid_for_unmanaged_scope():
+    author_b = make_user(PostUserDTO, user_id=20, portrait="author-B")
+    reply = make_post(pid=200, tid=9, floor=31, user=author_b)
+    posts_page = make_posts_response([reply])
     research_response = ResearchPage(
-        raw=SimpleNamespace(thread=SimpleNamespace(pid=0, fid=0, fname="")),
+        raw=SimpleNamespace(
+            thread=SimpleNamespace(
+                pid=200,
+                tid=9,
+                fid=10,
+                fname="bar",
+                author_id=20,
+                user=author_b,
+            )
+        ),
         dto=posts_page,
         observed_at=datetime.now(UTC),
         source_api="aiotieba.get_posts",
@@ -239,7 +254,7 @@ async def test_first_post_comments_fall_back_to_stored_first_pid():
     datastore = SimpleNamespace(
         save_items=AsyncMock(),
         add_pending_comment_scan=AsyncMock(),
-        get_research_first_post_pids=AsyncMock(return_value={501}),
+        get_research_first_post_pids=AsyncMock(return_value={100}),
     )
     router = QueueRouter()
     handler = FullScanPostsTaskHandler(
@@ -248,32 +263,147 @@ async def test_first_post_comments_fall_back_to_stored_first_pid():
         cast("Any", datastore),
         router,
     )
+    handler.ensure_users = AsyncMock()
 
     await handler._process_posts_on_page(9, posts_page, True, research_response=research_response)
 
     datastore.get_research_first_post_pids.assert_awaited_once_with(9)
+    assert datastore.add_pending_comment_scan.await_args_list == [
+        call(tid=9, pid=200, fid=10, fname="bar", backfill=True, task_kind="full"),
+        call(tid=9, pid=100, fid=10, fname="bar", backfill=True, task_kind="full"),
+    ]
+    tasks = [task.content for task in router.comments_queue._q._queue]
+    assert {(task.pid, task.parent_kind) for task in tasks} == {
+        (200, "reply_post"),
+        (100, "first_post"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_unknown_floor_zero_does_not_create_first_post_scope():
+    author_b = make_user(PostUserDTO, user_id=20, portrait="author-B")
+    reply = make_post(pid=200, tid=9, floor=0, user=author_b)
+    posts_page = make_posts_response([reply])
+    response = ResearchPage(
+        raw=SimpleNamespace(
+            thread=SimpleNamespace(pid=200, tid=9, fid=10, fname="bar", author_id=20, user=author_b)
+        ),
+        dto=posts_page,
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
+    )
+    datastore = SimpleNamespace(
+        save_items=AsyncMock(),
+        add_pending_comment_scan=AsyncMock(),
+        get_research_first_post_pids=AsyncMock(return_value=set()),
+    )
+    router = QueueRouter()
+    handler = FullScanPostsTaskHandler(
+        0,
+        make_research_container(SimpleNamespace()),
+        cast("Any", datastore),
+        router,
+    )
+    handler.ensure_users = AsyncMock()
+
+    await handler._process_posts_on_page(9, posts_page, True, research_response=response)
+
+    datastore.get_research_first_post_pids.assert_awaited_once_with(9)
+    tasks = [task.content for task in router.comments_queue._q._queue]
+    assert [(task.pid, task.parent_kind) for task in tasks] == [(200, "reply_post")]
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_stored_first_post_floor_zero_is_filtered_before_reply_enqueue():
+    author_a = make_user(PostUserDTO, user_id=10, portrait="author-A")
+    preview = make_comment(cid=1700, pid=100, tid=9)
+    first_post = make_post(pid=100, tid=9, floor=0, user=author_a, comments=[preview])
+    posts_page = make_posts_response([first_post])
+    response = ResearchPage(
+        raw=SimpleNamespace(
+            thread=SimpleNamespace(pid=200, tid=9, fid=10, fname="bar", author_id=20)
+        ),
+        dto=posts_page,
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
+    )
+    datastore = SimpleNamespace(
+        save_items=AsyncMock(),
+        add_pending_comment_scan=AsyncMock(),
+        get_research_first_post_pids=AsyncMock(return_value={100}),
+    )
+    router = QueueRouter()
+    handler = FullScanPostsTaskHandler(
+        0,
+        make_research_container(SimpleNamespace()),
+        cast("Any", datastore),
+        router,
+    )
+    handler.ensure_users = AsyncMock()
+
+    await handler._process_posts_on_page(9, posts_page, True, research_response=response)
+
+    saved_items = [item for entry in datastore.save_items.await_args_list for item in entry.args[0]]
+    assert not any(isinstance(item, PostModel) and item.pid == 100 for item in saved_items)
+    assert [item.cid for item in saved_items if isinstance(item, CommentModel)] == [1700]
     datastore.add_pending_comment_scan.assert_awaited_once_with(
         tid=9,
-        pid=501,
+        pid=100,
         fid=10,
         fname="bar",
         backfill=True,
         task_kind="full",
     )
+    tasks = [task.content for task in router.comments_queue._q._queue]
+    assert [(task.pid, task.parent_kind) for task in tasks] == [(100, "first_post")]
 
 
 @pytest.mark.asyncio
-async def test_managed_posts_page_uses_stored_first_pid_inside_page_transaction(monkeypatch):
-    reply = make_post(pid=701, tid=9, floor=2)
+async def test_managed_page_head_reply_reuses_canonical_first_post_scope(monkeypatch):
+    author_a = make_user(PostUserDTO, user_id=10, portrait="author-A")
+    author_b = make_user(PostUserDTO, user_id=20, portrait="author-B")
+    first_post = make_post(pid=100, tid=9, floor=1, user=author_a)
+    first_reply = make_post(pid=150, tid=9, floor=2, user=author_b)
+    page1 = SimpleNamespace(
+        objs=[first_post, first_reply],
+        forum=SimpleNamespace(fid=10, fname="bar"),
+        page=SimpleNamespace(has_more=True, total_page=2, total_count=2),
+    )
+    reply = make_post(pid=200, tid=9, floor=31, user=author_b)
     posts_page = SimpleNamespace(
         objs=[reply],
         forum=SimpleNamespace(fid=10, fname="bar"),
-        page=SimpleNamespace(has_more=False, total_page=1, total_count=0),
+        page=SimpleNamespace(has_more=False, total_page=2, total_count=0),
+    )
+    first_response = ResearchPage(
+        raw=SimpleNamespace(
+            thread=SimpleNamespace(
+                pid=100,
+                tid=9,
+                fid=10,
+                fname="bar",
+                reply_num=20,
+                author_id=10,
+                user=author_a,
+            ),
+            objs=[SimpleNamespace(pid=100, tid=9, fid=10, floor=1)],
+        ),
+        dto=page1,
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
     )
     response = ResearchPage(
         raw=SimpleNamespace(
-            thread=SimpleNamespace(pid=0, tid=9, fid=10, fname="bar", reply_num=20),
-            objs=[SimpleNamespace(pid=701, tid=9, floor=2)],
+            thread=SimpleNamespace(
+                pid=200,
+                tid=9,
+                fid=10,
+                fname="bar",
+                reply_num=20,
+                author_id=20,
+                user=author_b,
+            ),
+            objs=[SimpleNamespace(pid=200, tid=9, fid=10, floor=31, author_id=20)],
         ),
         dto=posts_page,
         observed_at=datetime.now(UTC),
@@ -281,6 +411,7 @@ async def test_managed_posts_page_uses_stored_first_pid_inside_page_transaction(
     )
     events = []
     persisted_run_ids: list[str | None] = []
+    persisted_page_head_pids: list[int] = []
 
     class Session:
         async def __aenter__(self):
@@ -296,6 +427,8 @@ async def test_managed_posts_page_uses_stored_first_pid_inside_page_transaction(
         def __init__(self):
             self.session = Session()
             self.async_sessionmaker = lambda: self.session
+            self.saved_post_pids = []
+            self.saved_comment_cids = []
 
         async def get_research_task_scope_for_update(self, session, run_id, logical_key):
             assert run_id == "synthetic-run"
@@ -308,10 +441,12 @@ async def test_managed_posts_page_uses_stored_first_pid_inside_page_transaction(
             assert tid == 9
             assert session is self.session
             events.append("stored_first_pid_lookup")
-            return {501}
+            return {100}
 
-        async def save_items_in_session(self, session, _items):
+        async def save_items_in_session(self, session, items):
             assert session is self.session
+            self.saved_post_pids.extend(item.pid for item in items if isinstance(item, PostModel))
+            self.saved_comment_cids.extend(item.cid for item in items if isinstance(item, CommentModel))
 
         async def ensure_research_task_scope(self, *, session, logical_task_key, parent_generation, **kwargs):
             assert session is self.session
@@ -335,11 +470,12 @@ async def test_managed_posts_page_uses_stored_first_pid_inside_page_transaction(
     async def persist(_maker, _page, *, session, run_id=None):
         assert session is datastore.session
         persisted_run_ids.append(run_id)
+        persisted_page_head_pids.append(_page.raw.thread.pid)
         events.append("research_page_persisted")
 
     monkeypatch.setattr("src.research.persistence.persist_research_page", persist)
     datastore = ManagedDataStore()
-    router = QueueRouter(maxsize=3)
+    router = QueueRouter(maxsize=6)
     handler = FullScanPostsTaskHandler(
         0,
         make_research_container(SimpleNamespace()),
@@ -350,25 +486,100 @@ async def test_managed_posts_page_uses_stored_first_pid_inside_page_transaction(
     handler._prepare_research_page = AsyncMock()
     task = FullScanPostsTask(tid=9, run_id="synthetic-run", generation=4, fid=10, fname="bar", backfill=True)
 
-    committed, children = await handler._commit_research_posts_page(
+    committed_page1, children_page1 = await handler._commit_research_posts_page(
         task,
-        posts_page,
-        response,
+        page1,
+        first_response,
         page_number=1,
         cursor={},
         attempts=1,
     )
+    committed_page2, children_page2 = await handler._commit_research_posts_page(
+        task,
+        posts_page,
+        response,
+        page_number=2,
+        cursor={"last_pid": 150},
+        attempts=1,
+    )
+    preview = make_comment(cid=1700, pid=100, tid=9)
+    first_post_floor_zero = make_post(pid=100, tid=9, floor=0, user=author_a, comments=[preview])
+    page3 = SimpleNamespace(
+        objs=[first_post_floor_zero],
+        forum=SimpleNamespace(fid=10, fname="bar"),
+        page=SimpleNamespace(has_more=False, total_page=3, total_count=0),
+    )
+    page3_response = ResearchPage(
+        raw=SimpleNamespace(
+            thread=SimpleNamespace(
+                pid=200,
+                tid=9,
+                fid=10,
+                fname="bar",
+                reply_num=20,
+                author_id=20,
+                user=author_b,
+            ),
+            objs=[SimpleNamespace(pid=100, tid=9, fid=10, floor=0, author_id=10)],
+        ),
+        dto=page3,
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
+    )
+    page3_router = QueueRouter()
+    handler.router = page3_router
+    event_count_before_page3 = len(events)
+    committed_page3, children_page3 = await handler._commit_research_posts_page(
+        task,
+        page3,
+        page3_response,
+        page_number=3,
+        cursor={"last_pid": 200},
+        attempts=1,
+    )
+    page3_events = events[event_count_before_page3:]
 
-    assert committed is True
-    assert persisted_run_ids == ["synthetic-run"]
+    assert committed_page1 is True
+    assert committed_page2 is True
+    assert committed_page3 is True
+    assert persisted_run_ids == ["synthetic-run", "synthetic-run", "synthetic-run"]
+    assert persisted_page_head_pids == [100, 200, 200]
+    assert datastore.saved_post_pids == [150, 200]
+    assert datastore.saved_comment_cids == [1700]
+    assert events.count(("ensure_child", "post_comments:9:100", "first_post")) == 3
+    assert ("ensure_child", "post_comments:9:150", "reply_post") in events
+    assert ("ensure_child", "post_comments:9:200", "reply_post") in events
+    assert ("ensure_child", "post_comments:9:200", "first_post") not in events
+    assert ("pending_child", 9, 100) in events
+    assert ("pending_child", 9, 200) in events
     assert events.index("parent_locked") < events.index("stored_first_pid_lookup")
-    assert ("ensure_child", "post_comments:9:501", "first_post") in events
-    assert ("pending_child", 9, 501) in events
+    checkpoint_pages = [
+        entry[1]["page_number"]
+        for entry in events
+        if isinstance(entry, tuple) and entry[0] == "checkpoint"
+    ]
+    assert checkpoint_pages == [1, 2, 3]
+    assert datastore.checkpoint["page_number"] == 3
+    assert ("ensure_child", "post_comments:9:100", "reply_post") not in page3_events
+    assert ("ensure_child", "post_comments:9:100", "first_post") in page3_events
     assert datastore.checkpoint["reported_count_missing_reason"] == "not_provided_by_aiotieba_posts_page"
-    first_post_task = next(child for child in children if child.parent_kind == "first_post")
-    assert first_post_task.pid == 501
-    assert first_post_task.parent_generation == 4
-    assert len(router.comments_queue._q._queue) == 2
+    assert {(child.pid, child.parent_kind) for child in children_page1} == {
+        (100, "first_post"),
+        (150, "reply_post"),
+    }
+    assert {(child.pid, child.parent_kind) for child in children_page2} == {
+        (100, "first_post"),
+        (200, "reply_post"),
+    }
+    assert {(child.pid, child.parent_kind) for child in children_page3} == {(100, "first_post")}
+    assert all(
+        child.parent_generation == 4
+        for child in [*children_page1, *children_page2, *children_page3]
+    )
+    assert len(router.comments_queue._q._queue) == 3
+    assert [(item.content.pid, item.content.parent_kind) for item in page3_router.comments_queue._q._queue] == [
+        (100, "first_post")
+    ]
 
 
 @pytest.mark.asyncio

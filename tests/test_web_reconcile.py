@@ -148,7 +148,7 @@ def reconcile_db():
             ),
             (2103, None, {}, None, {}),
             (2104, 0, {}, None, {}),
-            (2105, None, {}, None, {}),
+            (2105, 0, {}, None, {}),
         ]
         for pid, agree_count, missing, is_bawu, extra_missing in rows:
             session.add(
@@ -160,7 +160,7 @@ def reconcile_db():
                     author_user_id=777,
                     author_user_name="known-api-name",
                     author_portrait="post-portrait",
-                    forum_level_name="known-title" if pid == 2105 else None,
+                    author_nickname="known-title" if pid == 2105 else None,
                     agree_count=agree_count,
                     disagree_count=0 if pid == 2104 else None,
                     is_bawu=is_bawu,
@@ -250,6 +250,7 @@ def _candidate(
     parent_post_pid="use-lease",
     source_kind="web_dom",
     precision="exact",
+    raw_value=None,
 ):
     identity = _identity(
         lease,
@@ -268,7 +269,7 @@ def _candidate(
         source_path = "data.post_list[0].author.synthetic"
     return ObservationCandidate(
         field_name=field_name,
-        raw_value=value,
+        raw_value=value if raw_value is None else raw_value,
         normalized_value=value,
         source_kind=source_kind,
         source_path=source_path,
@@ -333,31 +334,331 @@ async def _lease_thread(maker, fields):
     return summary, next(lease for lease in leases if lease.target_id == 1001)
 
 
+async def _lease_comment(maker, cid, fields):
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        fields,
+        target_type="comment",
+        target_ids=[cid],
+        tid=1001,
+    )
+    leases = await lease_web_enrichment_tasks(
+        maker, "run-reconcile-001", "synthetic-worker", task_keys=summary.task_keys
+    )
+    return summary, leases[0]
+
+
 @pytest.mark.asyncio
 async def test_verified_field_applies_by_exact_post_and_source_is_sanitized(reconcile_db):
     engine, maker = reconcile_db
-    summary, lease = await _lease_post(maker, 2101, ["forum_level_name"])
+    summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
     result = await complete_web_enrichment_task(
         maker,
         lease.task_key,
         lease.lease_token,
-        [_candidate(lease, "forum_level_name", "网页头衔")],
+        [_candidate(lease, "author_nickname", "网页头衔")],
     )
     assert result.status == "completed"
-    assert result.applied_fields == ("forum_level_name",)
+    assert result.applied_fields == ("author_nickname",)
     with Session(engine) as session:
         row = session.get(ResearchPost, 2101)
         observation = session.scalar(
             select(ResearchFieldObservation).where(ResearchFieldObservation.task_key == summary.task_keys[0])
         )
         task = session.get(ResearchWebEnrichmentTask, summary.task_keys[0])
-        assert row.forum_level_name == "网页头衔"
-        assert row.field_sources_json["forum_level_name"]["verified_web"]["source_kind"] == "web_dom"
+        assert row.author_nickname == "网页头衔"
+        assert row.field_sources_json["author_nickname"]["verified_web"]["source_kind"] == "web_dom"
         assert observation.source_url == "https://tieba.baidu.com/p/1001?fid=7654321"
         assert "synthetic-secret" not in observation.source_url
         assert observation.temporal_scope == "web_observation_at_observed_time"
         assert task.status == "completed"
         assert "elapsed_seconds" in task.last_diagnostics_json
+
+
+@pytest.mark.asyncio
+async def test_reply_display_name_is_not_applied_when_mention_uid_disagrees_with_known_uid(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_comment(
+        maker, 3101, ["reply_to_user_id", "reply_to_display_name"]
+    )
+    with Session(engine) as session, session.begin():
+        session.get(ResearchComment, 3101).reply_to_user_id = 99002
+
+    result = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [
+            _candidate(lease, "reply_to_user_id", 99001, source_kind="web_network"),
+            _candidate(
+                lease,
+                "reply_to_display_name",
+                "Synthetic Mention",
+                source_kind="web_network",
+                raw_value={"mention_type": 4, "mention_uid": "99001"},
+            ),
+        ],
+    )
+
+    assert result.conflict_fields == ("reply_to_display_name", "reply_to_user_id")
+    with Session(engine) as session:
+        row = session.get(ResearchComment, 3101)
+        assert row.reply_to_user_id == 99002
+        assert row.reply_to_display_name is None
+
+
+@pytest.mark.asyncio
+async def test_reply_display_name_cannot_mismatch_uid_candidate_in_same_batch(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_comment(
+        maker, 3101, ["reply_to_user_id", "reply_to_display_name"]
+    )
+
+    result = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [
+            _candidate(lease, "reply_to_user_id", 99001, source_kind="web_network"),
+            _candidate(
+                lease,
+                "reply_to_display_name",
+                "Synthetic Mention",
+                source_kind="web_network",
+                raw_value={"mention_type": 4, "mention_uid": "99002"},
+            ),
+        ],
+    )
+
+    assert result.applied_fields == ()
+    assert result.conflict_fields == ("reply_to_display_name", "reply_to_user_id")
+    with Session(engine) as session:
+        row = session.get(ResearchComment, 3101)
+        assert row.reply_to_user_id is None
+        assert row.reply_to_display_name is None
+
+
+@pytest.mark.asyncio
+async def test_reply_candidates_respect_existing_verified_web_uid_source(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_comment(
+        maker, 3101, ["reply_to_user_id", "reply_to_display_name"]
+    )
+    with Session(engine) as session, session.begin():
+        row = session.get(ResearchComment, 3101)
+        row.field_sources_json = {"reply_to_user_id": {"verified_web": {"value": 99002}}}
+
+    result = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [
+            _candidate(lease, "reply_to_user_id", 99001, source_kind="web_network"),
+            _candidate(
+                lease,
+                "reply_to_display_name",
+                "Synthetic Mention",
+                source_kind="web_network",
+                raw_value={"mention_type": 4, "mention_uid": "99001"},
+            ),
+        ],
+    )
+
+    assert result.conflict_fields == ("reply_to_display_name", "reply_to_user_id")
+    with Session(engine) as session:
+        row = session.get(ResearchComment, 3101)
+        assert row.reply_to_user_id is None
+        assert row.reply_to_display_name is None
+
+
+@pytest.mark.parametrize(("later_uid", "expected_status"), [(111, "applied"), (222, "conflict")])
+@pytest.mark.asyncio
+async def test_reply_name_only_task_binds_mention_uid_for_later_uid_tasks(
+    reconcile_db, later_uid, expected_status
+):
+    engine, maker = reconcile_db
+    _name_summary, name_lease = await _lease_comment(maker, 3101, ["reply_to_display_name"])
+    name_result = await complete_web_enrichment_task(
+        maker,
+        name_lease.task_key,
+        name_lease.lease_token,
+        [
+            _candidate(
+                name_lease,
+                "reply_to_display_name",
+                "Target A",
+                source_kind="web_network",
+                raw_value={"mention_type": 4, "mention_uid": "111"},
+            )
+        ],
+    )
+    assert name_result.applied_fields == ("reply_to_display_name",)
+
+    _uid_summary, uid_lease = await _lease_comment(maker, 3101, ["reply_to_user_id"])
+    uid_result = await complete_web_enrichment_task(
+        maker,
+        uid_lease.task_key,
+        uid_lease.lease_token,
+        [_candidate(uid_lease, "reply_to_user_id", later_uid, source_kind="web_network")],
+    )
+
+    with Session(engine) as session:
+        row = session.get(ResearchComment, 3101)
+        binding = row.field_sources_json["reply_to_display_name"]["verified_web"]
+        assert binding["reply_target_user_id"] == "111"
+        assert row.reply_to_display_name == "Target A"
+        assert row.reply_to_user_id == (111 if expected_status == "applied" else None)
+        if expected_status == "applied":
+            assert uid_result.applied_fields == ("reply_to_user_id",)
+            assert uid_result.conflict_fields == ()
+        else:
+            assert uid_result.applied_fields == ()
+            assert uid_result.conflict_fields == ("reply_to_user_id",)
+            observation = session.scalar(
+                select(ResearchFieldObservation).where(
+                    ResearchFieldObservation.task_key == uid_lease.task_key,
+                    ResearchFieldObservation.field_name == "reply_to_user_id",
+                )
+            )
+            assert observation.normalized_value_json == later_uid
+            assert observation.applied_status == "conflict"
+
+
+@pytest.mark.asyncio
+async def test_reply_name_without_mention_uid_is_saved_as_display_name_only(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_comment(maker, 3101, ["reply_to_display_name"])
+
+    result = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [
+            _candidate(
+                lease,
+                "reply_to_display_name",
+                "Display Only",
+                source_kind="web_network",
+                raw_value={"mention_type": 4, "mention_uid": None},
+            )
+        ],
+    )
+
+    assert result.applied_fields == ("reply_to_display_name",)
+    with Session(engine) as session:
+        row = session.get(ResearchComment, 3101)
+        observation = session.scalar(select(ResearchFieldObservation))
+        source = row.field_sources_json["reply_to_display_name"]["verified_web"]
+        assert row.reply_to_display_name == "Display Only"
+        assert "reply_to_display_name" not in row.missing_reasons_json
+        assert source["confidence"] == "display_name_only"
+        assert source["reply_target_user_id"] is None
+        assert observation.applied_status == "applied"
+        assert observation.raw_value_json == {"mention_type": 4, "mention_uid": None}
+
+
+@pytest.mark.asyncio
+async def test_reply_name_without_mention_uid_is_audit_only_when_uid_is_known(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_comment(maker, 3101, ["reply_to_display_name"])
+    with Session(engine) as session, session.begin():
+        session.get(ResearchComment, 3101).reply_to_user_id = 99001
+
+    result = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [
+            _candidate(
+                lease,
+                "reply_to_display_name",
+                "Display Only",
+                source_kind="web_network",
+                raw_value={"mention_type": 4, "mention_uid": None},
+            )
+        ],
+    )
+
+    assert result.applied_fields == ()
+    with Session(engine) as session:
+        row = session.get(ResearchComment, 3101)
+        observation = session.scalar(select(ResearchFieldObservation))
+        assert row.reply_to_display_name is None
+        assert row.missing_reasons_json["reply_to_display_name"] == "reply_to_mention_uid_missing"
+        assert observation.applied_status == "audit_only"
+        assert observation.missing_reason == "reply_to_mention_uid_missing"
+
+
+@pytest.mark.asyncio
+async def test_display_name_only_blocks_uid_task_until_same_label_has_explicit_uid(reconcile_db):
+    engine, maker = reconcile_db
+    _name_summary, name_lease = await _lease_comment(maker, 3101, ["reply_to_display_name"])
+    await complete_web_enrichment_task(
+        maker,
+        name_lease.task_key,
+        name_lease.lease_token,
+        [
+            _candidate(
+                name_lease,
+                "reply_to_display_name",
+                "Display Only",
+                source_kind="web_network",
+                raw_value={"mention_type": 4, "mention_uid": None},
+            )
+        ],
+    )
+
+    _uid_summary, uid_lease = await _lease_comment(maker, 3101, ["reply_to_user_id"])
+    uid_result = await complete_web_enrichment_task(
+        maker,
+        uid_lease.task_key,
+        uid_lease.lease_token,
+        [_candidate(uid_lease, "reply_to_user_id", 222, source_kind="web_network")],
+    )
+
+    assert uid_result.conflict_fields == ("reply_to_user_id",)
+    with Session(engine) as session:
+        row = session.get(ResearchComment, 3101)
+        observation = session.scalar(
+            select(ResearchFieldObservation).where(
+                ResearchFieldObservation.task_key == uid_lease.task_key,
+                ResearchFieldObservation.field_name == "reply_to_user_id",
+            )
+        )
+        assert row.reply_to_user_id is None
+        assert row.reply_to_display_name == "Display Only"
+        assert row.missing_reasons_json["reply_to_user_id"] == "reply_to_uid_unbound_display_name"
+        assert observation.applied_status == "conflict"
+
+    _upgrade_summary, upgrade_lease = await _lease_comment(
+        maker, 3101, ["reply_to_user_id", "reply_to_display_name"]
+    )
+    upgraded = await complete_web_enrichment_task(
+        maker,
+        upgrade_lease.task_key,
+        upgrade_lease.lease_token,
+        [
+            _candidate(upgrade_lease, "reply_to_user_id", 111, source_kind="web_network"),
+            _candidate(
+                upgrade_lease,
+                "reply_to_display_name",
+                "Display Only",
+                source_kind="web_network",
+                raw_value={"mention_type": 4, "mention_uid": "111"},
+            ),
+        ],
+    )
+
+    assert upgraded.applied_fields == ("reply_to_user_id",)
+    assert upgraded.confirmed_fields == ("reply_to_display_name",)
+    with Session(engine) as session:
+        row = session.get(ResearchComment, 3101)
+        name_source = row.field_sources_json["reply_to_display_name"]["verified_web"]
+        assert row.reply_to_user_id == 111
+        assert row.reply_to_display_name == "Display Only"
+        assert name_source["confidence"] == "explicit_type4_mention"
+        assert name_source["reply_target_user_id"] == "111"
 
 
 @pytest.mark.asyncio
@@ -471,20 +772,20 @@ async def test_page_pc_reconcile_rejects_mismatched_kz(reconcile_db):
 @pytest.mark.asyncio
 async def test_mixed_candidate_batch_with_wrong_author_has_zero_partial_updates(reconcile_db):
     engine, maker = reconcile_db
-    _summary, lease = await _lease_post(maker, 2101, ["forum_level_name", "global_growth_level"])
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname", "global_growth_level"])
     result = await complete_web_enrichment_task(
         maker,
         lease.task_key,
         lease.lease_token,
         [
-            _candidate(lease, "forum_level_name", "must-roll-back"),
+            _candidate(lease, "author_nickname", "must-roll-back"),
             _candidate(lease, "global_growth_level", 8, author_user_id=999),
         ],
     )
     assert result.status == "identity_unverified"
     with Session(engine) as session:
         row = session.get(ResearchPost, 2101)
-        assert row.forum_level_name is None
+        assert row.author_nickname is None
         assert row.global_growth_level is None
         assert session.scalars(select(ResearchFieldObservation)).all() == []
         failure = session.scalar(select(ResearchWebEnrichmentFailure))
@@ -521,12 +822,12 @@ async def test_field_outcomes_preserve_not_tested_reason_without_marking_unsuppo
 @pytest.mark.asyncio
 async def test_identity_failure_field_outcome_rejects_good_candidates_before_any_write(reconcile_db):
     engine, maker = reconcile_db
-    _summary, lease = await _lease_post(maker, 2101, ["forum_level_name", "global_growth_level"])
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname", "global_growth_level"])
     result = await complete_web_enrichment_task(
         maker,
         lease.task_key,
         lease.lease_token,
-        [_candidate(lease, "forum_level_name", "must-not-apply")],
+        [_candidate(lease, "author_nickname", "must-not-apply")],
         field_outcomes={
             "global_growth_level": {
                 "status": "identity_unverified",
@@ -541,7 +842,7 @@ async def test_identity_failure_field_outcome_rejects_good_candidates_before_any
         task = session.get(ResearchWebEnrichmentTask, lease.task_key)
         attempt = session.get(ResearchWebEnrichmentAttempt, (lease.task_key, lease.lease_generation))
         failure = session.scalar(select(ResearchWebEnrichmentFailure))
-        assert row.forum_level_name is None
+        assert row.author_nickname is None
         assert row.global_growth_level is None
         assert session.scalars(select(ResearchFieldObservation)).all() == []
         assert task.status == "identity_unverified"
@@ -570,14 +871,14 @@ async def test_known_zero_unknown_zero_null_and_confirmed_zero_are_distinct(reco
     )
     assert null_value.applied_fields == ("agree_count",)
 
-    _confirmed_summary, confirmed_lease = await _lease_post(maker, 2104, ["disagree_count"])
+    _confirmed_summary, confirmed_lease = await _lease_post(maker, 2105, ["agree_count"])
     confirmed = await complete_web_enrichment_task(
         maker,
         confirmed_lease.task_key,
         confirmed_lease.lease_token,
-        [_candidate(confirmed_lease, "disagree_count", 0)],
+        [_candidate(confirmed_lease, "agree_count", 0)],
     )
-    assert confirmed.confirmed_fields == ("disagree_count",)
+    assert confirmed.confirmed_fields == ("agree_count",)
     with Session(engine) as session:
         assert session.get(ResearchPost, 2104).agree_count == 0
         row = session.get(ResearchPost, 2102)
@@ -589,9 +890,9 @@ async def test_known_zero_unknown_zero_null_and_confirmed_zero_are_distinct(reco
 @pytest.mark.asyncio
 async def test_api_refresh_preserves_web_unknown_and_records_explicit_conflict(reconcile_db):
     engine, maker = reconcile_db
-    _summary, lease = await _lease_post(maker, 2101, ["forum_level_name"])
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
     await complete_web_enrichment_task(
-        maker, lease.task_key, lease.lease_token, [_candidate(lease, "forum_level_name", "web-title")]
+        maker, lease.task_key, lease.lease_token, [_candidate(lease, "author_nickname", "web-title")]
     )
     incoming = ResearchPost(
         pid=2101,
@@ -602,17 +903,17 @@ async def test_api_refresh_preserves_web_unknown_and_records_explicit_conflict(r
         observed_at=datetime(2026, 1, 5, tzinfo=UTC),
         source_payload_json={"synthetic_api": "raw"},
         missing_reasons_json={
-            "forum_level_name": "not_exposed_by_get_posts",
+            "author_nickname": "not_exposed_by_get_posts",
             "author_user_name": "not_returned_by_source",
         },
-        forum_level_name=None,
+        author_nickname=None,
         author_user_name=None,
     )
     async with maker() as session, session.begin():
         await _upsert_content_rows(session, ResearchPost, [incoming])
     with Session(engine) as session:
         row = session.get(ResearchPost, 2101)
-        assert row.forum_level_name == "web-title"
+        assert row.author_nickname == "web-title"
         assert row.author_user_name == "known-api-name"
         assert row.field_sources_json["author_user_name"]["last_known_api"]["retained_value"] == "known-api-name"
 
@@ -625,14 +926,14 @@ async def test_api_refresh_preserves_web_unknown_and_records_explicit_conflict(r
         observed_at=datetime(2026, 1, 6, tzinfo=UTC),
         source_payload_json={"synthetic_api": "conflict"},
         missing_reasons_json={},
-        forum_level_name="api-title",
+        author_nickname="api-title",
     )
     async with maker() as session, session.begin():
         await _upsert_content_rows(session, ResearchPost, [conflicting])
     with Session(engine) as session:
         row = session.get(ResearchPost, 2101)
-        conflict = row.field_sources_json["forum_level_name"]["api_conflicts"][-1]
-        assert row.forum_level_name == "web-title"
+        conflict = row.field_sources_json["author_nickname"]["api_conflicts"][-1]
+        assert row.author_nickname == "web-title"
         assert conflict == {
             "source_api": "aiotieba.get_posts",
             "observed_at": "2026-01-06T00:00:00+00:00",
@@ -771,7 +1072,7 @@ async def test_comment_row_parent_change_rejects_entire_candidate_batch(reconcil
 @pytest.mark.asyncio
 async def test_target_author_or_forum_row_change_is_rejected(reconcile_db, column_name):
     engine, maker = reconcile_db
-    _summary, lease = await _lease_post(maker, 2101, ["forum_level_name"])
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
     with Session(engine) as session, session.begin():
         row = session.get(ResearchPost, 2101)
         setattr(row, column_name, 999 if column_name == "author_user_id" else 7654322)
@@ -779,11 +1080,11 @@ async def test_target_author_or_forum_row_change_is_rejected(reconcile_db, colum
         maker,
         lease.task_key,
         lease.lease_token,
-        [_candidate(lease, "forum_level_name", "must-not-apply")],
+        [_candidate(lease, "author_nickname", "must-not-apply")],
     )
     assert result.status == "identity_unverified"
     with Session(engine) as session:
-        assert session.get(ResearchPost, 2101).forum_level_name is None
+        assert session.get(ResearchPost, 2101).author_nickname is None
         assert session.scalars(select(ResearchFieldObservation)).all() == []
 
 
@@ -794,7 +1095,7 @@ async def test_expired_cancelled_scope_and_changed_watermark_responses_are_rejec
     summary = await enqueue_web_enrichment_tasks(
         maker,
         "run-reconcile-001",
-        ["forum_level_name"],
+        ["author_nickname"],
         target_type="post",
         target_ids=[2101],
         tid=1001,
@@ -808,7 +1109,7 @@ async def test_expired_cancelled_scope_and_changed_watermark_responses_are_rejec
         maker,
         lease.task_key,
         lease.lease_token,
-        [_candidate(lease, "forum_level_name", "expired")],
+        [_candidate(lease, "author_nickname", "expired")],
         now=current + timedelta(seconds=2),
     )
     assert rejected.reason_code == "lease_expired"
@@ -824,18 +1125,18 @@ async def test_expired_cancelled_scope_and_changed_watermark_responses_are_rejec
         maker,
         renewed.task_key,
         renewed.lease_token,
-        [_candidate(renewed, "forum_level_name", "cancelled")],
+        [_candidate(renewed, "author_nickname", "cancelled")],
     )
     assert cancelled.reason_code == "lease_token_stale"
     with Session(engine) as session:
-        assert session.get(ResearchPost, 2101).forum_level_name is None
+        assert session.get(ResearchPost, 2101).author_nickname is None
         assert session.scalars(select(ResearchFieldObservation)).all() == []
 
 
 @pytest.mark.asyncio
 async def test_old_scope_generation_and_api_watermark_cannot_write(reconcile_db):
     engine, maker = reconcile_db
-    _summary, lease = await _lease_post(maker, 2101, ["forum_level_name"])
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
     with Session(engine) as session, session.begin():
         scope = session.get(ResearchTaskScope, ("run-reconcile-001", "thread_replies:1001"))
         scope.generation = 1
@@ -843,7 +1144,7 @@ async def test_old_scope_generation_and_api_watermark_cannot_write(reconcile_db)
         maker,
         lease.task_key,
         lease.lease_token,
-        [_candidate(lease, "forum_level_name", "old-scope")],
+        [_candidate(lease, "author_nickname", "old-scope")],
     )
     assert stale_scope.reason_code == "scope_generation_changed"
     with Session(engine) as session, session.begin():
@@ -865,11 +1166,11 @@ async def test_old_scope_generation_and_api_watermark_cannot_write(reconcile_db)
         maker,
         renewed.task_key,
         renewed.lease_token,
-        [_candidate(renewed, "forum_level_name", "old-watermark")],
+        [_candidate(renewed, "author_nickname", "old-watermark")],
     )
     assert stale_watermark.reason_code == "target_api_watermark_changed"
     with Session(engine) as session:
-        assert session.get(ResearchPost, 2101).forum_level_name is None
+        assert session.get(ResearchPost, 2101).author_nickname is None
 
 
 @pytest.mark.asyncio
@@ -879,7 +1180,7 @@ async def test_old_lease_token_cannot_finish_new_attempt_or_current_task(reconci
     summary = await enqueue_web_enrichment_tasks(
         maker,
         "run-reconcile-001",
-        ["forum_level_name"],
+        ["author_nickname"],
         target_type="post",
         target_ids=[2101],
         tid=1001,
@@ -909,7 +1210,7 @@ async def test_old_lease_token_cannot_finish_new_attempt_or_current_task(reconci
         maker,
         lease_a.task_key,
         lease_a.lease_token,
-        [_candidate(lease_a, "forum_level_name", "old-response")],
+        [_candidate(lease_a, "author_nickname", "old-response")],
         now=started + timedelta(seconds=3),
     )
     assert stale.reason_code == "lease_token_stale"
@@ -936,25 +1237,25 @@ async def test_old_lease_token_cannot_finish_new_attempt_or_current_task(reconci
         assert task.status == "running"
         assert task.lease_token == lease_b.lease_token
         assert task.lease_generation == lease_b.lease_generation
-        assert task.field_statuses_json == {"forum_level_name": {"status": "pending", "reason": None}}
+        assert task.field_statuses_json == {"author_nickname": {"status": "pending", "reason": None}}
         assert old_attempt.status == "running"
         assert old_attempt.finished_at is None
         assert current_attempt.status == "running"
         assert current_attempt.finished_at is None
         assert failure.reason_code == "lease_token_stale"
-        assert session.get(ResearchPost, 2101).forum_level_name is None
+        assert session.get(ResearchPost, 2101).author_nickname is None
         assert session.scalars(select(ResearchFieldObservation)).all() == []
 
     accepted = await complete_web_enrichment_task(
         maker,
         lease_b.task_key,
         lease_b.lease_token,
-        [_candidate(lease_b, "forum_level_name", "new-response")],
+        [_candidate(lease_b, "author_nickname", "new-response")],
         now=started + timedelta(seconds=5),
     )
     assert accepted.status == "completed"
     with Session(engine) as session:
-        assert session.get(ResearchPost, 2101).forum_level_name == "new-response"
+        assert session.get(ResearchPost, 2101).author_nickname == "new-response"
         assert session.get(
             ResearchWebEnrichmentAttempt,
             (lease_b.task_key, lease_b.lease_generation),
@@ -964,7 +1265,7 @@ async def test_old_lease_token_cannot_finish_new_attempt_or_current_task(reconci
 @pytest.mark.asyncio
 async def test_retried_response_is_observation_idempotent(reconcile_db):
     engine, maker = reconcile_db
-    summary, first_lease = await _lease_post(maker, 2101, ["forum_level_name"])
+    summary, first_lease = await _lease_post(maker, 2101, ["author_nickname"])
     retry_at = datetime.now(UTC)
     assert await fail_web_enrichment_task(
         maker,
@@ -989,9 +1290,9 @@ async def test_retried_response_is_observation_idempotent(reconcile_db):
         maker,
         second_lease.task_key,
         second_lease.lease_token,
-        [_candidate(second_lease, "forum_level_name", "retried-title")],
+        [_candidate(second_lease, "author_nickname", "retried-title")],
     )
-    assert result.applied_fields == ("forum_level_name",)
+    assert result.applied_fields == ("author_nickname",)
     with Session(engine) as session:
         observations = session.scalars(
             select(ResearchFieldObservation).where(ResearchFieldObservation.task_key == first_lease.task_key)

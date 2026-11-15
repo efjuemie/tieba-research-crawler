@@ -15,6 +15,7 @@ from .identity import (
     IdentityError,
     ObservationCandidate,
     Target,
+    canonical_growth_icon_url,
     canonical_thread_id_from_url,
     make_identity_evidence,
     parse_positive_id,
@@ -385,6 +386,7 @@ def _extract_global_growth(document, header, add, mark) -> None:
     icons = _owned_elements_with_class(header, "icon_tshows")
     if not icons:
         mark("global_growth_level", "absent_on_page", "global_growth_icon_not_present")
+        mark("global_growth_icon_url", "absent_on_page", "global_growth_icon_not_present")
         return
     matches = []
     for icon in icons:
@@ -392,17 +394,38 @@ def _extract_global_growth(document, header, add, mark) -> None:
             tooltip_text = _tooltip_text(document, ref)
             if not tooltip_text or "贴吧成长等级" not in tooltip_text:
                 continue
-            matches.append(tooltip_text)
+            matches.append((ref, tooltip_text))
     if len(matches) != 1:
         reason = "icon_semantics_unverified" if not matches else "ambiguous_growth_tooltip"
         mark("global_growth_level", "needs_evidence", reason)
+        mark("global_growth_icon_url", "needs_evidence", reason)
         return
-    match = re.search(r"贴吧成长等级\s*[:：]?\s*(?:Lv\.?\s*)?([0-9]+)", matches[0], re.IGNORECASE)
+    ref, tooltip_text = matches[0]
+    match = re.search(r"贴吧成长等级\s*[:：]?\s*(?:Lv\.?\s*)?([0-9]+)", tooltip_text, re.IGNORECASE)
     if match:
         level = int(match.group(1))
-        add("global_growth_level", matches[0], level, "owner.head-line.icon_tshows.tooltip_text")
+        add("global_growth_level", tooltip_text, level, "owner.head-line.icon_tshows.tooltip_text")
     else:
         mark("global_growth_level", "needs_evidence", "numeric_level_not_exposed_in_page")
+
+    images = _owned_elements_with_class(ref, "icon_tshows_img")
+    image_urls = {
+        canonical
+        for image in images
+        for attribute in ("src", "data-src", "data-original")
+        if (canonical := canonical_growth_icon_url(image.get(attribute))) is not None
+    }
+    if len(image_urls) == 1:
+        url = next(iter(image_urls))
+        add(
+            "global_growth_icon_url",
+            url,
+            url,
+            "owner.head-line.icon_tshows.icon_tshows_img.src",
+        )
+    else:
+        reason = "growth_icon_image_not_found" if not image_urls else "ambiguous_growth_icon_image"
+        mark("global_growth_icon_url", "needs_evidence", reason)
 
 
 def _extract_location(owner, target: Target, add, mark) -> None:

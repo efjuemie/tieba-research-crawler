@@ -9,6 +9,7 @@ import pytest
 from src.research.web_fallback.identity import Target, make_request_context
 from src.research.web_fallback.network import (
     extract_page_pc_comment,
+    extract_page_pc_post,
     extract_page_pc_thread_counts,
 )
 
@@ -50,6 +51,27 @@ def _comment_target(**changes):
         "parent_post_pid": POST_ID,
         "author_user_id": AUTHOR_ID,
         "requested_fields": ("ip_location_text", "agree_count", "disagree_count"),
+    }
+    values.update(changes)
+    return Target(**values)
+
+
+def _post_target(**changes):
+    values = {
+        "target_type": "post",
+        "target_id": "45003",
+        "tid": TID,
+        "fid": FID,
+        "pid": "45003",
+        "author_user_id": AUTHOR_ID,
+        "requested_fields": (
+            "ip_location_text",
+            "global_growth_level",
+            "global_growth_icon_url",
+            "agree_count",
+            "disagree_count",
+            "share_count",
+        ),
     }
     values.update(changes)
     return Target(**values)
@@ -100,6 +122,39 @@ def _payload():
     }
 
 
+def _post_payload(*, ip_address="合成地区", growth_level=4, include_growth_icon=True):
+    user = {
+        "id": int(AUTHOR_ID),
+        "ip_address": ip_address,
+        "user_growth": {"level_id": growth_level},
+    }
+    if include_growth_icon:
+        user["user_show_info"] = {
+            "feed_head": {
+                "main_data": [
+                    {
+                        "business_info_map": {"icon_tip": "贴吧成长等级"},
+                        "icon": {"url": "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp"},
+                    }
+                ]
+            }
+        }
+    return {
+        "error_code": 0,
+        "forum": {"id": int(FID)},
+        "thread": {"id": int(TID)},
+        "post_list": [
+            {
+                "id": 45003,
+                "author_id": int(AUTHOR_ID),
+                "agree": {"agree_num": 6, "disagree_num": 99},
+                "share_num": 88,
+            }
+        ],
+        "user_list": [user],
+    }
+
+
 def _extract(parser, payload, target, context=None):
     text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
     return parser(target, text, context or _context(target))
@@ -126,6 +181,32 @@ def test_page_pc_thread_counts_require_full_identity_and_keep_explicit_zero():
     assert candidates["collect_count"].identity.fid == FID
     assert "response_author_id" in candidates["collect_count"].identity.match_methods
     assert result.field_outcomes["view_count"]["reason"] == "not_observed_in_response"
+
+
+def test_page_pc_thread_growth_url_uses_only_structured_growth_icon():
+    payload = _payload()
+    payload["thread"]["author"]["user_show_info"] = {
+        "feed_head": {
+            "main_data": [
+                {
+                    "business_info_map": {"icon_tip": "本吧头衔"},
+                    "icon": {"url": "https://tieba-ares.cdn.bcebos.com/synthetic/forum.webp"},
+                },
+                {
+                    "business_info_map": {"icon_tip": "贴吧成长等级"},
+                    "icon": {"url": "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp"},
+                },
+            ]
+        }
+    }
+    target = _thread_target(requested_fields=("global_growth_icon_url",))
+
+    result = _extract(extract_page_pc_thread_counts, payload, target)
+
+    [candidate] = result.candidates
+    assert candidate.field_name == "global_growth_icon_url"
+    assert candidate.normalized_value == "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp"
+    assert candidate.identity.author_user_id == AUTHOR_ID
 
 
 @pytest.mark.parametrize(
@@ -195,10 +276,132 @@ def test_page_pc_comment_requires_exact_parent_cid_and_unique_user_id():
     candidates = {candidate.field_name: candidate for candidate in result.candidates}
     assert candidates["ip_location_text"].normalized_value == "合成地区"
     assert candidates["ip_location_text"].source_path == "page_pc.user_list[0].ip_address"
+    assert candidates["ip_location_text"].source_url == "https://tieba.baidu.com/c/f/pb/page_pc"
     assert candidates["agree_count"].normalized_value == 3
     assert candidates["disagree_count"].normalized_value == 0
     assert candidates["disagree_count"].identity.cid == CID
     assert "unique_response_user_id" in candidates["agree_count"].identity.match_methods
+
+
+def test_page_pc_comment_extracts_growth_from_exact_user_without_nested_request():
+    payload = _payload()
+    user = payload["user_list"][0]
+    user["user_growth"] = {"level_id": 5}
+    user["user_show_info"] = {
+        "feed_head": {
+            "main_data": [
+                {
+                    "business_info_map": {"icon_tip": "贴吧成长等级"},
+                    "icon": {"url": "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp"},
+                }
+            ]
+        }
+    }
+    target = _comment_target(requested_fields=("global_growth_level", "global_growth_icon_url"))
+
+    result = _extract(extract_page_pc_comment, payload, target)
+
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+    assert result.identity_verified is True
+    assert candidates["global_growth_level"].normalized_value == 5
+    assert candidates["global_growth_level"].source_path == "page_pc.user_list[0].user_growth.level_id"
+    assert candidates["global_growth_icon_url"].normalized_value == (
+        "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp"
+    )
+    assert candidates["global_growth_icon_url"].source_path.startswith("page_pc.user_list[0].")
+
+
+def test_page_pc_comment_extracts_exact_reply_prefix_name_and_uid():
+    payload = _payload()
+    comment = payload["post_list"][0]["sub_post_list"]["sub_post_list"][0]
+    comment["content"] = [
+        {"type": 0, "text": "回复 "},
+        {"type": 4, "text": "Synthetic Mention", "uid": 99001},
+    ]
+    target = _comment_target(requested_fields=("reply_to_display_name", "reply_to_user_id"))
+
+    result = _extract(extract_page_pc_comment, payload, target)
+
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+    assert candidates["reply_to_display_name"].normalized_value == "Synthetic Mention"
+    assert candidates["reply_to_display_name"].raw_value == {
+        "mention_type": 4,
+        "mention_uid": "99001",
+    }
+    assert candidates["reply_to_user_id"].normalized_value == 99001
+    assert candidates["reply_to_display_name"].source_path.endswith("content[1].text")
+    assert candidates["reply_to_user_id"].source_path.endswith("content[1].uid")
+    assert candidates["reply_to_display_name"].identity.cid == CID
+
+
+def test_page_pc_comment_keeps_display_only_mention_when_uid_is_unavailable():
+    payload = _payload()
+    comment = payload["post_list"][0]["sub_post_list"]["sub_post_list"][0]
+    comment["content"] = [
+        {"type": 0, "text": "回复 "},
+        {"type": 4, "text": "Synthetic Mention", "uid": 0},
+    ]
+    target = _comment_target(requested_fields=("reply_to_display_name", "reply_to_user_id"))
+
+    result = _extract(extract_page_pc_comment, payload, target)
+
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+    assert candidates["reply_to_display_name"].raw_value == {
+        "mention_type": 4,
+        "mention_uid": None,
+    }
+    assert candidates["reply_to_display_name"].normalized_value == "Synthetic Mention"
+    assert "reply_to_user_id" not in candidates
+    assert result.field_outcomes["reply_to_user_id"] == {
+        "status": "absent_on_page",
+        "reason": "reply_mention_uid_not_valid",
+    }
+
+
+def test_page_pc_comment_marks_missing_reply_prefix_and_unknown_growth_zero():
+    payload = _payload()
+    payload["user_list"][0]["user_growth"] = {"level_id": 0}
+    target = _comment_target(
+        requested_fields=(
+            "global_growth_level",
+            "global_growth_icon_url",
+            "reply_to_display_name",
+            "reply_to_user_id",
+        )
+    )
+
+    result = _extract(extract_page_pc_comment, payload, target)
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.candidates == ()
+    assert result.field_outcomes["global_growth_level"] == {
+        "status": "absent_on_page",
+        "reason": "global_growth_level_zero_is_unknown",
+    }
+    assert result.field_outcomes["global_growth_icon_url"]["reason"] == "growth_icon_not_exposed_in_response"
+    for field in ("reply_to_display_name", "reply_to_user_id"):
+        assert result.field_outcomes[field] == {
+            "status": "absent_on_page",
+            "reason": "reply_prefix_not_present",
+        }
+
+
+def test_page_pc_comment_rejects_reply_candidates_when_comment_author_uid_mismatches():
+    payload = _payload()
+    comment = payload["post_list"][0]["sub_post_list"]["sub_post_list"][0]
+    comment["author_id"] = 77004
+    comment["content"] = [
+        {"type": 0, "text": "回复 "},
+        {"type": 4, "text": "Synthetic Mention", "uid": 99001},
+    ]
+    target = _comment_target(requested_fields=("reply_to_display_name", "reply_to_user_id"))
+
+    result = _extract(extract_page_pc_comment, payload, target)
+
+    assert result.status == "identity_unverified"
+    assert result.reason == "response_author_id_mismatch"
+    assert result.candidates == ()
 
 
 def test_page_pc_missing_target_cid_does_not_bind_same_author_elsewhere():
@@ -220,6 +423,105 @@ def test_page_pc_comment_page_without_target_parent_is_not_a_identity_failure():
 
     assert result.status == "not_tested"
     assert result.reason == "parent_post_missing_from_response"
+    assert result.candidates == ()
+
+
+def test_page_pc_post_uses_exact_pid_and_unique_user_metadata():
+    result = _extract(extract_page_pc_post, _post_payload(), _post_target())
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+    assert {name: candidate.normalized_value for name, candidate in candidates.items()} == {
+        "ip_location_text": "合成地区",
+        "global_growth_level": 4,
+        "global_growth_icon_url": "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp",
+        "agree_count": 6,
+    }
+    assert candidates["ip_location_text"].source_path == "page_pc.user_list[0].ip_address"
+    assert candidates["global_growth_level"].source_path == "page_pc.user_list[0].user_growth.level_id"
+    assert candidates["agree_count"].source_path == "page_pc.post_list[0].agree.agree_num"
+    assert candidates["agree_count"].identity.pid == "45003"
+    assert "unique_response_user_id" in candidates["agree_count"].identity.match_methods
+    assert "disagree_count" not in candidates
+    assert "share_count" not in candidates
+
+
+def test_page_pc_post_empty_metadata_keeps_verified_identity_and_unknown_zero():
+    payload = _post_payload(ip_address="  ", growth_level=0, include_growth_icon=False)
+    payload["post_list"][0].pop("agree")
+    result = _extract(
+        extract_page_pc_post,
+        payload,
+        _post_target(),
+    )
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.candidates == ()
+    assert result.field_outcomes["ip_location_text"]["reason"] == "ip_location_empty_in_response"
+    assert result.field_outcomes["global_growth_level"] == {
+        "status": "absent_on_page",
+        "reason": "global_growth_level_zero_is_unknown",
+    }
+    assert result.field_outcomes["global_growth_icon_url"]["reason"] == "growth_icon_not_exposed_in_response"
+    assert result.field_outcomes["agree_count"]["reason"] == "not_observed_in_response"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    [
+        (lambda payload: payload["forum"].update(id=121), "response_fid_mismatch"),
+        (lambda payload: payload["thread"].update(id=81002), "response_tid_mismatch"),
+        (lambda payload: payload["post_list"][0].update(pid=45004), "response_post_id_mismatch"),
+        (lambda payload: payload["post_list"][0].update(author_id=77004), "response_author_id_mismatch"),
+        (lambda payload: payload["user_list"].append(dict(payload["user_list"][0])), "duplicate_response_user_id"),
+    ],
+)
+def test_page_pc_post_rejects_identity_mismatches(mutate, reason):
+    payload = _post_payload()
+    mutate(payload)
+
+    result = _extract(extract_page_pc_post, payload, _post_target())
+
+    assert result.status == "identity_unverified"
+    assert result.reason == reason
+    assert result.candidates == ()
+
+
+def test_page_pc_post_does_not_borrow_user_from_another_pid_and_missing_pid_can_continue():
+    payload = _post_payload()
+    payload["post_list"][0]["id"] = 45004
+
+    result = _extract(extract_page_pc_post, payload, _post_target())
+
+    assert result.status == "not_tested"
+    assert result.reason == "target_post_missing_from_response"
+    assert result.candidates == ()
+
+
+def test_page_pc_post_request_requires_exact_thread_context_and_safe_post_route():
+    target = _post_target()
+    context = _context(target)
+    for changed in (
+        _context(target, post_data="kz=81002&pn=1"),
+        replace(context, request_method="GET"),
+        replace(context, request_url="https://tieba.baidu.com/c/f/pb/other"),
+        _context(target, request_url="http://tieba.baidu.com/c/f/pb/page_pc?sign=synthetic"),
+    ):
+        result = _extract(extract_page_pc_post, _post_payload(), target, changed)
+        assert result.status == "identity_unverified"
+        assert result.candidates == ()
+
+
+def test_page_pc_post_rejects_duplicate_target_pid():
+    payload = _post_payload()
+    payload["post_list"].append(dict(payload["post_list"][0]))
+
+    result = _extract(extract_page_pc_post, payload, _post_target())
+
+    assert result.status == "identity_unverified"
+    assert result.reason == "duplicate_response_post_id"
     assert result.candidates == ()
 
 
