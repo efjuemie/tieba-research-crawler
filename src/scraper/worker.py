@@ -400,7 +400,12 @@ class TaskHandler(ABC):
 
         if session is None:
             await self._prepare_research_page(response)
-        await persist_research_page(sessionmaker_, response, session=session)
+        await persist_research_page(
+            sessionmaker_,
+            response,
+            session=session,
+            run_id=getattr(self.container, "research_run_id", None),
+        )
 
     async def _persist_user_forum_snapshots(self, response: Any, sessionmaker_: Any) -> None:
         raw = getattr(response, "raw", None)
@@ -1033,7 +1038,12 @@ class FullScanPostsTaskHandler(TaskHandler):
                 if len(stored_first_pids) == 1:
                     first_pid = next(iter(stored_first_pids))
 
-            await persist_research_page(self.datastore.async_sessionmaker, response, session=session)
+            await persist_research_page(
+                self.datastore.async_sessionmaker,
+                response,
+                session=session,
+                run_id=run_id,
+            )
             await self.datastore.save_items_in_session(session, post_models)
 
             for post in posts:
@@ -1894,7 +1904,12 @@ class FullScanCommentsTaskHandler(TaskHandler):
             ):
                 return False
 
-            await persist_research_page(self.datastore.async_sessionmaker, response, session=session)
+            await persist_research_page(
+                self.datastore.async_sessionmaker,
+                response,
+                session=session,
+                run_id=run_id,
+            )
             await self.datastore.save_items_in_session(
                 session,
                 [Comment.from_dto(comment) for comment in page.objs],

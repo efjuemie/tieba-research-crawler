@@ -59,8 +59,8 @@ def _drain_router(router: QueueRouter) -> list[Task]:
 async def test_research_detail_pages_enrich_unique_author_forum_snapshots(source_api, monkeypatch):
     events: list[tuple[str, object]] = []
 
-    async def persist(_sessionmaker, page, *, session=None):
-        events.append(("persist", page.source_api))
+    async def persist(_sessionmaker, page, *, session=None, run_id=None):
+        events.append(("persist", (page.source_api, run_id)))
 
     monkeypatch.setattr("src.research.persistence.persist_research_page", persist)
 
@@ -130,25 +130,26 @@ async def test_research_detail_pages_enrich_unique_author_forum_snapshots(source
         ),
     )
     container.async_sessionmaker = object()
+    container.research_run_id = "synthetic-run"
     handler = FullScanPostsTaskHandler(0, container, cast("Any", SimpleNamespace()), QueueRouter())
 
     await handler._persist_research_page(response)
 
     assert events == [
         ("lookup", (42, 10, "portrait-10")),
-        ("persist", "aiotieba.get_user_forum_info"),
+        ("persist", ("aiotieba.get_user_forum_info", None)),
         ("lookup", (42, 11, "portrait-11")),
-        ("persist", "aiotieba.get_user_forum_info"),
-        ("persist", source_api),
+        ("persist", ("aiotieba.get_user_forum_info", None)),
+        ("persist", (source_api, "synthetic-run")),
     ]
 
 
 @pytest.mark.asyncio
 async def test_user_forum_rejection_blocks_network_without_finishing_page(monkeypatch):
-    persisted: list[str] = []
+    persisted: list[tuple[str, str | None]] = []
 
-    async def persist(_sessionmaker, page, *, session=None):
-        persisted.append(page.source_api)
+    async def persist(_sessionmaker, page, *, session=None, run_id=None):
+        persisted.append((page.source_api, run_id))
 
     monkeypatch.setattr("src.research.persistence.persist_research_page", persist)
     user_page = SimpleNamespace(
@@ -184,7 +185,7 @@ async def test_user_forum_rejection_blocks_network_without_finishing_page(monkey
         await handler._persist_research_page(response)
 
     assert error.value.code == 220034
-    assert persisted == ["aiotieba.get_user_forum_info"]
+    assert persisted == [("aiotieba.get_user_forum_info", None)]
     datastore.set_research_run_status_if.assert_awaited_once()
     assert datastore.set_research_run_status_if.await_args.args[2] == "blocked"
     container.block_research_network.assert_awaited_once()
@@ -192,10 +193,10 @@ async def test_user_forum_rejection_blocks_network_without_finishing_page(monkey
 
 @pytest.mark.asyncio
 async def test_user_forum_auth_rejection_waits_for_refresh_then_persists_snapshot(monkeypatch):
-    persisted: list[str] = []
+    persisted: list[tuple[str, str | None]] = []
 
-    async def persist(_sessionmaker, page, *, session=None):
-        persisted.append(page.source_api)
+    async def persist(_sessionmaker, page, *, session=None, run_id=None):
+        persisted.append((page.source_api, run_id))
 
     monkeypatch.setattr("src.research.persistence.persist_research_page", persist)
     pages = [
@@ -254,7 +255,10 @@ async def test_user_forum_auth_rejection_waits_for_refresh_then_persists_snapsho
     await handler._persist_research_page(response)
 
     assert lookup.await_count == 2
-    assert persisted == ["aiotieba.get_user_forum_info", "aiotieba.get_posts"]
+    assert persisted == [
+        ("aiotieba.get_user_forum_info", None),
+        ("aiotieba.get_posts", "synthetic-run"),
+    ]
     datastore.set_research_run_status_if.assert_awaited_once()
     assert datastore.set_research_run_status_if.await_args.args[2] == "paused_auth"
     datastore.resume_research_run_if_status.assert_awaited_once_with("synthetic-run", "paused_auth")

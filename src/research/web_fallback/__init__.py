@@ -16,7 +16,13 @@ from .identity import (
     sanitize_source_url,
     validate_request_context,
 )
-from .network import NetworkExtractionResult, extract_nested_floor
+from .network import (
+    PAGE_PC_PATH,
+    NetworkExtractionResult,
+    extract_nested_floor,
+    extract_page_pc_comment,
+    extract_page_pc_thread_counts,
+)
 
 __all__ = [
     "BrowserProviderConfigurationError",
@@ -28,10 +34,13 @@ __all__ = [
     "ImmutableRequestContext",
     "NetworkExtractionResult",
     "ObservationCandidate",
+    "PAGE_PC_PATH",
     "PlaywrightWebFallbackProvider",
     "Target",
     "extract_dom_candidates",
     "extract_nested_floor",
+    "extract_page_pc_comment",
+    "extract_page_pc_thread_counts",
     "make_request_context",
     "parse_json_unique",
     "parse_positive_id",

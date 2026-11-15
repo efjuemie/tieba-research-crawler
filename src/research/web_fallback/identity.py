@@ -13,8 +13,9 @@ MAX_SIGNED_64 = (1 << 63) - 1
 PARSER_VERSION = "web-fallback-v1"
 TargetType = Literal["thread", "post", "comment"]
 SourceKind = Literal["web_network", "web_dom"]
-_SAFE_ID_QUERY_KEYS = {"tid", "thread_id", "fid", "pid", "post_id", "cid"}
+_SAFE_ID_QUERY_KEYS = {"tid", "thread_id", "kz", "fid", "pid", "post_id", "cid"}
 _SAFE_PAGE_QUERY_KEYS = {"pn", "offset", "see_lz"}
+PAGE_PC_PATH = "/c/f/pb/page_pc"
 
 
 class IdentityError(ValueError):
@@ -153,6 +154,7 @@ class ImmutableRequestContext:
     observed_at: datetime
     context_id: str
     reason: str | None = None
+    page_origin: str | None = None
 
 
 def canonical_thread_id_from_url(url: str) -> str | None:
@@ -239,7 +241,7 @@ def make_request_context(
                     pairs.extend(
                         (key, str(value))
                         for key, value in payload.items()
-                        if key in {"tid", "thread_id", "fid", "pid", "post_id", "offset"}
+                        if key.lower() in {"tid", "thread_id", "kz", "fid", "pid", "post_id", "offset"}
                     )
             else:
                 pairs.extend(parse_qsl(post_data, keep_blank_values=True))
@@ -248,13 +250,13 @@ def make_request_context(
 
     values: dict[str, list[str]] = {"tid": [], "fid": [], "post": [], "offset": []}
     for key, value in pairs:
-        if key in {"tid", "thread_id"}:
+        if key.lower() in {"tid", "thread_id", "kz"}:
             values["tid"].append(value)
-        elif key == "fid":
+        elif key.lower() == "fid":
             values["fid"].append(value)
-        elif key in {"pid", "post_id"}:
+        elif key.lower() in {"pid", "post_id"}:
             values["post"].append(value)
-        elif key == "offset":
+        elif key.lower() == "offset":
             values["offset"].append(value)
 
     def one_id(key: str) -> str | None:
@@ -297,7 +299,15 @@ def make_request_context(
         observed_at=observed_at or datetime.now(UTC),
         context_id=context_id,
         reason=reason,
+        page_origin=_trusted_origin(page_url),
     )
+
+
+def _trusted_origin(url: str) -> str | None:
+    parsed = urlparse(url)
+    if not _is_trusted_tieba_url(parsed):
+        return None
+    return f"https://{(parsed.hostname or '').lower()}"
 
 
 def validate_request_context(target: Target, context: ImmutableRequestContext) -> IdentityCheck:
@@ -320,6 +330,36 @@ def validate_request_context(target: Target, context: ImmutableRequestContext) -
     if expected_post_id is not None and context.request_post_id != expected_post_id:
         return IdentityCheck(False, "request_post_id_mismatch")
     if target.fid is not None and context.request_fid is not None and context.request_fid != target.fid:
+        return IdentityCheck(False, "request_fid_mismatch")
+    return IdentityCheck(True, None)
+
+
+def validate_page_pc_request_context(target: Target, context: ImmutableRequestContext) -> IdentityCheck:
+    if context.reason:
+        return IdentityCheck(False, context.reason)
+    if target != context.target:
+        return IdentityCheck(False, "request_context_target_mismatch")
+    if target.target_type not in {"thread", "comment"}:
+        return IdentityCheck(False, "page_pc_target_type_mismatch")
+    if context.request_method != "POST":
+        return IdentityCheck(False, "request_method_mismatch")
+    parsed_request = urlparse(context.request_url)
+    if (
+        parsed_request.scheme != "https"
+        or (parsed_request.hostname or "").lower() not in {"tieba.baidu.com", "www.tieba.baidu.com"}
+        or parsed_request.username is not None
+        or parsed_request.password is not None
+        or parsed_request.path != PAGE_PC_PATH
+        or context.page_origin != _trusted_origin(context.request_url)
+    ):
+        return IdentityCheck(False, "page_pc_request_context_mismatch")
+    if context.page_tid != target.tid:
+        return IdentityCheck(False, "page_tid_mismatch")
+    if context.request_tid != target.tid:
+        return IdentityCheck(False, "request_tid_mismatch")
+    if target.fid is None:
+        return IdentityCheck(False, "target_fid_missing")
+    if context.request_fid is not None and context.request_fid != target.fid:
         return IdentityCheck(False, "request_fid_mismatch")
     return IdentityCheck(True, None)
 

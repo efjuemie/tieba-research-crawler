@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
 from aiotieba.enums import BawuType, PostSortType, ReqUInfo, ThreadSortType
+from aiotieba.helper.cache import ForumInfoCache
 from tiebameow.client.tieba_client import Client, RetriableApiError, UnretriableApiError, with_ensure
 from tiebameow.parser import convert_aiotieba_comments, convert_aiotieba_posts, convert_aiotieba_threads
 
@@ -208,6 +209,14 @@ class ResearchClient(Client):
         sort: ThreadSortType = ThreadSortType.REPLY,
         is_good: bool = False,
     ) -> ResearchPage[object, ThreadsDTO]:
+        # Resolve outside get_threads' admission: aiotieba's internal resolver
+        # bypasses that wrapper and would issue two HTTP calls in one slot.
+        if isinstance(fname_or_fid, int):
+            if isinstance(fname_or_fid, bool) or not 0 < fname_or_fid < (1 << 63):
+                raise ValueError("Invalid forum ID.")
+            fname_or_fid = ForumInfoCache.get_fname(fname_or_fid) or str(await self.get_fname(fname_or_fid))
+            if not fname_or_fid:
+                raise ValueError("Forum name resolution returned no name.")
         raw = await self.get_threads(fname_or_fid, pn, rn=rn, sort=sort, is_good=is_good)
         dto = convert_aiotieba_threads(raw)
         dto.page.total_count = raw.page.total_count

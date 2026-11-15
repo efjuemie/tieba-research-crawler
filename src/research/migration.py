@@ -28,6 +28,8 @@ async def create_research_tables(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all, tables=RESEARCH_MIGRATION_TABLES)
         await connection.run_sync(_ensure_research_user_global_growth_level)
+        await connection.run_sync(_ensure_content_field_sources)
+        await connection.run_sync(_ensure_api_field_observation_nullability)
 
 
 def _ensure_research_user_global_growth_level(connection) -> None:
@@ -41,6 +43,53 @@ def _ensure_research_user_global_growth_level(connection) -> None:
         columns = {column["name"] for column in inspect(connection).get_columns("research_user")}
         if "global_growth_level" not in columns:
             connection.exec_driver_sql("ALTER TABLE research_user ADD COLUMN global_growth_level INTEGER")
+        return
+
+    raise ValueError(f"Unsupported database dialect for research migration: {connection.dialect.name}.")
+
+
+def _ensure_content_field_sources(connection) -> None:
+    """Add web/API provenance storage without rewriting existing content rows."""
+    table_names = ("research_thread", "research_post", "research_comment")
+    if connection.dialect.name == "postgresql":
+        for table_name in table_names:
+            connection.exec_driver_sql(
+                f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS field_sources_json JSONB"
+            )
+        return
+
+    if connection.dialect.name == "sqlite":
+        inspector = inspect(connection)
+        for table_name in table_names:
+            columns = {column["name"] for column in inspector.get_columns(table_name)}
+            if "field_sources_json" not in columns:
+                connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN field_sources_json JSON")
+        return
+
+    raise ValueError(f"Unsupported database dialect for research migration: {connection.dialect.name}.")
+
+
+def _ensure_api_field_observation_nullability(connection) -> None:
+    """Allow API observations without a web task, run, or captured request URL."""
+    if connection.dialect.name == "postgresql":
+        connection.exec_driver_sql(
+            "ALTER TABLE research_field_observation ALTER COLUMN task_key DROP NOT NULL"
+        )
+        connection.exec_driver_sql(
+            "ALTER TABLE research_field_observation ALTER COLUMN run_id DROP NOT NULL"
+        )
+        connection.exec_driver_sql(
+            "ALTER TABLE research_field_observation ALTER COLUMN source_url DROP NOT NULL"
+        )
+        return
+
+    if connection.dialect.name == "sqlite":
+        columns = {column["name"]: column for column in inspect(connection).get_columns("research_field_observation")}
+        if any(columns[name]["nullable"] is False for name in ("task_key", "run_id", "source_url")):
+            raise ValueError(
+                "SQLite research_field_observation has an unsupported pre-release NOT NULL schema; "
+                "create a fresh synthetic database or migrate this table explicitly."
+            )
         return
 
     raise ValueError(f"Unsupported database dialect for research migration: {connection.dialect.name}.")

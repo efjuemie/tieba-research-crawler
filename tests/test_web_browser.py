@@ -3,15 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from pathlib import Path
 
 import pytest
+from lxml import html
 
 from src.research.web_fallback.browser import (
     BrowserProviderConfigurationError,
     PlaywrightWebFallbackProvider,
 )
 from src.research.web_fallback.identity import Target
-from src.research.web_fallback.network import NESTED_FLOOR_PATH, USER_CARD_PATH
+from src.research.web_fallback.network import NESTED_FLOOR_PATH, PAGE_PC_PATH, USER_CARD_PATH
 
 TID = "81001"
 FID = "120"
@@ -120,15 +122,15 @@ class FakeWrapper:
     def __init__(self, page):
         self.page = page
 
-    def get_by_text(self, _pattern):
-        return FakeExpansion(self.page)
-
     async def count(self):
         return int(self.page.has_wrapper)
 
     def locator(self, selector):
-        assert selector == ".pb-lzl-item"
-        return FakeNestedItems(self.page)
+        if selector == ":scope > .show-more-lzl":
+            return FakeExpansion(self.page)
+        if selector == ":scope > .pb-lzl-item":
+            return FakeNestedItems(self.page)
+        raise AssertionError(f"unexpected wrapper selector {selector}")
 
 
 class FakeNestedItems:
@@ -150,7 +152,7 @@ class FakePostLocator:
         return int(self.page.has_post)
 
     def locator(self, selector):
-        assert selector == ":scope > .lzl-wrapper"
+        assert selector == ":scope > .comment-content > .lzl-wrapper"
         return FakeWrapper(self.page)
 
 
@@ -162,6 +164,7 @@ class FakePage:
         body_text="正常页面",
         status=200,
         nested_response_text="{}",
+        page_pc_response_text=None,
         expansion_remaining=1,
         has_post=True,
         emit_user_card=False,
@@ -181,6 +184,7 @@ class FakePage:
         self.body_text = body_text
         self.goto_status = status
         self.nested_response_text = nested_response_text
+        self.page_pc_response_text = page_pc_response_text
         self.expansion_remaining = expansion_remaining
         self.has_post = has_post
         self.emit_user_card = emit_user_card
@@ -228,6 +232,14 @@ class FakePage:
             user_card = FakeRequest(f"https://tieba.baidu.com{USER_CARD_PATH}", method="GET")
             self.emit("request", user_card)
             self.emit("response", FakeResponse(user_card))
+        if self.page_pc_response_text is not None:
+            page_pc = FakeRequest(
+                f"https://tieba.baidu.com{PAGE_PC_PATH}",
+                method="POST",
+                post_data=f"kz={TID}&pn=1",
+            )
+            self.emit("request", page_pc)
+            self.emit("response", FakeResponse(page_pc, text=self.page_pc_response_text))
         if self.navigation_delay:
             await asyncio.sleep(self.navigation_delay)
         return FakeResponse(document, status=self.goto_status)
@@ -259,6 +271,20 @@ class FakePage:
         if self.close_delay:
             await asyncio.sleep(self.close_delay)
         self.closed = True
+
+
+class PaginatedPagePcFakePage(FakePage):
+    def __init__(self, *, page_pc_responses, has_post_by_page, nested_response_text="{}"):
+        super().__init__(has_post=False, nested_response_text=nested_response_text)
+        self.page_pc_responses = page_pc_responses
+        self.has_post_by_page = has_post_by_page
+        self.page_number = 0
+
+    async def goto(self, url, **kwargs):
+        self.page_number += 1
+        self.page_pc_response_text = self.page_pc_responses[self.page_number - 1]
+        self.has_post = self.has_post_by_page[self.page_number - 1]
+        return await super().goto(url, **kwargs)
 
 
 class FakeContext:
@@ -339,6 +365,42 @@ def _nested_response(*, cid=CID, author_id=AUTHOR_ID):
     )
 
 
+def _page_pc_response(*, cid=CID):
+    return json.dumps(
+        {
+            "error_code": 0,
+            "forum": {"id": int(FID)},
+            "thread": {
+                "id": int(TID),
+                "post_id": int(POST_ID),
+                "author": {"id": int(AUTHOR_ID)},
+                "reply_num": 8,
+                "agree": {"agree_num": 5, "disagree_num": 2},
+                "collect_num": 0,
+                "share_num": 1,
+            },
+            "first_floor": {"id": int(POST_ID), "author_id": int(AUTHOR_ID)},
+            "post_list": [
+                {
+                    "id": int(POST_ID),
+                    "sub_post_list": {
+                        "pid": int(POST_ID),
+                        "sub_post_list": [
+                            {
+                                "id": int(cid),
+                                "author_id": int(AUTHOR_ID),
+                                "agree": {"agree_num": 3, "disagree_num": 0},
+                            }
+                        ],
+                    },
+                }
+            ],
+            "user_list": [{"id": int(AUTHOR_ID), "ip_address": "合成地区"}],
+        },
+        ensure_ascii=False,
+    )
+
+
 def _provider(context, budget=None, **kwargs):
     return PlaywrightWebFallbackProvider(
         context=context,
@@ -377,6 +439,39 @@ async def test_provider_uses_natural_expansion_response_and_request_context():
 
 
 @pytest.mark.asyncio
+async def test_provider_expands_synthetic_comment_content_wrapper():
+    """The real owner shape nests lzl-wrapper under comment-content."""
+    fixture = html.fromstring(
+        (Path(__file__).parent / "fixtures/web_comment_owner_synthetic.html").read_text()
+    )
+    owners = fixture.xpath(
+        "//*[contains(concat(' ', normalize-space(@class), ' '), ' pb-comment-item ') "
+        "and @data-id='45002']"
+    )
+    assert len(owners) == 1
+    contents = owners[0].xpath(
+        "./*[contains(concat(' ', normalize-space(@class), ' '), ' comment-content ')]"
+    )
+    wrappers = contents[0].xpath(
+        "./*[contains(concat(' ', normalize-space(@class), ' '), ' lzl-wrapper ')]"
+    )
+    expanders = wrappers[0].xpath(
+        "./*[contains(concat(' ', normalize-space(@class), ' '), ' show-more-lzl ')]"
+    )
+    assert len(contents) == len(wrappers) == len(expanders) == 1
+
+    page = FakePage(nested_response_text=_nested_response())
+    provider = _provider(FakeContext(lambda: page), max_expansions=1)
+
+    result = await provider.collect(_comment_target())
+
+    assert result.status == "ok"
+    assert result.diagnostics["expansions"] == 1
+    assert result.diagnostics["nested_floor_requests"] == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_verified_comment_without_requested_network_value_is_ok():
     page = FakePage(nested_response_text=_nested_response())
     provider = _provider(FakeContext(lambda: page))
@@ -408,6 +503,123 @@ async def test_verified_thread_without_requested_dom_value_is_ok():
     assert result.field_outcomes["global_growth_level"] == {
         "status": "absent_on_page",
         "reason": "global_growth_icon_not_present",
+    }
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_prefers_page_pc_counts_and_preserves_dom_conflicts():
+    counters = """
+      <div class="pc-pb-first-floor-interactive">
+        <div class="action-item"><svg><use href="#agree_pb"></use></svg><span class="action-number">5</span></div>
+        <div class="action-item"><svg><use href="#comment_pb"></use></svg><span class="action-number">7</span></div>
+        <div class="action-item"><svg><use href="#collect"></use></svg><span class="action-number">收藏</span></div>
+        <div class="action-item"><svg><use href="#share_pb"></use></svg><span class="action-number">1</span></div>
+      </div>
+    """
+    page = FakePage(
+        html_text=_thread_html().replace(
+            '<div class="pc-pb-first-floor-interactive"></div>', counters
+        ),
+        page_pc_response_text=_page_pc_response(),
+    )
+    provider = _provider(FakeContext(lambda: page))
+
+    result = await provider.collect(
+        _thread_target(
+            requested_fields=("agree_count", "reply_count", "collect_count", "share_count")
+        )
+    )
+
+    by_field = {}
+    for candidate in result.candidates:
+        by_field.setdefault(candidate.field_name, []).append(candidate)
+    assert result.status == "ok"
+    assert [item.source_kind for item in by_field["agree_count"]] == ["web_network"]
+    assert [item.normalized_value for item in by_field["reply_count"]] == [8, 7]
+    assert by_field["reply_count"][0].source_kind == "web_network"
+    assert by_field["reply_count"][1].source_kind == "web_dom"
+    assert [(item.source_kind, item.raw_value) for item in by_field["reply_count"]] == [
+        ("web_network", 8),
+        ("web_dom", "7"),
+    ]
+    assert by_field["collect_count"][0].normalized_value == 0
+    assert by_field["collect_count"][0].source_path == "page_pc.thread.collect_num"
+    assert "collect_count" not in result.field_outcomes
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_page_pc_candidates_do_not_stop_nested_floor_fallback():
+    page = FakePage(
+        nested_response_text=_nested_response(),
+        page_pc_response_text=_page_pc_response(),
+    )
+    provider = _provider(FakeContext(lambda: page), max_expansions=1)
+
+    result = await provider.collect(
+        _comment_target(
+            requested_fields=("author_nickname", "ip_location_text", "agree_count", "disagree_count")
+        )
+    )
+
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+    assert result.status == "ok"
+    assert result.diagnostics["page_pc_requests"] == 1
+    assert result.diagnostics["nested_floor_requests"] == 1
+    assert candidates["author_nickname"].raw_value == "合成昵称"
+    assert candidates["ip_location_text"].source_path == "page_pc.user_list[0].ip_address"
+    assert candidates["agree_count"].normalized_value == 3
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_page_pc_missing_cid_keeps_exact_nested_expansion_active():
+    page = FakePage(
+        nested_response_text=_nested_response(),
+        page_pc_response_text=_page_pc_response(cid="9007199254740994"),
+    )
+    provider = _provider(FakeContext(lambda: page), max_expansions=1)
+
+    result = await provider.collect(_comment_target())
+
+    assert result.status == "ok"
+    assert result.diagnostics["nested_floor_requests"] == 1
+    assert [candidate.field_name for candidate in result.candidates] == ["author_nickname"]
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_page_pc_without_parent_on_page_one_allows_valid_page_two_candidate():
+    first_page_payload = json.loads(_page_pc_response())
+    first_page_payload["post_list"] = []
+    page = PaginatedPagePcFakePage(
+        page_pc_responses=[
+            json.dumps(first_page_payload, ensure_ascii=False),
+            _page_pc_response(),
+        ],
+        has_post_by_page=[False, True],
+        nested_response_text=_nested_response(),
+    )
+    provider = _provider(
+        FakeContext(lambda: page),
+        max_pages=2,
+        max_expansions=1,
+        timeout_seconds=0.2,
+    )
+
+    result = await provider.collect(
+        _comment_target(requested_fields=("author_nickname", "ip_location_text", "agree_count"))
+    )
+
+    assert result.status == "ok"
+    assert result.diagnostics["pages"] == 2
+    assert result.diagnostics["page_pc_requests"] == 2
+    assert result.diagnostics["nested_floor_requests"] == 1
+    assert {candidate.field_name for candidate in result.candidates} == {
+        "ip_location_text",
+        "agree_count",
+        "author_nickname",
     }
     await provider.close()
 
@@ -668,7 +880,11 @@ async def test_user_card_route_stays_unverified_until_schema_evidence_exists():
 
 @pytest.mark.asyncio
 async def test_provider_obeys_max_pages_when_owner_is_not_on_current_page():
-    page = FakePage(html_text=_thread_html(), has_post=False)
+    page = FakePage(
+        html_text=_thread_html(),
+        has_post=False,
+        page_pc_response_text=_page_pc_response(),
+    )
     target = Target(
         target_type="post",
         target_id=POST_ID,
@@ -685,6 +901,7 @@ async def test_provider_obeys_max_pages_when_owner_is_not_on_current_page():
 
     assert result.status in {"dom_changed", "timeout"}
     assert result.diagnostics["pages"] == 2
+    assert result.diagnostics["page_pc_requests"] == 0
     await provider.close()
 
 

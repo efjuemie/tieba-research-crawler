@@ -206,6 +206,14 @@ class ResearchConfig(BaseModel):
     retry_wait_seconds: float = Field(default=0.5, ge=0)
 
 
+class WebFallbackConfig(BaseModel):
+    """Bounded defaults for explicit, local web enrichment commands."""
+
+    max_pages: int = Field(default=1, ge=1, le=1)
+    max_expansions: int = Field(default=1, ge=0, le=1)
+    timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+
+
 class PydanticConfig(BaseSettings):
     """Pydantic总配置模型"""
 
@@ -229,6 +237,7 @@ class PydanticConfig(BaseSettings):
     deep_scan: DeepScanConfig = Field(default_factory=lambda: DeepScanConfig(enabled=False, depth=3))
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
+    web_fallback: WebFallbackConfig = Field(default_factory=WebFallbackConfig)
     websocket: WebSocketConfig = Field(default_factory=lambda: WebSocketConfig(host="localhost", port=8000))
     consumer: ConsumerConfig = Field(
         default_factory=lambda: ConsumerConfig(transport="none", max_len=10000, stream_prefix="scraper:tieba:events")

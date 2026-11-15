@@ -59,9 +59,10 @@ class AsyncResultFromSync:
 
 
 class AsyncSessionFromSync:
-    def __init__(self, session, *, drop_first_stream=False):
+    def __init__(self, session, *, drop_stream_number=None):
         self._session = session
-        self._drop_first_stream = drop_first_stream
+        self._drop_stream_number = drop_stream_number
+        self._stream_number = 0
 
     async def __aenter__(self):
         return self
@@ -80,8 +81,8 @@ class AsyncSessionFromSync:
 
     async def stream(self, statement):
         result = self._session.execute(statement)
-        drop_first = self._drop_first_stream
-        self._drop_first_stream = False
+        self._stream_number += 1
+        drop_first = self._stream_number == self._drop_stream_number
         return AsyncResultFromSync(result, drop_first=drop_first)
 
 
@@ -398,6 +399,11 @@ async def test_export_writes_all_csvs_without_losing_legacy_or_research_rows(tmp
         "media_assets",
         "thread_scope_quality_report",
         "crawl_quality_report",
+        "web_enrichment_tasks",
+        "web_enrichment_attempts",
+        "field_observations",
+        "web_enrichment_failures",
+        "field_quality_report",
     }
     batch_prefix = paths["threads"].stem.removeprefix("threads_")
     assert set(paths) == {*expected_csv_names, "manifest"}
@@ -1006,7 +1012,7 @@ async def test_export_writes_header_only_quality_report_when_no_summaries(tmp_pa
     assert manifest["quality_checkpoint_summary_count"] == 0
     assert manifest["csv_row_counts"]["crawl_quality_report"] == 1
     assert manifest["csv_row_counts"]["thread_scope_quality_report"] == 0
-    assert manifest["database_row_counts"] == dict.fromkeys(
+    expected_counts = dict.fromkeys(
         (
             "threads",
             "posts",
@@ -1015,9 +1021,15 @@ async def test_export_writes_header_only_quality_report_when_no_summaries(tmp_pa
             "user_forum_snapshots",
             "media_assets",
             "thread_scope_quality_report",
+            "web_enrichment_tasks",
+            "web_enrichment_attempts",
+            "field_observations",
+            "web_enrichment_failures",
         ),
         0,
     )
+    expected_counts["field_quality_report"] = len(read_csv(paths["field_quality_report"])[1])
+    assert manifest["database_row_counts"] == expected_counts
     assert read_csv(paths["threads"])[0] == list(THREAD_FIELDS)
     assert read_csv(paths["posts"])[0] == list(POST_FIELDS)
     assert read_csv(paths["comments"])[0] == list(COMMENT_FIELDS)
@@ -1070,7 +1082,8 @@ async def test_export_rejects_csv_count_mismatch_before_publishing(tmp_path):
     database.commit()
 
     def async_sessionmaker_():
-        return AsyncSessionFromSync(database, drop_first_stream=True)
+        # Five quality queries stream before thread CSV validation begins.
+        return AsyncSessionFromSync(database, drop_stream_number=6)
 
     output_dir = tmp_path / "exports"
     with pytest.raises(ResearchExportValidationError, match="threads database and staged row counts differ"):

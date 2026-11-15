@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import threading
+from collections import Counter
 from collections.abc import AsyncIterable, Iterable, Mapping
 from datetime import UTC, date, datetime
 from enum import Enum
@@ -29,7 +30,18 @@ from tiebameow.models.orm import User as BaseUser
 
 from src.core.models import ResearchTaskScope
 
-from .models import MediaAsset, ResearchComment, ResearchPost, ResearchThread, ResearchUser, UserForumSnapshot
+from .models import (
+    MediaAsset,
+    ResearchComment,
+    ResearchFieldObservation,
+    ResearchPost,
+    ResearchThread,
+    ResearchUser,
+    ResearchWebEnrichmentAttempt,
+    ResearchWebEnrichmentFailure,
+    ResearchWebEnrichmentTask,
+    UserForumSnapshot,
+)
 from .urls import canonical_thread_url
 
 if TYPE_CHECKING:
@@ -39,6 +51,7 @@ if TYPE_CHECKING:
 
 EXPORT_BATCH_SIZE = 1000
 _CSV_FIELD_LIMIT_LOCK = threading.Lock()
+_UNKNOWN_ZERO_REASONS = frozenset({"zero_presence_unverified", "zero_presence_unverified_in_parsed_object"})
 
 
 class ResearchExportValidationError(RuntimeError):
@@ -92,6 +105,7 @@ THREAD_FIELDS = (
     "observed_at",
     "source_payload_json",
     "missing_reasons_json",
+    "field_sources_json",
     "record_source",
     "legacy_base_snapshot_json",
     "thread_url",
@@ -143,6 +157,7 @@ POST_FIELDS = (
     "observed_at",
     "source_payload_json",
     "missing_reasons_json",
+    "field_sources_json",
     "record_source",
     "legacy_base_snapshot_json",
     "thread_url",
@@ -195,6 +210,7 @@ COMMENT_FIELDS = (
     "observed_at",
     "source_payload_json",
     "missing_reasons_json",
+    "field_sources_json",
     "record_source",
     "legacy_base_snapshot_json",
     "thread_url",
@@ -246,6 +262,34 @@ USER_FORUM_SNAPSHOT_FIELDS = (
     "tieba_uid",
     "source_payload_json",
     "missing_reasons_json",
+)
+
+WEB_ENRICHMENT_TASK_FIELDS = tuple(column.name for column in ResearchWebEnrichmentTask.__table__.columns)
+FIELD_OBSERVATION_FIELDS = tuple(column.name for column in ResearchFieldObservation.__table__.columns)
+WEB_ENRICHMENT_FAILURE_FIELDS = ("run_id", *(column.name for column in ResearchWebEnrichmentFailure.__table__.columns))
+WEB_ENRICHMENT_ATTEMPT_FIELDS = tuple(column.name for column in ResearchWebEnrichmentAttempt.__table__.columns)
+FIELD_QUALITY_FIELDS = (
+    "entity_type",
+    "field_name",
+    "entity_count",
+    "canonical_nonempty_count",
+    "api_nonempty_count",
+    "verified_content_api_entity_count",
+    "web_applied_entity_count",
+    "api_observation_count",
+    "web_observation_count",
+    "unknown_source_observation_count",
+    "unscoped_observation_count",
+    "known_zero_count",
+    "unknown_zero_count",
+    "missing_reason_count",
+    "missing_reason_counts_json",
+    "api_conflict_count",
+    "api_observation_conflict_count",
+    "web_conflict_count",
+    "identity_failure_count",
+    "entity_population",
+    "web_evidence_run_filter",
 )
 
 MEDIA_ASSET_FIELDS = (
@@ -348,15 +392,25 @@ async def export_research_csvs(
             "media_assets",
             "thread_scope_quality_report",
             "crawl_quality_report",
+            "web_enrichment_tasks",
+            "web_enrichment_attempts",
+            "field_observations",
+            "web_enrichment_failures",
+            "field_quality_report",
         )
     }
 
     try:
-        specs = _query_specs(entity_scope)
+        specs = _query_specs(entity_scope, source_run_id=source_run_id)
         async with async_sessionmaker_() as session:
             await _begin_consistent_snapshot(session)
             expected_counts = await _validate_database(session, specs, entity_scope)
             scope_selection_counts = await _thread_scope_selection_counts(session, entity_scope)
+            field_quality_rows = await _collect_field_quality_rows(
+                session,
+                entity_scope=entity_scope,
+                source_run_id=source_run_id,
+            )
             csv_counts: dict[str, int] = {}
             for name, statement, fields, row_mapper, _unique_fields in specs:
                 written = await _write_query_csv(session, paths[name], fields, statement, row_mapper)
@@ -370,6 +424,15 @@ async def export_research_csvs(
                         f"Export validation failed: {name} database and parsed CSV row counts differ."
                     )
                 csv_counts[name] = parsed
+
+            await _write_rows_csv(paths["field_quality_report"], FIELD_QUALITY_FIELDS, field_quality_rows)
+            field_quality_parsed = await _count_csv_rows(paths["field_quality_report"], FIELD_QUALITY_FIELDS)
+            if field_quality_parsed != len(field_quality_rows):
+                raise ResearchExportValidationError(
+                    "Export validation failed: field quality summary and parsed CSV row counts differ."
+                )
+            expected_counts["field_quality_report"] = len(field_quality_rows)
+            csv_counts["field_quality_report"] = field_quality_parsed
 
             quality_written, quality_summary_count, quality_checked_range = await _write_quality_csv(
                 paths["crawl_quality_report"],
@@ -395,11 +458,25 @@ async def export_research_csvs(
                     "threads": entity_scope,
                     "posts": entity_scope,
                     "comments": entity_scope,
-                    "media_assets": (
-                        "all_database_rows" if entity_scope == "all" else "selected_content_owners_only"
-                    ),
+                    "media_assets": ("all_database_rows" if entity_scope == "all" else "selected_content_owners_only"),
                     "users": "all_database_rows_unfiltered",
                     "user_forum_snapshots": "all_database_rows_unfiltered",
+                    "web_enrichment_tasks": "source_run_id_filtered" if source_run_id is not None else "all_runs",
+                    "web_enrichment_attempts": (
+                        "joined_to_source_run_id_tasks" if source_run_id is not None else "all_runs"
+                    ),
+                    "field_observations": (
+                        "selected_run_id_excludes_unscoped_null_run_id"
+                        if source_run_id is not None
+                        else "all_runs_including_unscoped_null_run_id"
+                    ),
+                    "web_enrichment_failures": (
+                        "joined_to_source_run_id_tasks" if source_run_id is not None else "all_runs"
+                    ),
+                    "field_quality_report": (
+                        "canonical counts match exported content population; "
+                        "evidence counts follow source_run_id filter"
+                    ),
                 },
                 "scope_selection_semantics": (
                     "latest ResearchTaskScope per tid and logical scope across runs by last_checked DESC, run_id DESC; "
@@ -417,6 +494,23 @@ async def export_research_csvs(
                 "forum_coverage_status": "unknown_not_proven",
                 "thread_scope_selection_counts": scope_selection_counts,
                 "source_run_id_context_only": source_run_id,
+                "audit_csv_semantics": {
+                    "web_enrichment_tasks": "operational audit data, not an analysis sample",
+                    "web_enrichment_attempts": "bounded request and page-action audit data, not an analysis sample",
+                    "field_observations": (
+                        "source evidence, not an analysis sample; source_kind distinguishes "
+                        "web_dom/web_network, api_raw/user_forum_api, and unknown; "
+                        "all-runs includes null run_id; selected-run exports exclude null run_id"
+                    ),
+                    "web_enrichment_failures": "operational failure audit, not an analysis sample",
+                    "field_quality_report": {
+                        "canonical_population": "all exported research/legacy content entities; see entity_scope",
+                        "source_run_id": (
+                            "filters task and observation evidence only; does not filter canonical entities; "
+                            "selected-run observation filters exclude unscoped null run_id rows"
+                        ),
+                    },
+                },
                 "csv_files": {name: path.name for name, path in paths.items()},
                 "database_row_counts": expected_counts,
                 "quality_checkpoint_summary_count": quality_summary_count,
@@ -449,7 +543,7 @@ def _batch_identity(source_run_id: str | None, entity_scope: str = "all") -> tup
     return f"{scope_prefix}_source-{safe_run_id}_{timestamp}_{export_id}", export_id, exported_at
 
 
-def _query_specs(entity_scope: str = "all"):
+def _query_specs(entity_scope: str = "all", *, source_run_id: str | None = None):
     return [
         ("threads", _thread_query(entity_scope), THREAD_FIELDS, _thread_row, ("export_id",)),
         ("posts", _post_query(entity_scope), POST_FIELDS, _post_row, ("export_id",)),
@@ -476,7 +570,87 @@ def _query_specs(entity_scope: str = "all"):
             _thread_scope_quality_row,
             ("tid",),
         ),
+        (
+            "web_enrichment_tasks",
+            _web_task_query(source_run_id),
+            WEB_ENRICHMENT_TASK_FIELDS,
+            lambda row: _table_record_row(row[0], WEB_ENRICHMENT_TASK_FIELDS),
+            ("task_key",),
+        ),
+        (
+            "web_enrichment_attempts",
+            _web_attempt_query(source_run_id),
+            WEB_ENRICHMENT_ATTEMPT_FIELDS,
+            lambda row: _table_record_row(row[0], WEB_ENRICHMENT_ATTEMPT_FIELDS),
+            ("task_key", "lease_generation"),
+        ),
+        (
+            "field_observations",
+            _field_observation_query(source_run_id),
+            FIELD_OBSERVATION_FIELDS,
+            lambda row: _table_record_row(row[0], FIELD_OBSERVATION_FIELDS),
+            ("observation_key",),
+        ),
+        (
+            "web_enrichment_failures",
+            _web_failure_query(source_run_id),
+            WEB_ENRICHMENT_FAILURE_FIELDS,
+            _web_failure_row,
+            ("failure_id",),
+        ),
     ]
+
+
+def _web_task_query(source_run_id: str | None):
+    statement = select(ResearchWebEnrichmentTask)
+    if source_run_id is not None:
+        statement = statement.where(ResearchWebEnrichmentTask.run_id == source_run_id)
+    return statement.order_by(
+        ResearchWebEnrichmentTask.run_id, ResearchWebEnrichmentTask.created_at, ResearchWebEnrichmentTask.task_key
+    )
+
+
+def _web_attempt_query(source_run_id: str | None):
+    statement = select(ResearchWebEnrichmentAttempt)
+    if source_run_id is not None:
+        statement = statement.join(
+            ResearchWebEnrichmentTask,
+            ResearchWebEnrichmentTask.task_key == ResearchWebEnrichmentAttempt.task_key,
+        ).where(ResearchWebEnrichmentTask.run_id == source_run_id)
+    return statement.order_by(ResearchWebEnrichmentAttempt.task_key, ResearchWebEnrichmentAttempt.lease_generation)
+
+
+def _field_observation_query(source_run_id: str | None):
+    statement = select(ResearchFieldObservation)
+    if source_run_id is not None:
+        statement = statement.where(ResearchFieldObservation.run_id == source_run_id)
+    return statement.order_by(
+        ResearchFieldObservation.run_id,
+        ResearchFieldObservation.target_type,
+        ResearchFieldObservation.target_id,
+        ResearchFieldObservation.field_name,
+        ResearchFieldObservation.observed_at,
+    )
+
+
+def _web_failure_query(source_run_id: str | None):
+    statement = select(ResearchWebEnrichmentFailure, ResearchWebEnrichmentTask.run_id).outerjoin(
+        ResearchWebEnrichmentTask,
+        ResearchWebEnrichmentTask.task_key == ResearchWebEnrichmentFailure.task_key,
+    )
+    if source_run_id is not None:
+        statement = statement.where(ResearchWebEnrichmentTask.run_id == source_run_id)
+    return statement.order_by(ResearchWebEnrichmentFailure.occurred_at, ResearchWebEnrichmentFailure.failure_id)
+
+
+def _table_record_row(record: Any, fields: tuple[str, ...]) -> dict[str, object]:
+    return {field: getattr(record, field, None) for field in fields}
+
+
+def _web_failure_row(row: Any) -> dict[str, object]:
+    values = _table_record_row(row[0], tuple(field for field in WEB_ENRICHMENT_FAILURE_FIELDS if field != "run_id"))
+    values["run_id"] = row[1] or "unknown_task_run"
+    return values
 
 
 async def _begin_consistent_snapshot(session: AsyncSession) -> None:
@@ -557,6 +731,208 @@ async def _validate_relationships(session: AsyncSession, entity_scope: str = "al
         )
 
 
+async def _collect_field_quality_rows(
+    session: AsyncSession,
+    *,
+    entity_scope: str,
+    source_run_id: str | None,
+) -> list[dict[str, object]]:
+    """Stream exported content rows and aggregate compact per-field evidence counts."""
+    entity_specs = (
+        ("thread", _thread_query(entity_scope), _thread_row),
+        ("post", _post_query(entity_scope), _post_row),
+        ("comment", _comment_query(entity_scope), _comment_row),
+    )
+    metrics: dict[tuple[str, str], Counter[str]] = {}
+    missing_counts: dict[tuple[str, str], Counter[str]] = {}
+
+    for entity_type, statement, row_mapper in entity_specs:
+        result = await session.stream(statement.execution_options(yield_per=EXPORT_BATCH_SIZE))
+        try:
+            async for row in result:
+                values = row_mapper(row)
+                sources = values.get("field_sources_json")
+                sources = sources if isinstance(sources, dict) else {}
+                reasons = values.get("missing_reasons_json")
+                reasons = reasons if isinstance(reasons, dict) else {}
+                source_api = values.get("source_api")
+                record_source = values.get("record_source")
+                for field_name in _content_quality_fields(entity_type):
+                    key = (entity_type, field_name)
+                    counts = metrics.setdefault(key, Counter())
+                    counts["entity_count"] += 1
+                    value = values.get(field_name)
+                    present = value is not None and not (isinstance(value, str) and not value.strip())
+                    if present:
+                        counts["canonical_nonempty_count"] += 1
+                    source = sources.get(field_name)
+                    source = source if isinstance(source, dict) else {}
+                    verified_web = source.get("verified_web")
+                    verified_content_api = source.get("verified_content_api")
+                    if isinstance(verified_content_api, dict):
+                        counts["verified_content_api_entity_count"] += 1
+                    if isinstance(verified_web, dict):
+                        counts["web_applied_entity_count"] += 1
+                    elif present and (
+                        isinstance(verified_content_api, dict)
+                        or (
+                            record_source == "research_api"
+                            and isinstance(source_api, str)
+                            and source_api.startswith("aiotieba.")
+                        )
+                    ):
+                        counts["api_nonempty_count"] += 1
+                    reason = reasons.get(field_name)
+                    if isinstance(reason, str) and reason:
+                        counts["missing_reason_count"] += 1
+                        missing_counts.setdefault(key, Counter())[reason] += 1
+                    is_zero = value is False or (isinstance(value, int) and not isinstance(value, bool) and value == 0)
+                    has_presence_evidence = isinstance(verified_web, dict) or isinstance(verified_content_api, dict)
+                    legacy_base_zero = record_source == "legacy_base_unverified" and is_zero
+                    legacy_bawu_false = (
+                        field_name == "is_bawu"
+                        and value is False
+                        and record_source == "research_api"
+                        and not has_presence_evidence
+                    )
+                    unknown_zero = is_zero and (
+                        (reason in _UNKNOWN_ZERO_REASONS and not has_presence_evidence)
+                        or legacy_base_zero
+                        or legacy_bawu_false
+                    )
+                    if unknown_zero:
+                        counts["unknown_zero_count"] += 1
+                        if (legacy_base_zero or legacy_bawu_false) and not reason:
+                            counts["missing_reason_count"] += 1
+                            missing_counts.setdefault(key, Counter())["legacy_presence_unverified"] += 1
+                    elif is_zero:
+                        counts["known_zero_count"] += 1
+                    api_conflicts = source.get("api_conflicts")
+                    if isinstance(api_conflicts, list):
+                        counts["api_conflict_count"] += len(api_conflicts)
+        finally:
+            await result.close()
+
+    evidence_counts: dict[tuple[str, str], Counter[str]] = {}
+    observation_result = await session.stream(
+        _field_observation_query(source_run_id).execution_options(yield_per=EXPORT_BATCH_SIZE)
+    )
+    try:
+        async for row in observation_result:
+            observation = row[0]
+            key = (observation.target_type, observation.field_name)
+            counts = evidence_counts.setdefault(key, Counter())
+            source_kind = observation.source_kind
+            if observation.run_id is None:
+                counts["unscoped_observation_count"] += 1
+            if source_kind in {"web_dom", "web_network"}:
+                counts["web_observation_count"] += 1
+                if observation.applied_status == "conflict":
+                    counts["web_conflict_count"] += 1
+            elif source_kind in {"api_raw", "user_forum_api"}:
+                counts["api_observation_count"] += 1
+                if observation.applied_status == "conflict":
+                    counts["api_observation_conflict_count"] += 1
+            else:
+                counts["unknown_source_observation_count"] += 1
+    finally:
+        await observation_result.close()
+
+    identity_counts: Counter[tuple[str, str]] = Counter()
+    task_result = await session.stream(_web_task_query(source_run_id).execution_options(yield_per=EXPORT_BATCH_SIZE))
+    try:
+        async for row in task_result:
+            task = row[0]
+            statuses = task.field_statuses_json if isinstance(task.field_statuses_json, dict) else {}
+            requested = task.requested_fields_json if isinstance(task.requested_fields_json, list) else []
+            identity_failed = task.status == "identity_unverified" or task.identity_verified is False
+            for field_name in requested:
+                state = statuses.get(field_name)
+                state_status = state.get("status") if isinstance(state, dict) else state
+                key = (task.target_type, field_name)
+                if identity_failed or state_status == "identity_unverified":
+                    identity_counts[key] += 1
+    finally:
+        await task_result.close()
+
+    rows: list[dict[str, object]] = []
+    population = "all_exported_content_entities" if entity_scope == "all" else "completed_threads_scope_entities"
+    evidence_filter = "all_runs_including_unscoped" if source_run_id is None else "selected_run_id_excluding_unscoped"
+    for entity_type in ("thread", "post", "comment"):
+        for field_name in _content_quality_fields(entity_type):
+            key = (entity_type, field_name)
+            counts = metrics.get(key, Counter())
+            evidence = evidence_counts.get(key, Counter())
+            rows.append({
+                "entity_type": entity_type,
+                "field_name": field_name,
+                "entity_count": counts["entity_count"],
+                "canonical_nonempty_count": counts["canonical_nonempty_count"],
+                "api_nonempty_count": counts["api_nonempty_count"],
+                "verified_content_api_entity_count": counts["verified_content_api_entity_count"],
+                "web_applied_entity_count": counts["web_applied_entity_count"],
+                "api_observation_count": evidence["api_observation_count"],
+                "web_observation_count": evidence["web_observation_count"],
+                "unknown_source_observation_count": evidence["unknown_source_observation_count"],
+                "unscoped_observation_count": evidence["unscoped_observation_count"],
+                "known_zero_count": counts["known_zero_count"],
+                "unknown_zero_count": counts["unknown_zero_count"],
+                "missing_reason_count": counts["missing_reason_count"],
+                "missing_reason_counts_json": dict(sorted(missing_counts.get(key, Counter()).items())),
+                "api_conflict_count": counts["api_conflict_count"],
+                "api_observation_conflict_count": evidence["api_observation_conflict_count"],
+                "web_conflict_count": evidence["web_conflict_count"],
+                "identity_failure_count": identity_counts[key],
+                "entity_population": population,
+                "web_evidence_run_filter": evidence_filter,
+            })
+    return rows
+
+
+def _content_quality_fields(entity_type: str) -> tuple[str, ...]:
+    field_types = {
+        "thread": THREAD_FIELDS,
+        "post": POST_FIELDS,
+        "comment": COMMENT_FIELDS,
+    }[entity_type]
+    quality_fields = {
+        "author_user_name",
+        "author_nickname",
+        "author_portrait",
+        "forum_level",
+        "global_growth_level",
+        "is_bawu",
+        "forum_level_name",
+        "role_type",
+        "role_name",
+        "role_badge_id",
+        "role_badge_url",
+        "ip_location_text",
+        "agree_count",
+        "disagree_count",
+        "reply_count",
+        "collect_count",
+        "view_count",
+        "share_count",
+    }
+    return tuple(name for name in field_types if name in quality_fields)
+
+
+async def _write_rows_csv(path: Path, fields: tuple[str, ...], rows: Iterable[Mapping[str, object]]) -> int:
+    row_count = 0
+
+    async def write(file: Any) -> None:
+        nonlocal row_count
+        writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(_csv_row(row, fields))
+            row_count += 1
+
+    await _write_atomically(path, write)
+    return row_count
+
+
 def _latest_scope_rows(scope_type: str):
     scope = aliased(ResearchTaskScope)
     partition_columns = [scope.tid]
@@ -573,7 +949,8 @@ def _latest_scope_rows(scope_type: str):
             scope.generation.label("generation"),
             scope.status.label("status"),
             scope.last_checked.label("last_checked"),
-            func.row_number()
+            func
+            .row_number()
             .over(
                 partition_by=partition_columns,
                 order_by=(scope.last_checked.desc(), scope.run_id.desc(), scope.logical_task_key.desc()),
@@ -612,9 +989,7 @@ def _comment_scope_requirements():
         .join(ResearchPost, BasePost.pid == ResearchPost.pid, full=True)
         .where(post_tid.is_not(None), post_pid.is_not(None), post_subreply_count > 0)
     )
-    first_post_subreply_count = (
-        ResearchThread.source_payload_json["first_post"]["subreply_count_reported"].as_integer()
-    )
+    first_post_subreply_count = ResearchThread.source_payload_json["first_post"]["subreply_count_reported"].as_integer()
     positive_first_post_parents = select(
         ResearchThread.tid.label("tid"),
         ResearchThread.first_pid.label("parent_pid"),

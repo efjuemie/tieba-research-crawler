@@ -31,3 +31,6 @@ dev = [
     "ruff>=0.14.10",
 ]
 login = ["playwright>=1.50,<2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

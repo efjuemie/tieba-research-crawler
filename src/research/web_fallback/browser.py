@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -14,7 +13,15 @@ from urllib.parse import urlencode, urlparse
 
 from .dom import DOMExtractionResult, extract_dom_candidates, target_dom_structure_ready
 from .identity import ImmutableRequestContext, ObservationCandidate, Target, make_request_context
-from .network import NESTED_FLOOR_PATH, USER_CARD_PATH, NetworkExtractionResult, extract_nested_floor
+from .network import (
+    NESTED_FLOOR_PATH,
+    PAGE_PC_PATH,
+    USER_CARD_PATH,
+    NetworkExtractionResult,
+    extract_nested_floor,
+    extract_page_pc_comment,
+    extract_page_pc_thread_counts,
+)
 
 _CALLBACK_CLEANUP_TIMEOUT_SECONDS = 0.05
 
@@ -105,6 +112,7 @@ class PlaywrightWebFallbackProvider:
             "budgeted_actions": 0,
             "observed_subresource_requests": 0,
             "nested_floor_requests": 0,
+            "page_pc_requests": 0,
             "user_card_requests": 0,
             "pages": 0,
             "expansions": 0,
@@ -180,31 +188,33 @@ class PlaywrightWebFallbackProvider:
             if context_snapshot is None:
                 identity_mismatch = True
                 return
-            if response.status != 200:
-                result = extract_nested_floor(
-                    target,
-                    "",
-                    context_snapshot,
-                    response_status=response.status,
-                )
-                network_results.append(result)
-                return
+            path = urlparse(response.request.url).path
             try:
-                response_text = await asyncio.wait_for(
-                    response.text(),
-                    timeout=self._timeout_seconds,
+                response_text = "" if response.status != 200 else await asyncio.wait_for(
+                    response.text(), timeout=self._timeout_seconds
                 )
             except TimeoutError:
                 network_results.append(NetworkExtractionResult("timeout", "response_text_timeout", False, ()))
                 return
-            result = extract_nested_floor(
+            if path == PAGE_PC_PATH:
+                parser = (
+                    extract_page_pc_thread_counts
+                    if target.target_type == "thread"
+                    else extract_page_pc_comment
+                )
+            else:
+                parser = extract_nested_floor
+            result = parser(
                 target,
                 response_text,
                 context_snapshot,
                 response_status=response.status,
             )
             network_results.append(result)
-            if result.status == "identity_unverified" and result.reason != "cid_missing_from_response":
+            if result.status == "identity_unverified" and result.reason not in {
+                "cid_missing_from_response",
+                "parent_post_missing_from_response",
+            }:
                 state["identity_failure"] = result.reason
 
         def on_request(request) -> None:
@@ -218,6 +228,11 @@ class PlaywrightWebFallbackProvider:
                 state["user_card_reason"] = "unverified_source_schema"
             if path == NESTED_FLOOR_PATH:
                 state["nested_floor_requests"] += 1
+            if path == PAGE_PC_PATH and target.target_type in {"thread", "comment"}:
+                state["page_pc_requests"] += 1
+            if path == NESTED_FLOOR_PATH or (
+                path == PAGE_PC_PATH and target.target_type in {"thread", "comment"}
+            ):
                 request_contexts[_request_key(request)] = make_request_context(
                     target,
                     page_url=page.url,
@@ -263,11 +278,15 @@ class PlaywrightWebFallbackProvider:
                 state["blocked_reason"] = "http_429"
                 schedule_blocked("http_429")
             elif status in {401, 403} and (
-                path in {NESTED_FLOOR_PATH, USER_CARD_PATH} or _is_document_request(response.request)
+                path in {NESTED_FLOOR_PATH, USER_CARD_PATH}
+                or (path == PAGE_PC_PATH and target.target_type in {"thread", "comment"})
+                or _is_document_request(response.request)
             ):
                 state["blocked_reason"] = "http_auth_or_verification"
                 schedule_blocked("http_auth_or_verification")
-            if path == NESTED_FLOOR_PATH:
+            if path == NESTED_FLOOR_PATH or (
+                path == PAGE_PC_PATH and target.target_type in {"thread", "comment"}
+            ):
                 task = asyncio.create_task(capture_response(response))
                 response_tasks.add(task)
 
@@ -334,14 +353,14 @@ class PlaywrightWebFallbackProvider:
             if state.get("identity_failure"):
                 return BrowserRunResult("identity_unverified", state["identity_failure"], (), dict(state))
             if any(
-                result.status == "identity_unverified" and result.reason != "cid_missing_from_response"
+                result.status == "identity_unverified"
+                and result.reason
+                not in {"cid_missing_from_response", "parent_post_missing_from_response"}
                 for result in network_results
             ):
                 return BrowserRunResult("identity_unverified", "network_identity_mismatch", (), dict(state))
 
-            candidates = [candidate for result in network_results for candidate in result.candidates]
-            if dom_result is not None and dom_result.identity_verified:
-                candidates.extend(dom_result.candidates)
+            candidates = _merge_candidates(network_results, dom_result)
             identity_verified = any(result.identity_verified for result in network_results) or (
                 dom_result is not None and dom_result.identity_verified
             )
@@ -429,13 +448,13 @@ class PlaywrightWebFallbackProvider:
             else:
                 owner = page.locator(f'.pb-comment-item[data-id="{target.parent_post_pid}"]')
                 if await owner.count() == 1:
-                    wrapper = owner.locator(":scope > .lzl-wrapper")
+                    wrapper = owner.locator(":scope > .comment-content > .lzl-wrapper")
                     if await wrapper.count() == 1:
-                        expansion = wrapper.get_by_text(re.compile(r"展开\s*[0-9]+\s*条回复"))
-                        nested_items = wrapper.locator(".pb-lzl-item")
+                        expansion = wrapper.locator(":scope > .show-more-lzl")
+                        nested_items = wrapper.locator(":scope > .pb-lzl-item")
                         if (
                             state["nested_floor_requests"]
-                            or await expansion.count() > 0
+                            or await expansion.count() == 1
                             or await nested_items.count() > 0
                         ):
                             return "ready"
@@ -456,9 +475,13 @@ class PlaywrightWebFallbackProvider:
         owner = page.locator(f'.pb-comment-item[data-id="{target.parent_post_pid}"]')
         if await owner.count() != 1:
             return
-        wrapper = owner.locator(":scope > .lzl-wrapper")
-        expansion = wrapper.get_by_text(re.compile(r"展开\s*[0-9]+\s*条回复"))
-        while state["expansions"] < self._max_expansions and await expansion.count() > 0:
+        wrapper = owner.locator(":scope > .comment-content > .lzl-wrapper")
+        if await wrapper.count() != 1:
+            return
+        expansion = wrapper.locator(":scope > .show-more-lzl")
+        while state["expansions"] < self._max_expansions:
+            if await expansion.count() != 1:
+                return
             try:
                 async with page.expect_response(
                     lambda response: urlparse(response.request.url).path == NESTED_FLOOR_PATH,
@@ -474,8 +497,12 @@ class PlaywrightWebFallbackProvider:
             state["expansions"] += 1
             await capture_response(response)
             owner = page.locator(f'.pb-comment-item[data-id="{target.parent_post_pid}"]')
-            wrapper = owner.locator(":scope > .lzl-wrapper")
-            expansion = wrapper.get_by_text(re.compile(r"展开\s*[0-9]+\s*条回复"))
+            if await owner.count() != 1:
+                return
+            wrapper = owner.locator(":scope > .comment-content > .lzl-wrapper")
+            if await wrapper.count() != 1:
+                return
+            expansion = wrapper.locator(":scope > .show-more-lzl")
             if state["blocked_reason"]:
                 return
 
@@ -577,6 +604,27 @@ def _field_outcomes(target, network_results, dom_result):
                 {"status": "not_tested", "reason": "not_observed_in_bounded_page"},
             )
     return outcomes
+
+
+def _merge_candidates(network_results, dom_result):
+    candidates = [candidate for result in network_results for candidate in result.candidates]
+    if dom_result is not None and dom_result.identity_verified:
+        candidates.extend(dom_result.candidates)
+    candidates.sort(
+        key=lambda item: (
+            0 if item.source_path.startswith("page_pc.") else 1 if item.source_kind == "web_network" else 2
+        )
+    )
+    merged = []
+    for candidate in candidates:
+        if any(
+            existing.field_name == candidate.field_name
+            and existing.normalized_value == candidate.normalized_value
+            for existing in merged
+        ):
+            continue
+        merged.append(candidate)
+    return merged
 
 
 def _request_key(request):

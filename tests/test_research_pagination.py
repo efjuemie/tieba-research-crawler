@@ -280,6 +280,7 @@ async def test_managed_posts_page_uses_stored_first_pid_inside_page_transaction(
         source_api="aiotieba.get_posts",
     )
     events = []
+    persisted_run_ids: list[str | None] = []
 
     class Session:
         async def __aenter__(self):
@@ -331,8 +332,9 @@ async def test_managed_posts_page_uses_stored_first_pid_inside_page_transaction(
             assert session is self.session
             assert tid == 9
 
-    async def persist(_maker, _page, *, session):
+    async def persist(_maker, _page, *, session, run_id=None):
         assert session is datastore.session
+        persisted_run_ids.append(run_id)
         events.append("research_page_persisted")
 
     monkeypatch.setattr("src.research.persistence.persist_research_page", persist)
@@ -358,6 +360,7 @@ async def test_managed_posts_page_uses_stored_first_pid_inside_page_transaction(
     )
 
     assert committed is True
+    assert persisted_run_ids == ["synthetic-run"]
     assert events.index("parent_locked") < events.index("stored_first_pid_lookup")
     assert ("ensure_child", "post_comments:9:501", "first_post") in events
     assert ("pending_child", 9, 501) in events

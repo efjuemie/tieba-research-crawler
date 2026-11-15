@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import hashlib
 import ipaddress
+import json
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from itertools import starmap
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from aiotieba.enums import ThreadType
 from sqlalchemy import and_, case, delete, select, update
@@ -23,6 +27,7 @@ from .models import (
     MediaAsset,
     ResearchComment,
     ResearchContentObservation,
+    ResearchFieldObservation,
     ResearchPost,
     ResearchThread,
     ResearchUser,
@@ -42,6 +47,29 @@ _RESEARCH_USER_LAST_KNOWN_FIELDS = (
     "tieba_uid",
     "global_growth_level",
 )
+_CONTENT_LAST_KNOWN_FIELDS = frozenset(
+    {
+        "fid",
+        "tid",
+        "parent_post_pid",
+        "author_user_id",
+        "author_user_name",
+        "author_nickname",
+        "author_portrait",
+        "author_tieba_uid",
+    }
+)
+_COMMENT_PREVIEW_FIELDS = frozenset(
+    {
+        "author_user_name",
+        "author_nickname",
+        "author_portrait",
+        "forum_level",
+        "global_growth_level",
+        "is_bawu",
+        "ip_location_text",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -53,6 +81,8 @@ class ResearchRecords:
     user_forum_snapshots: list[UserForumSnapshot] = field(default_factory=list)
     media_assets: list[MediaAsset] = field(default_factory=list)
     content_observations: list[ResearchContentObservation] = field(default_factory=list)
+    api_preview_comment_identities: list[tuple[int, int, int, int, int]] = field(default_factory=list)
+    api_field_observations: list[ResearchFieldObservation] = field(default_factory=list)
 
 
 async def persist_research_page(
@@ -60,6 +90,7 @@ async def persist_research_page(
     page: ResearchPage,
     *,
     session: AsyncSession | None = None,
+    run_id: str | None = None,
 ) -> dict[str, int]:
     """Upsert one already-fetched response without advancing any checkpoint.
 
@@ -69,6 +100,9 @@ async def persist_research_page(
     nor closes it.
     """
     records = build_research_records(page)
+    for observation in records.api_field_observations:
+        observation.run_id = run_id
+        observation.observation_key = _api_field_observation_key(observation)
     if session is not None:
         return await _persist_research_records(session, records)
     if async_sessionmaker_ is None:
@@ -83,12 +117,31 @@ async def _persist_research_records(session: Any, records: ResearchRecords) -> d
     persisted_media_count = 0
     persisted_post_count = 0
     persisted_comment_count = 0
+    await _validate_api_preview_identity_rows(session, records.api_preview_comment_identities)
     if records.comments:
         await _fill_parent_post_authors(session, records.comments)
     accepted_content = await _upsert_content_observations(
         session,
         _dedupe(records.content_observations, ("owner_type", "owner_id")),
     )
+    thread_rows = _dedupe(records.threads, ("tid",))
+    if any(row.source_api == "aiotieba.get_posts" for row in thread_rows):
+        thread_rows = [
+            row
+            for row in thread_rows
+            if row.source_api != "aiotieba.get_posts" or ("thread_first_post", row.tid) in accepted_content
+        ]
+    post_rows = [row for row in _dedupe(records.posts, ("pid",)) if ("post", row.pid) in accepted_content]
+    comment_rows = [
+        row for row in _dedupe(records.comments, ("cid",)) if ("comment", row.cid) in accepted_content
+    ]
+
+    # Validate all existing content identities under their row locks before any
+    # canonical row (including ResearchUser) is changed for this page.
+    await _validate_content_identity_rows(session, ResearchThread, thread_rows)
+    await _validate_content_identity_rows(session, ResearchPost, post_rows)
+    await _validate_content_identity_rows(session, ResearchComment, comment_rows)
+
     accepted_media_owners = set(starmap(_content_owner_to_media_owner, accepted_content))
     for owner_type, owner_id in sorted(accepted_media_owners):
         await session.execute(
@@ -106,15 +159,14 @@ async def _persist_research_records(session: Any, records: ResearchRecords) -> d
     )
     await _upsert_research_threads(
         session,
-        _dedupe(records.threads, ("tid",)),
+        thread_rows,
         accepted_content,
     )
-    post_rows = [row for row in _dedupe(records.posts, ("pid",)) if ("post", row.pid) in accepted_content]
-    comment_rows = [
-        row for row in _dedupe(records.comments, ("cid",)) if ("comment", row.cid) in accepted_content
-    ]
-    await _upsert_rows(session, ResearchPost, post_rows)
-    await _upsert_rows(session, ResearchComment, comment_rows)
+    await _upsert_content_rows(session, ResearchPost, post_rows)
+    await _upsert_content_rows(session, ResearchComment, comment_rows)
+    await _persist_api_field_observations(session, records.api_field_observations)
+    api_comment_ids = {row.target_id for row in records.api_field_observations}
+    await _apply_latest_api_comment_observations(session, api_comment_ids | {row.cid for row in comment_rows})
     persisted_post_count = len(post_rows)
     persisted_comment_count = len(comment_rows)
     media_rows = _dedupe(
@@ -134,6 +186,223 @@ async def _persist_research_records(session: Any, records: ResearchRecords) -> d
         ),
         "media_assets": persisted_media_count,
     }
+
+
+def _content_identity_fields(model: type) -> tuple[str, ...]:
+    if model is ResearchThread:
+        return ("fid", "first_pid", "author_user_id")
+    if model is ResearchPost:
+        return ("tid", "fid", "author_user_id")
+    if model is ResearchComment:
+        return ("tid", "parent_post_pid", "fid", "author_user_id")
+    raise ValueError(f"Unsupported content identity model: {model.__name__}.")
+
+
+def _identity_value_is_known(value: Any) -> bool:
+    return value is not None and not (isinstance(value, int) and not isinstance(value, bool) and value == 0)
+
+
+def _assert_content_identity_stable(model: type, current: Any, incoming: Any) -> None:
+    for field_name in _content_identity_fields(model):
+        previous_value = getattr(current, field_name)
+        incoming_value = getattr(incoming, field_name)
+        if (
+            _identity_value_is_known(previous_value)
+            and _identity_value_is_known(incoming_value)
+            and previous_value != incoming_value
+        ):
+            raise ValueError(
+                f"{model.__name__}.{field_name} identity changed for an existing primary key."
+            )
+
+
+async def _validate_content_identity_rows(session: Any, model: type, rows: list[Any]) -> None:
+    if not rows:
+        return
+    primary_key = tuple(column.name for column in model.__table__.primary_key.columns)
+    if len(primary_key) != 1:
+        raise RuntimeError("Research content rows must have a single identity key.")
+    pk_name = primary_key[0]
+    for incoming in sorted(rows, key=lambda row: getattr(row, pk_name)):
+        current = await session.scalar(
+            select(model)
+            .where(model.__table__.c[pk_name] == getattr(incoming, pk_name))
+            .with_for_update()
+        )
+        if current is None or _utc_datetime(incoming.observed_at) < _utc_datetime(current.observed_at):
+            continue
+        _assert_content_identity_stable(model, current, incoming)
+
+
+def _api_field_observation_key(observation: ResearchFieldObservation) -> str:
+    stable = {
+        "run_id": observation.run_id,
+        "target_type": observation.target_type,
+        "target_id": observation.target_id,
+        "tid": observation.tid,
+        "cid": observation.cid,
+        "parent_post_pid": observation.parent_post_pid,
+        "author_user_id": observation.author_user_id,
+        "fid": observation.fid,
+        "field_name": observation.field_name,
+        "raw_value": observation.raw_value_json,
+        "normalized_value": observation.normalized_value_json,
+        "source_path": observation.source_path,
+        "observed_at": _utc_datetime(observation.observed_at).isoformat(),
+    }
+    encoded = json.dumps(stable, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+async def _validate_api_preview_identity_rows(
+    session: Any,
+    identities: list[tuple[int, int, int, int, int]],
+) -> None:
+    targets = {
+        cid: (tid, parent_post_pid, fid, author_user_id)
+        for cid, tid, parent_post_pid, fid, author_user_id in identities
+    }
+    for cid, observed_identity in sorted(targets.items()):
+        current = await session.scalar(
+            select(ResearchComment).where(ResearchComment.cid == cid).with_for_update()
+        )
+        if current is None:
+            continue
+        identity = (current.tid, current.parent_post_pid, current.fid, current.author_user_id)
+        if identity != observed_identity:
+            raise ValueError("get_posts preview identity conflicts with the existing comment CID.")
+
+
+async def _persist_api_field_observations(session: Any, observations: list[ResearchFieldObservation]) -> None:
+    if not observations:
+        return
+    insert_factory = _insert_factory(session.get_bind().dialect.name)
+    for observation in observations:
+        statement = insert_factory(ResearchFieldObservation).values(**_row_values(observation))
+        await session.execute(
+            statement.on_conflict_do_nothing(index_elements=[ResearchFieldObservation.observation_key])
+        )
+
+
+async def _apply_latest_api_comment_observations(session: Any, comment_ids: set[int]) -> None:
+    if not comment_ids:
+        return
+    rows = (
+        await session.scalars(
+            select(ResearchFieldObservation)
+            .where(
+                ResearchFieldObservation.target_type == "comment",
+                ResearchFieldObservation.target_id.in_(sorted(comment_ids)),
+                ResearchFieldObservation.source_kind == "api_raw",
+                ResearchFieldObservation.validation_status == "verified",
+            )
+            .order_by(ResearchFieldObservation.observed_at.desc(), ResearchFieldObservation.observation_key.desc())
+        )
+    ).all()
+    latest: dict[tuple[int, str], ResearchFieldObservation] = {}
+    for observation in rows:
+        if not observation.source_path.startswith("api.comments_preview."):
+            continue
+        latest.setdefault((observation.target_id, observation.field_name), observation)
+
+    for cid in sorted({target_id for target_id, _ in latest}):
+        current = await session.scalar(select(ResearchComment).where(ResearchComment.cid == cid).with_for_update())
+        if current is None:
+            continue
+        sources = deepcopy(current.field_sources_json or {})
+        missing = dict(current.missing_reasons_json or {})
+        changed = False
+        for (target_id, field_name), observation in sorted(latest.items()):
+            if target_id != cid or field_name not in _COMMENT_PREVIEW_FIELDS:
+                continue
+            if (
+                current.tid,
+                current.parent_post_pid,
+                current.fid,
+                current.author_user_id,
+            ) != (
+                observation.tid,
+                observation.parent_post_pid,
+                observation.fid,
+                observation.author_user_id,
+            ):
+                continue
+            value = observation.normalized_value_json
+            if not _comment_preview_value_is_known(field_name, value):
+                continue
+            source = sources.get(field_name)
+            source = dict(source) if isinstance(source, dict) else {}
+            current_value = getattr(current, field_name)
+            web_value = source.get("verified_web")
+            if isinstance(web_value, dict):
+                if current_value != value:
+                    _append_api_field_conflict(source, observation, value)
+                    sources[field_name] = source
+                    changed = True
+                continue
+            if not _comment_preview_value_is_unknown(field_name, current_value, missing):
+                if current_value != value:
+                    _append_api_field_conflict(source, observation, value)
+                else:
+                    source["verified_content_api"] = _api_field_source(observation, value)
+                sources[field_name] = source
+                changed = True
+                missing.pop(field_name, None)
+                continue
+
+            setattr(current, field_name, value)
+            source["verified_content_api"] = _api_field_source(observation, value)
+            sources[field_name] = source
+            missing.pop(field_name, None)
+            if field_name == "ip_location_text":
+                current.ip_location_source = observation.source_path
+                current.ip_location_observed_at = observation.observed_at
+            changed = True
+        if changed:
+            current.field_sources_json = sources or None
+            current.missing_reasons_json = missing
+
+
+def _api_field_source(observation: ResearchFieldObservation, value: Any) -> dict[str, Any]:
+    return {
+        "source_kind": "api_raw",
+        "source_path": observation.source_path,
+        "observed_at": _utc_datetime(observation.observed_at).isoformat(),
+        "temporal_scope": observation.temporal_scope,
+        "value": _jsonable(value),
+        "applied_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def _append_api_field_conflict(source: dict[str, Any], observation: ResearchFieldObservation, value: Any) -> None:
+    conflicts = list(source.get("api_conflicts") or [])
+    conflict = {
+        "source_kind": "api_raw",
+        "source_path": observation.source_path,
+        "observed_at": _utc_datetime(observation.observed_at).isoformat(),
+        "value": _jsonable(value),
+    }
+    if conflict not in conflicts:
+        conflicts.append(conflict)
+    source["api_conflicts"] = conflicts
+
+
+def _comment_preview_value_is_known(field_name: str, value: Any) -> bool:
+    if field_name in {"author_user_name", "author_nickname", "author_portrait", "ip_location_text"}:
+        return isinstance(value, str) and bool(value.strip())
+    if field_name in {"forum_level", "global_growth_level"}:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    return field_name == "is_bawu" and value is True
+
+
+def _comment_preview_value_is_unknown(field_name: str, value: Any, missing: Any) -> bool:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return True
+    if field_name in {"forum_level", "global_growth_level"}:
+        return isinstance(value, int) and not isinstance(value, bool) and value <= 0
+    if field_name == "is_bawu":
+        return value is False
+    return False
 
 
 def build_research_records(page: ResearchPage) -> ResearchRecords:
@@ -203,7 +472,7 @@ def _records_from_threads_page(page: ResearchPage) -> ResearchRecords:
             author_tieba_uid=_safe_tieba_uid(getattr(user, "tieba_uid", None), "author_tieba_uid", missing),
             forum_level=_protobuf_int_field(getattr(user, "level", None), "forum_level", missing),
             global_growth_level=_protobuf_int_field(getattr(user, "glevel", None), "global_growth_level", missing),
-            is_bawu=_optional_bool(getattr(user, "is_bawu", None)),
+            is_bawu=_content_is_bawu(getattr(user, "is_bawu", None), missing),
             author_icons=_jsonable(getattr(user, "icons", None)),
             role_type=None,
             role_name=None,
@@ -348,7 +617,7 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
                 global_growth_level=_protobuf_int_field(
                     getattr(raw_user, "glevel", None), "global_growth_level", missing
                 ),
-                is_bawu=_optional_bool(getattr(raw_user, "is_bawu", None)),
+                is_bawu=_content_is_bawu(getattr(raw_user, "is_bawu", None), missing),
                 author_icons=_jsonable(getattr(raw_user, "icons", None)),
                 forum_level_name=None,
                 role_type=None,
@@ -399,6 +668,11 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
         )
 
     thread_author_id = _author_user_id(raw_thread, getattr(raw_thread, "user", None))
+    seen_preview_comments: dict[int, tuple[tuple[int, int, int, int], dict[str, Any]]] = {}
+    if thread_tid is not None:
+        for post in page_posts:
+            _append_comment_preview_observations(records, page, raw_thread, post, seen_preview_comments)
+
     for post in page_posts:
         pid = _positive_id(getattr(post, "pid", None))
         if pid is None:
@@ -436,7 +710,7 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
                 thread_author_user_id=thread_author_id,
                 forum_level=_protobuf_int_field(getattr(user, "level", None), "forum_level", missing),
                 global_growth_level=_protobuf_int_field(getattr(user, "glevel", None), "global_growth_level", missing),
-                is_bawu=_optional_bool(getattr(user, "is_bawu", None)),
+                is_bawu=_content_is_bawu(getattr(user, "is_bawu", None), missing),
                 author_icons=_jsonable(getattr(user, "icons", None)),
                 forum_level_name=None,
                 role_type=None,
@@ -472,6 +746,137 @@ def _records_from_posts_page(page: ResearchPage) -> ResearchRecords:
             missing["contents_raw"] = "not_returned_by_source"
         records.media_assets.extend(_media_rows("post", pid, tid, fragments, page))
     return records
+
+
+def _append_comment_preview_observations(
+    records: ResearchRecords,
+    page: ResearchPage,
+    thread: Any,
+    post: Any,
+    seen: dict[int, tuple[tuple[int, int, int, int], dict[str, Any]]],
+) -> None:
+    comments = getattr(post, "comments", ()) or ()
+    if not comments:
+        return
+
+    tid = _positive_id(getattr(thread, "tid", None))
+    thread_fid = _positive_id(getattr(thread, "fid", None))
+    parent_pid = _positive_id(getattr(post, "pid", None))
+    post_tid = _positive_id(getattr(post, "tid", None))
+    post_fid = _positive_id(getattr(post, "fid", None))
+    if tid is None or thread_fid is None or parent_pid is None:
+        raise ValueError("get_posts comment preview is missing thread, forum, or parent identity.")
+    if (post_tid is not None and post_tid != tid) or (post_fid is not None and post_fid != thread_fid):
+        raise ValueError("get_posts comment preview parent scope does not match its thread.")
+
+    for comment in comments:
+        cid = _positive_id(getattr(comment, "pid", None))
+        comment_tid = _positive_id(getattr(comment, "tid", None))
+        comment_parent_pid = _positive_id(getattr(comment, "ppid", None))
+        comment_fid = _positive_id(getattr(comment, "fid", None))
+        user = getattr(comment, "user", None)
+        record_author_id = _positive_id(getattr(comment, "author_id", None))
+        user_author_id = _positive_id(getattr(user, "user_id", None))
+        if cid is None or (record_author_id is None or record_author_id != user_author_id):
+            raise ValueError("get_posts comment preview is missing or disagrees on author identity.")
+        identity = (tid, parent_pid, thread_fid, record_author_id)
+        if comment_tid != tid or comment_parent_pid != parent_pid or comment_fid != thread_fid:
+            raise ValueError("get_posts comment preview identity does not match its thread and parent post.")
+
+        raw_values = {
+            "author_user_name": getattr(user, "user_name", None),
+            "author_nickname": _nickname(user),
+            "author_portrait": getattr(user, "portrait", None),
+            "forum_level": getattr(user, "level", None),
+            "global_growth_level": getattr(user, "glevel", None),
+            "is_bawu": getattr(user, "is_bawu", None),
+            "ip_location_text": getattr(user, "ip", None),
+        }
+        values = {
+            "author_user_name": _identity_text(raw_values["author_user_name"]),
+            "author_nickname": _identity_text(raw_values["author_nickname"]),
+            "author_portrait": _identity_text(raw_values["author_portrait"]),
+            "forum_level": _positive_metadata_int(raw_values["forum_level"]),
+            "global_growth_level": _positive_metadata_int(raw_values["global_growth_level"]),
+            "is_bawu": raw_values["is_bawu"] is True,
+            "ip_location_text": _ip_location_text(user),
+        }
+        values = {field_name: value for field_name, value in values.items() if value is not None and value is not False}
+
+        previous = seen.get(cid)
+        if previous is not None:
+            if previous[0] != identity:
+                raise ValueError("Repeated get_posts preview CID has conflicting identity tuples.")
+            if previous[1] != values:
+                raise ValueError("Repeated get_posts preview CID has conflicting metadata values.")
+            continue
+        seen[cid] = (identity, values)
+        records.api_preview_comment_identities.append((cid, tid, parent_pid, thread_fid, record_author_id))
+
+        identity_evidence = {
+            "identity_verified": True,
+            "proof": {
+                "thread_tid": tid,
+                "thread_fid": thread_fid,
+                "parent_post_pid": parent_pid,
+                "comment_cid": cid,
+                "comment_tid": comment_tid,
+                "comment_ppid": comment_parent_pid,
+                "comment_fid": comment_fid,
+                "comment_author_id": record_author_id,
+                "user_user_id": user_author_id,
+            },
+        }
+        for field_name, value in values.items():
+            source_path = f"api.comments_preview.author.{field_name}"
+            if field_name == "ip_location_text":
+                source_path = "api.comments_preview.author.ip"
+            raw_value = _jsonable(raw_values[field_name])
+            evidence_key = {
+                "target_type": "comment",
+                "target_id": cid,
+                "tid": tid,
+                "parent_post_pid": parent_pid,
+                "author_user_id": record_author_id,
+                "fid": thread_fid,
+                "field_name": field_name,
+                "raw_value": raw_value,
+                "normalized_value": value,
+                "source_path": source_path,
+                "observed_at": page.observed_at.isoformat(),
+            }
+            encoded = json.dumps(evidence_key, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            records.api_field_observations.append(
+                ResearchFieldObservation(
+                    observation_id=str(uuid4()),
+                    observation_key=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                    task_key=None,
+                    run_id=None,
+                    target_type="comment",
+                    target_id=cid,
+                    tid=tid,
+                    pid=None,
+                    cid=cid,
+                    parent_post_pid=parent_pid,
+                    author_user_id=record_author_id,
+                    fid=thread_fid,
+                    field_name=field_name,
+                    raw_value_json=raw_value,
+                    normalized_value_json=value,
+                    source_url=None,
+                    source_path=source_path,
+                    source_kind="api_raw",
+                    observed_at=page.observed_at,
+                    temporal_scope="api_observation_time_not_publication_time",
+                    parser_version="aiotieba-parsed-response-v1",
+                    identity_evidence_json=identity_evidence,
+                    validation_status="verified",
+                    applied_status="observed_only",
+                    missing_reason=None,
+                    created_at=page.observed_at,
+                    applied_at=None,
+                )
+            )
 
 
 def _records_from_comments_page(page: ResearchPage) -> ResearchRecords:
@@ -521,7 +926,7 @@ def _records_from_comments_page(page: ResearchPage) -> ResearchRecords:
                 author_tieba_uid=_safe_tieba_uid(getattr(user, "tieba_uid", None), "author_tieba_uid", missing),
                 forum_level=_protobuf_int_field(getattr(user, "level", None), "forum_level", missing),
                 global_growth_level=_protobuf_int_field(getattr(user, "glevel", None), "global_growth_level", missing),
-                is_bawu=_optional_bool(getattr(user, "is_bawu", None)),
+                is_bawu=_content_is_bawu(getattr(user, "is_bawu", None), missing),
                 author_icons=_jsonable(getattr(user, "icons", None)),
                 forum_level_name=None,
                 role_type=None,
@@ -817,6 +1222,8 @@ async def _upsert_research_threads(
         is_current = _utc_datetime(incoming.observed_at) >= _utc_datetime(current.observed_at)
         if incoming.source_api == "aiotieba.get_posts" and not content_accepted:
             is_current = False
+        if is_current:
+            _assert_content_identity_stable(ResearchThread, current, incoming)
         marker_exists = await session.scalar(
             select(ResearchContentObservation.owner_id)
             .where(
@@ -827,6 +1234,8 @@ async def _upsert_research_threads(
         )
         has_content_marker = marker_exists is not None
         incoming_values = _row_values(incoming)
+        field_sources = deepcopy(current.field_sources_json or {})
+        protected_fields: set[str] = set()
 
         if incoming.source_api == "aiotieba.get_posts" and content_accepted:
             if incoming.first_pid is not None:
@@ -837,6 +1246,24 @@ async def _upsert_research_threads(
                 ):
                     continue
                 if _thread_source_supports(incoming.source_api, name, incoming.missing_reasons_json):
+                    if _protect_verified_web_field(
+                        current,
+                        name,
+                        incoming_values[name],
+                        incoming,
+                        field_sources,
+                    ):
+                        protected_fields.add(name)
+                        continue
+                    if _protect_last_known_content_value(
+                        current,
+                        name,
+                        incoming_values[name],
+                        incoming,
+                        field_sources,
+                    ):
+                        protected_fields.add(name)
+                        continue
                     setattr(current, name, incoming_values[name])
         elif incoming.source_api == "aiotieba.get_threads" and is_current and not has_content_marker:
             if incoming.first_pid is not None:
@@ -855,6 +1282,24 @@ async def _upsert_research_threads(
             if not _thread_source_supports(incoming.source_api, name, incoming.missing_reasons_json):
                 continue
             if is_current:
+                if _protect_verified_web_field(
+                    current,
+                    name,
+                    incoming_values[name],
+                    incoming,
+                    field_sources,
+                ):
+                    protected_fields.add(name)
+                    continue
+                if _protect_last_known_content_value(
+                    current,
+                    name,
+                    incoming_values[name],
+                    incoming,
+                    field_sources,
+                ):
+                    protected_fields.add(name)
+                    continue
                 setattr(current, name, incoming_values[name])
 
         if incoming.source_api == "aiotieba.get_threads":
@@ -893,6 +1338,259 @@ async def _upsert_research_threads(
         elif is_current:
             current.source_payload_json = dict(incoming.source_payload_json or {})
             current.missing_reasons_json = dict(incoming.missing_reasons_json or {})
+
+        current.field_sources_json = field_sources or None
+        for field_name in protected_fields:
+            if _api_value_is_unknown(
+                field_name,
+                incoming_values.get(field_name),
+                incoming.missing_reasons_json,
+            ):
+                current.missing_reasons_json.pop(field_name, None)
+
+
+def _canonical_source_field(field_name: str) -> str:
+    if field_name in {"ip_location_source", "ip_location_observed_at"}:
+        return "ip_location_text"
+    return field_name
+
+
+def _api_value_is_unknown(field_name: str, value: Any, missing_reasons: Any) -> bool:
+    reason = (missing_reasons or {}).get(field_name)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return True
+    if reason in {"zero_presence_unverified", "zero_presence_unverified_in_parsed_object"}:
+        if isinstance(value, bool):
+            return field_name == "is_bawu" and value is False
+        return isinstance(value, int) and value == 0
+    return False
+
+
+def _protect_verified_web_field(
+    current: Any,
+    field_name: str,
+    incoming_value: Any,
+    incoming: Any,
+    field_sources: dict[str, Any],
+) -> bool:
+    """Keep a verified web value against API unknowns and retain explicit conflicts."""
+    source_field = _canonical_source_field(field_name)
+    source = field_sources.get(source_field)
+    verified_web = source.get("verified_web") if isinstance(source, dict) else None
+    if not isinstance(verified_web, dict):
+        return False
+    if field_name != source_field:
+        return True
+
+    existing_value = getattr(current, field_name)
+    if _api_value_is_unknown(field_name, incoming_value, incoming.missing_reasons_json):
+        return True
+    if existing_value == incoming_value:
+        return True
+
+    source = dict(source)
+    conflicts = list(source.get("api_conflicts") or [])
+    conflict = {
+        "source_api": incoming.source_api,
+        "observed_at": _utc_datetime(incoming.observed_at).isoformat(),
+        "value": _jsonable(incoming_value),
+    }
+    if conflict not in conflicts:
+        conflicts.append(conflict)
+    source["api_conflicts"] = conflicts
+    field_sources[source_field] = source
+    return True
+
+
+def _protect_last_known_content_value(
+    current: Any,
+    field_name: str,
+    incoming_value: Any,
+    incoming: Any,
+    field_sources: dict[str, Any],
+) -> bool:
+    """Keep last-known API content identity values when a later response omits them."""
+    if field_name not in _CONTENT_LAST_KNOWN_FIELDS:
+        return False
+    existing_value = getattr(current, field_name)
+    existing_is_known = _identity_value_is_known(existing_value) and not (
+        isinstance(existing_value, str) and not existing_value.strip()
+    )
+    if not existing_is_known:
+        return False
+    if not _api_value_is_unknown(field_name, incoming_value, incoming.missing_reasons_json):
+        source = field_sources.get(field_name)
+        if isinstance(source, dict) and "last_known_api" in source:
+            source = dict(source)
+            source.pop("last_known_api", None)
+            if source:
+                field_sources[field_name] = source
+            else:
+                field_sources.pop(field_name, None)
+        return False
+    previous = field_sources.get(field_name)
+    previous_last_known = previous.get("last_known_api") if isinstance(previous, dict) else None
+    if (
+        isinstance(previous_last_known, dict)
+        and previous_last_known.get("retained_value") == existing_value
+    ):
+        retained_source_api = previous_last_known.get("retained_source_api")
+        retained_observed_at = previous_last_known.get("retained_observed_at")
+    else:
+        retained_source_api = current.source_api
+        retained_observed_at = _utc_datetime(current.observed_at).isoformat()
+    field_sources[field_name] = {
+        **(previous if isinstance(previous, dict) else {}),
+        "last_known_api": {
+            "retained_source_api": retained_source_api,
+            "retained_observed_at": retained_observed_at,
+            "retained_value": existing_value,
+            "missing_source_api": incoming.source_api,
+            "missing_observed_at": _utc_datetime(incoming.observed_at).isoformat(),
+            "missing_reason": (incoming.missing_reasons_json or {}).get(field_name),
+        },
+    }
+    return True
+
+
+async def _upsert_content_rows(session: Any, model: type, rows: list[Any]) -> None:
+    """Lock one content row at a time so web field provenance survives API refreshes."""
+    if not rows:
+        return
+    insert_factory = _insert_factory(session.get_bind().dialect.name)
+    primary_key = tuple(column.name for column in model.__table__.primary_key.columns)
+    if len(primary_key) != 1:
+        raise RuntimeError("Research content rows must have a single identity key.")
+    pk_name = primary_key[0]
+    for incoming in sorted(rows, key=lambda row: getattr(row, pk_name)):
+        insert = insert_factory(model).values(**_row_values(incoming)).on_conflict_do_nothing(
+            index_elements=[model.__table__.c[pk_name]]
+        )
+        await session.execute(insert)
+        current = await session.scalar(
+            select(model)
+            .where(model.__table__.c[pk_name] == getattr(incoming, pk_name))
+            .with_for_update()
+        )
+        if current is None:
+            raise RuntimeError(f"{model.__name__} disappeared during a locked upsert.")
+        if _utc_datetime(incoming.observed_at) < _utc_datetime(current.observed_at):
+            continue
+        _assert_content_identity_stable(model, current, incoming)
+
+        field_sources = deepcopy(current.field_sources_json or {})
+        incoming_values = _row_values(incoming)
+        updates: dict[str, Any] = {}
+        protected_fields: set[str] = set()
+        for column in model.__table__.columns:
+            name = column.name
+            if name in primary_key or name in {"field_sources_json", "missing_reasons_json"}:
+                continue
+            value = incoming_values[name]
+            if _protect_verified_web_field(current, name, value, incoming, field_sources):
+                protected_fields.add(name)
+                continue
+            if model is ResearchComment and _protect_verified_content_api_field(
+                current, name, value, incoming, field_sources
+            ):
+                protected_fields.add(name)
+                continue
+            if model is ResearchComment and _protect_last_known_comment_metadata(
+                current, name, value, incoming, field_sources
+            ):
+                protected_fields.add(name)
+                continue
+            if _protect_last_known_content_value(current, name, value, incoming, field_sources):
+                protected_fields.add(name)
+                continue
+            updates[name] = value
+
+        incoming_missing = dict(incoming.missing_reasons_json or {})
+        for field_name in protected_fields:
+            if _api_value_is_unknown(field_name, incoming_values.get(field_name), incoming_missing):
+                incoming_missing.pop(field_name, None)
+        updates["missing_reasons_json"] = incoming_missing
+        updates["field_sources_json"] = field_sources or None
+        await session.execute(
+            update(model)
+            .where(model.__table__.c[pk_name] == getattr(incoming, pk_name))
+            .values(**updates)
+        )
+
+
+def _protect_verified_content_api_field(
+    current: ResearchComment,
+    field_name: str,
+    incoming_value: Any,
+    incoming: ResearchComment,
+    field_sources: dict[str, Any],
+) -> bool:
+    source_field = _canonical_source_field(field_name)
+    if source_field not in _COMMENT_PREVIEW_FIELDS:
+        return False
+    source = field_sources.get(source_field)
+    verified = source.get("verified_content_api") if isinstance(source, dict) else None
+    if not isinstance(verified, dict):
+        return False
+    if field_name != source_field:
+        return True
+    current_value = getattr(current, field_name)
+    if _comment_preview_value_is_unknown(field_name, incoming_value, incoming.missing_reasons_json):
+        return True
+    if current_value == incoming_value:
+        return True
+    source = dict(source)
+    conflicts = list(source.get("api_conflicts") or [])
+    conflict = {
+        "source_api": incoming.source_api,
+        "observed_at": _utc_datetime(incoming.observed_at).isoformat(),
+        "value": _jsonable(incoming_value),
+    }
+    if conflict not in conflicts:
+        conflicts.append(conflict)
+    source["api_conflicts"] = conflicts
+    field_sources[source_field] = source
+    return True
+
+
+def _protect_last_known_comment_metadata(
+    current: ResearchComment,
+    field_name: str,
+    incoming_value: Any,
+    incoming: ResearchComment,
+    field_sources: dict[str, Any],
+) -> bool:
+    source_field = _canonical_source_field(field_name)
+    if source_field not in _COMMENT_PREVIEW_FIELDS:
+        return False
+    current_value = getattr(current, source_field)
+    if not _comment_preview_value_is_known(source_field, current_value):
+        return False
+    if not _comment_preview_value_is_unknown(
+        source_field,
+        getattr(incoming, source_field),
+        incoming.missing_reasons_json,
+    ):
+        return False
+    previous = field_sources.get(source_field)
+    previous = dict(previous) if isinstance(previous, dict) else {}
+    previous_last_known = previous.get("last_known_api")
+    if isinstance(previous_last_known, dict) and previous_last_known.get("retained_value") == current_value:
+        retained_source_api = previous_last_known.get("retained_source_api")
+        retained_observed_at = previous_last_known.get("retained_observed_at")
+    else:
+        retained_source_api = current.source_api
+        retained_observed_at = _utc_datetime(current.observed_at).isoformat()
+    previous["last_known_api"] = {
+        "retained_source_api": retained_source_api,
+        "retained_observed_at": retained_observed_at,
+        "retained_value": current_value,
+        "missing_source_api": incoming.source_api,
+        "missing_observed_at": _utc_datetime(incoming.observed_at).isoformat(),
+        "missing_reason": (incoming.missing_reasons_json or {}).get(source_field),
+    }
+    field_sources[source_field] = previous
+    return True
 
 
 def _thread_source_supports(source_api: str, field_name: str, missing_reasons: Any) -> bool:
@@ -1740,6 +2438,13 @@ def _positive_id(value: Any) -> int | None:
     return integer if integer is not None and integer > 0 else None
 
 
+def _positive_metadata_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    integer = _int_value(value)
+    return integer if integer is not None and integer > 0 else None
+
+
 def _safe_tieba_uid(value: Any, field_name: str, missing: dict[str, str]) -> int | None:
     integer = _int_value(value)
     if integer is None or integer <= 0:
@@ -1770,6 +2475,14 @@ def _identity_text(value: Any) -> str | None:
 
 def _optional_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+def _content_is_bawu(value: Any, missing: dict[str, str]) -> bool | None:
+    """Treat aiotieba's protobuf default false as unverified unless it is true."""
+    if value is False:
+        missing["is_bawu"] = "zero_presence_unverified_in_parsed_object"
+        return None
+    return _optional_bool(value)
 
 
 def _enum_int(value: Any) -> int | None:

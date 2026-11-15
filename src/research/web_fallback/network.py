@@ -18,10 +18,12 @@ from .identity import (
     make_identity_evidence,
     parse_json_unique,
     parse_positive_id,
+    validate_page_pc_request_context,
     validate_request_context,
 )
 
 NESTED_FLOOR_PATH = "/c/f/pb/nestedFloor"
+PAGE_PC_PATH = "/c/f/pb/page_pc"
 USER_CARD_PATH = "/c/u/pc/userCard"
 
 
@@ -32,6 +34,433 @@ class NetworkExtractionResult:
     identity_verified: bool
     candidates: tuple[ObservationCandidate, ...]
     field_outcomes: dict[str, dict[str, str]] = field(default_factory=dict)
+
+
+def extract_page_pc_thread_counts(
+    target: Target,
+    response_text: str,
+    request_context: ImmutableRequestContext,
+    *,
+    response_status: int = 200,
+) -> NetworkExtractionResult:
+    payload, failure = _page_pc_payload(
+        target, response_text, request_context, "thread", response_status
+    )
+    if failure is not None:
+        return failure
+    if payload is None:
+        return _page_pc_failed(target, "dom_changed", "response_root_not_object")
+
+    forum = payload.get("forum")
+    thread = payload.get("thread")
+    first_floor = payload.get("first_floor")
+    author = thread.get("author") if isinstance(thread, dict) else None
+    if not all(isinstance(value, dict) for value in (forum, thread, first_floor, author)):
+        return _page_pc_failed(target, "identity_unverified", "page_pc_identity_structure_missing")
+    try:
+        forum_id = parse_positive_id(forum["id"])
+        thread_id = parse_positive_id(thread["id"])
+        post_id = parse_positive_id(thread["post_id"])
+        first_floor_id = parse_positive_id(first_floor["id"])
+        first_floor_author_id = parse_positive_id(first_floor["author_id"])
+        thread_author_id = parse_positive_id(author["id"])
+    except (IdentityError, KeyError):
+        return _page_pc_failed(target, "identity_unverified", "page_pc_identity_id_invalid")
+    if forum_id != target.fid:
+        return _page_pc_failed(target, "identity_unverified", "response_fid_mismatch")
+    if thread_id != target.tid:
+        return _page_pc_failed(target, "identity_unverified", "response_tid_mismatch")
+    if post_id != first_floor_id:
+        return _page_pc_failed(target, "identity_unverified", "response_first_floor_id_mismatch")
+    if first_floor_author_id != thread_author_id or thread_author_id != target.author_user_id:
+        return _page_pc_failed(target, "identity_unverified", "response_author_id_mismatch")
+    first_floor_author = first_floor.get("author")
+    for obj, keys, expected in (
+        (forum, ("fid",), target.fid),
+        (thread, ("tid", "thread_id"), target.tid),
+        (thread, ("fid", "forum_id"), target.fid),
+        (thread, ("author_id",), target.author_user_id),
+        (first_floor, ("tid", "thread_id"), target.tid),
+        (first_floor, ("fid", "forum_id"), target.fid),
+        (first_floor, ("post_id",), post_id),
+        (first_floor_author, ("id",), target.author_user_id),
+    ):
+        if not isinstance(obj, dict):
+            continue
+        for key in keys:
+            if key not in obj:
+                continue
+            try:
+                if parse_positive_id(obj[key]) != expected:
+                    return _page_pc_failed(target, "identity_unverified", "response_identity_id_mismatch")
+            except IdentityError:
+                return _page_pc_failed(target, "identity_unverified", "page_pc_identity_id_invalid")
+
+    identity = make_identity_evidence(
+        target,
+        (
+            "page_tid",
+            "request_tid",
+            "response_forum_id",
+            "response_thread_id",
+            "thread_post_id_matches_first_floor_id",
+            "response_author_id",
+        ),
+        request_context,
+    )
+    candidates, outcomes = _page_pc_count_candidates(
+        target,
+        identity,
+        request_context,
+        (
+            (thread, "reply_num", "reply_count", "page_pc.thread.reply_num"),
+            (thread.get("agree"), "agree_num", "agree_count", "page_pc.thread.agree.agree_num"),
+            (thread.get("agree"), "disagree_num", "disagree_count", "page_pc.thread.agree.disagree_num"),
+            (thread, "collect_num", "collect_count", "page_pc.thread.collect_num"),
+            (thread, "share_num", "share_count", "page_pc.thread.share_num"),
+        ),
+    )
+    return NetworkExtractionResult("ok", None, True, tuple(candidates), outcomes)
+
+
+def extract_page_pc_comment(
+    target: Target,
+    response_text: str,
+    request_context: ImmutableRequestContext,
+    *,
+    response_status: int = 200,
+) -> NetworkExtractionResult:
+    payload, failure = _page_pc_payload(
+        target, response_text, request_context, "comment", response_status
+    )
+    if failure is not None:
+        return failure
+    if payload is None:
+        return _page_pc_failed(target, "dom_changed", "response_root_not_object")
+    if target.cid is None or target.parent_post_pid is None or target.author_user_id is None:
+        return _page_pc_failed(target, "identity_unverified", "comment_target_identity_missing")
+
+    forum = payload.get("forum")
+    thread = payload.get("thread")
+    post_list = payload.get("post_list")
+    if not isinstance(forum, dict) or not isinstance(thread, dict):
+        return _page_pc_failed(target, "identity_unverified", "page_pc_identity_structure_missing")
+    try:
+        forum_id = parse_positive_id(forum["id"])
+        thread_id = parse_positive_id(thread["id"])
+    except (IdentityError, KeyError):
+        return _page_pc_failed(target, "identity_unverified", "page_pc_identity_id_invalid")
+    if forum_id != target.fid:
+        return _page_pc_failed(target, "identity_unverified", "response_fid_mismatch")
+    if thread_id != target.tid:
+        return _page_pc_failed(target, "identity_unverified", "response_tid_mismatch")
+    for obj, keys, expected in (
+        (forum, ("fid",), target.fid),
+        (thread, ("tid", "thread_id"), target.tid),
+        (thread, ("fid", "forum_id"), target.fid),
+    ):
+        for key in keys:
+            if key not in obj:
+                continue
+            try:
+                if parse_positive_id(obj[key]) != expected:
+                    return _page_pc_failed(target, "identity_unverified", "response_identity_id_mismatch")
+            except IdentityError:
+                return _page_pc_failed(target, "identity_unverified", "page_pc_identity_id_invalid")
+    if not isinstance(post_list, list):
+        return _page_pc_failed(target, "dom_changed", "post_list_missing")
+
+    matching_posts = []
+    seen_post_ids = set()
+    for index, post in enumerate(post_list):
+        if not isinstance(post, dict) or "id" not in post:
+            return _page_pc_failed(target, "identity_unverified", "response_post_id_missing")
+        try:
+            post_id = parse_positive_id(post["id"])
+        except IdentityError:
+            return _page_pc_failed(target, "identity_unverified", "response_post_id_invalid")
+        if post_id in seen_post_ids:
+            return _page_pc_failed(target, "identity_unverified", "duplicate_response_post_id")
+        seen_post_ids.add(post_id)
+        for keys, expected, reason in (
+            (("pid", "post_id"), post_id, "response_post_id_mismatch"),
+            (("fid", "forum_id"), target.fid, "response_fid_mismatch"),
+            (("tid", "thread_id"), target.tid, "response_tid_mismatch"),
+        ):
+            for key in keys:
+                if key not in post:
+                    continue
+                try:
+                    if parse_positive_id(post[key]) != expected:
+                        return _page_pc_failed(target, "identity_unverified", reason)
+                except IdentityError:
+                    return _page_pc_failed(target, "identity_unverified", "page_pc_identity_id_invalid")
+        if post_id == target.parent_post_pid:
+            matching_posts.append((index, post))
+    if not matching_posts:
+        for post in post_list:
+            sublist = post.get("sub_post_list") if isinstance(post, dict) else None
+            comments = sublist.get("sub_post_list") if isinstance(sublist, dict) else None
+            if not isinstance(comments, list):
+                continue
+            for comment in comments:
+                if not isinstance(comment, dict) or "id" not in comment:
+                    continue
+                try:
+                    if parse_positive_id(comment["id"]) == target.cid:
+                        return _page_pc_failed(
+                            target,
+                            "identity_unverified",
+                            "response_cid_parent_mismatch",
+                        )
+                except IdentityError:
+                    continue
+        return _page_pc_failed(target, "not_tested", "parent_post_missing_from_response")
+    if len(matching_posts) != 1:
+        return _page_pc_failed(target, "identity_unverified", "parent_post_missing_from_response")
+
+    post_index, parent = matching_posts[0]
+    container = parent.get("sub_post_list")
+    if not isinstance(container, dict) or not isinstance(container.get("sub_post_list"), list):
+        return _page_pc_failed(target, "dom_changed", "sub_post_list_missing")
+    try:
+        if parse_positive_id(container["pid"]) != target.parent_post_pid:
+            return _page_pc_failed(target, "identity_unverified", "response_parent_pid_mismatch")
+    except (IdentityError, KeyError):
+        return _page_pc_failed(target, "identity_unverified", "response_parent_pid_invalid")
+
+    matching_comments = []
+    seen_comment_ids = set()
+    for outer_index, outer in enumerate(post_list):
+        outer_id = parse_positive_id(outer["id"])
+        sublist = outer.get("sub_post_list")
+        if not isinstance(sublist, dict):
+            continue
+        if "pid" in sublist:
+            try:
+                if parse_positive_id(sublist["pid"]) != outer_id:
+                    return _page_pc_failed(target, "identity_unverified", "response_parent_pid_mismatch")
+            except IdentityError:
+                return _page_pc_failed(target, "identity_unverified", "response_parent_pid_invalid")
+        if not isinstance(sublist.get("sub_post_list"), list):
+            continue
+        for index, comment in enumerate(sublist["sub_post_list"]):
+            if not isinstance(comment, dict) or "id" not in comment:
+                return _page_pc_failed(target, "identity_unverified", "response_cid_missing")
+            try:
+                cid = parse_positive_id(comment["id"])
+            except IdentityError:
+                return _page_pc_failed(target, "identity_unverified", "response_cid_invalid")
+            if cid in seen_comment_ids:
+                return _page_pc_failed(target, "identity_unverified", "duplicate_response_cid")
+            seen_comment_ids.add(cid)
+            if cid == target.cid:
+                if outer_index != post_index:
+                    return _page_pc_failed(target, "identity_unverified", "response_cid_parent_mismatch")
+                matching_comments.append((index, comment))
+    if not matching_comments:
+        return _page_pc_failed(target, "identity_unverified", "cid_missing_from_response")
+    if len(matching_comments) != 1:
+        return _page_pc_failed(target, "identity_unverified", "duplicate_target_cid")
+
+    comment_index, comment = matching_comments[0]
+    try:
+        author_id = parse_positive_id(comment["author_id"])
+    except (IdentityError, KeyError):
+        return _page_pc_failed(target, "identity_unverified", "response_author_id_invalid")
+    if author_id != target.author_user_id:
+        return _page_pc_failed(target, "identity_unverified", "response_author_id_mismatch")
+    comment_author = comment.get("author")
+    if isinstance(comment_author, dict) and "id" in comment_author:
+        try:
+            if parse_positive_id(comment_author["id"]) != author_id:
+                return _page_pc_failed(target, "identity_unverified", "response_author_id_disagreement")
+        except IdentityError:
+            return _page_pc_failed(target, "identity_unverified", "response_author_id_invalid")
+    for keys, expected in (
+        (("fid", "forum_id"), target.fid),
+        (("tid", "thread_id"), target.tid),
+        (
+            ("pid", "parent_id", "parent_post_id", "parent_post_pid", "post_id"),
+            target.parent_post_pid,
+        ),
+    ):
+        for key in keys:
+            if key not in comment:
+                continue
+            try:
+                if parse_positive_id(comment[key]) != expected:
+                    return _page_pc_failed(target, "identity_unverified", "response_comment_context_mismatch")
+            except IdentityError:
+                return _page_pc_failed(target, "identity_unverified", "response_comment_context_id_invalid")
+    users = payload.get("user_list")
+    if not isinstance(users, list):
+        return _page_pc_failed(target, "identity_unverified", "user_list_missing")
+    matching_users = []
+    seen_user_ids = set()
+    for index, user in enumerate(users):
+        if not isinstance(user, dict) or "id" not in user:
+            return _page_pc_failed(target, "identity_unverified", "response_user_id_missing")
+        try:
+            user_id = parse_positive_id(user["id"])
+        except IdentityError:
+            return _page_pc_failed(target, "identity_unverified", "response_user_id_invalid")
+        if user_id in seen_user_ids:
+            return _page_pc_failed(target, "identity_unverified", "duplicate_response_user_id")
+        seen_user_ids.add(user_id)
+        if user_id == author_id:
+            matching_users.append((index, user))
+    if len(matching_users) != 1:
+        return _page_pc_failed(target, "identity_unverified", "response_user_id_not_unique")
+
+    identity = make_identity_evidence(
+        target,
+        (
+            "page_tid",
+            "request_tid",
+            "response_forum_id",
+            "response_thread_id",
+            "response_parent_post_id",
+            "response_sub_post_list_pid",
+            "response_cid",
+            "response_author_id",
+            "unique_response_user_id",
+        ),
+        request_context,
+    )
+    user_index, user = matching_users[0]
+    outcomes = {
+        name: {"status": "not_tested", "reason": "not_observed_in_response"}
+        for name in target.requested_fields
+    }
+    candidates = []
+    ip_address = user.get("ip_address")
+    if (
+        "ip_location_text" in target.requested_fields
+        and isinstance(ip_address, str)
+        and ip_address.strip()
+        and not _is_literal_ip(ip_address.strip())
+    ):
+        outcomes.pop("ip_location_text", None)
+        candidates.append(
+            _page_pc_candidate(
+                target,
+                "ip_location_text",
+                ip_address,
+                ip_address,
+                f"page_pc.user_list[{user_index}].ip_address",
+                request_context,
+                identity,
+            )
+        )
+    counts, count_outcomes = _page_pc_count_candidates(
+        target,
+        identity,
+        request_context,
+        (
+            (
+                comment.get("agree"),
+                "agree_num",
+                "agree_count",
+                f"page_pc.post_list[{post_index}].sub_post_list.sub_post_list[{comment_index}]"
+                ".agree.agree_num",
+            ),
+            (
+                comment.get("agree"),
+                "disagree_num",
+                "disagree_count",
+                f"page_pc.post_list[{post_index}].sub_post_list.sub_post_list[{comment_index}]"
+                ".agree.disagree_num",
+            ),
+        ),
+    )
+    candidates.extend(counts)
+    outcomes.update(count_outcomes)
+    for candidate in candidates:
+        outcomes.pop(candidate.field_name, None)
+    return NetworkExtractionResult("ok", None, True, tuple(candidates), outcomes)
+
+
+def _page_pc_payload(target, response_text, request_context, target_type, response_status):
+    if response_status == 429:
+        return None, _page_pc_failed(target, "blocked", "http_429")
+    if response_status in {401, 403}:
+        return None, _page_pc_failed(target, "blocked", "http_auth_or_verification")
+    if response_status != 200:
+        return None, _page_pc_failed(target, "dom_changed", f"http_{response_status}")
+    if target.target_type != target_type:
+        return None, _page_pc_failed(target, "identity_unverified", "page_pc_target_type_mismatch")
+    context_check = validate_page_pc_request_context(target, request_context)
+    if not context_check.identity_verified:
+        return None, _page_pc_failed(
+            target, "identity_unverified", context_check.reason or "request_context_invalid"
+        )
+    try:
+        payload = parse_json_unique(response_text)
+    except DuplicateJSONKeyError:
+        return None, _page_pc_failed(target, "identity_unverified", "duplicate_json_key")
+    except (ValueError, TypeError):
+        return None, _page_pc_failed(target, "dom_changed", "response_json_parse_error")
+    if not isinstance(payload, dict):
+        return None, _page_pc_failed(target, "dom_changed", "response_root_not_object")
+    error_code = payload.get("error_code")
+    if isinstance(error_code, bool) or not isinstance(error_code, int):
+        reason = "response_error_code_missing" if "error_code" not in payload else "invalid_response_error_code"
+        return None, _page_pc_failed(target, "dom_changed", reason)
+    if error_code != 0:
+        return None, _page_pc_failed(target, "dom_changed", "response_error_code_nonzero")
+    return payload, None
+
+
+def _page_pc_failed(target, status, reason):
+    outcome_status = "identity_unverified" if status == "identity_unverified" else "not_tested"
+    outcomes = {
+        name: {"status": outcome_status, "reason": reason}
+        for name in target.requested_fields
+    }
+    return NetworkExtractionResult(status, reason, False, (), outcomes)
+
+
+def _page_pc_count_candidates(target, identity, request_context, sources):
+    outcomes = {
+        name: {"status": "not_tested", "reason": "not_observed_in_response"}
+        for name in target.requested_fields
+    }
+    candidates = []
+    for source, key, field_name, source_path in sources:
+        if field_name not in target.requested_fields or not isinstance(source, dict) or key not in source:
+            continue
+        raw = source[key]
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            outcomes[field_name] = {"status": "needs_evidence", "reason": "invalid_json_count"}
+            continue
+        outcomes.pop(field_name, None)
+        candidates.append(
+            _page_pc_candidate(
+                target,
+                field_name,
+                raw,
+                raw,
+                source_path,
+                request_context,
+                identity,
+            )
+        )
+    return candidates, outcomes
+
+
+def _page_pc_candidate(target, field_name, raw, normalized, path, request_context, identity):
+    return ObservationCandidate(
+        field_name=field_name,
+        raw_value=raw,
+        normalized_value=normalized,
+        source_kind="web_network",
+        source_path=path,
+        source_url=request_context.request_url,
+        observed_at=request_context.observed_at,
+        identity=identity,
+        temporal_scope="content_observation",
+    )
 
 
 def extract_nested_floor(
