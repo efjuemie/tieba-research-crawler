@@ -193,6 +193,92 @@ async def test_full_scan_posts_checkpoints_each_page_and_scans_first_post_commen
 
 
 @pytest.mark.asyncio
+async def test_shutdown_after_posts_page_persists_metadata_and_leaves_next_page_pending(monkeypatch):
+    post = make_post(pid=101, tid=9, floor=2, reply_num=0)
+    dto = make_posts_response([post], has_more=True, current_page=1, total_page=2)
+    response = ResearchPage(
+        raw=SimpleNamespace(thread=SimpleNamespace(tid=9, pid=0, fid=10, fname="bar")),
+        dto=dto,
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
+    )
+    stop_event = asyncio.Event()
+    events: list[str] = []
+
+    async def get_posts(_tid, pn, **_kwargs):
+        events.append(f"api_page_{pn}")
+        stop_event.set()
+        return SimpleNamespace(response=response, attempts=1)
+
+    async def enqueue_missing(_sessions, _run_id, *, thread_ids=(), post_ids=(), comment_ids=()):
+        assert post_ids == (post.pid,)
+        events.append("web_target_enqueued")
+
+    monkeypatch.setattr("src.research.web_fallback.live.enqueue_missing_web_targets", enqueue_missing)
+    datastore = SimpleNamespace(
+        async_sessionmaker=object(),
+        get_research_resume_state=AsyncMock(return_value=(1, "running", {})),
+        record_research_checkpoint=AsyncMock(side_effect=lambda **_values: events.append("checkpoint")),
+        filter_new_ids=AsyncMock(return_value={post.pid}),
+        save_items=AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("canonical_saved")),
+        push_object_event=AsyncMock(),
+        add_pending_comment_scan=AsyncMock(),
+        remove_pending_thread_scan=AsyncMock(),
+    )
+    container = make_research_container(SimpleNamespace())
+    container.async_sessionmaker = datastore.async_sessionmaker
+    handler = FullScanPostsTaskHandler(
+        0,
+        container,
+        cast("Any", datastore),
+        QueueRouter(),
+        stop_event=stop_event,
+    )
+    handler.get_posts = get_posts
+    handler._persist_research_page = AsyncMock(side_effect=lambda _page: events.append("api_page_persisted"))
+
+    await handler.handle(FullScanPostsTask(tid=9, backfill=True))
+
+    assert events.count("api_page_1") == 1
+    assert not any(event.startswith("api_page_2") for event in events)
+    assert events.index("api_page_persisted") < events.index("canonical_saved")
+    assert events.index("canonical_saved") < events.index("web_target_enqueued")
+    checkpoint = datastore.record_research_checkpoint.await_args.kwargs
+    assert checkpoint["page_number"] == 1
+    assert checkpoint["scope_status"] == "running"
+    assert checkpoint["next_page"] == 2
+    datastore.remove_pending_thread_scan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_while_waiting_for_api_rate_slot_does_not_start_request():
+    api_called = AsyncMock()
+    limiter_started = asyncio.Event()
+
+    async def acquire():
+        limiter_started.set()
+        await asyncio.Event().wait()
+
+    container = make_research_container(SimpleNamespace(get_posts_research=api_called))
+    container.posts_limiter.acquire = acquire
+    stop_event = asyncio.Event()
+    handler = FullScanPostsTaskHandler(
+        0,
+        container,
+        cast("Any", SimpleNamespace()),
+        QueueRouter(),
+        stop_event=stop_event,
+    )
+
+    request = asyncio.create_task(handler.get_posts(9, 1))
+    await limiter_started.wait()
+    stop_event.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    api_called.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_first_post_comments_use_floor_one_pid_when_raw_thread_pid_is_zero():
     first_post = make_post(pid=500, tid=9, floor=1, reply_num=20)
     posts_page = make_posts_response([first_post])
@@ -360,6 +446,10 @@ async def test_unmanaged_stored_first_post_floor_zero_is_filtered_before_reply_e
 
 @pytest.mark.asyncio
 async def test_managed_page_head_reply_reuses_canonical_first_post_scope(monkeypatch):
+    monkeypatch.setattr(
+        "src.research.web_fallback.live.enqueue_missing_web_targets",
+        AsyncMock(return_value=()),
+    )
     author_a = make_user(PostUserDTO, user_id=10, portrait="author-A")
     author_b = make_user(PostUserDTO, user_id=20, portrait="author-B")
     first_post = make_post(pid=100, tid=9, floor=1, user=author_a)
@@ -786,6 +876,10 @@ async def test_comment_growth_refreshes_completed_scope_and_resumes_after_interr
 @pytest.mark.asyncio
 @pytest.mark.parametrize("old_fails", [False, True])
 async def test_inflight_old_comment_worker_cannot_erase_refreshed_child_scope(monkeypatch, old_fails):
+    monkeypatch.setattr(
+        "src.research.web_fallback.live.enqueue_missing_web_targets",
+        AsyncMock(return_value=()),
+    )
     old_request_started = asyncio.Event()
     release_old_request = asyncio.Event()
     new_child_registered = asyncio.Event()

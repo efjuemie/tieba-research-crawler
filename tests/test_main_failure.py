@@ -29,6 +29,9 @@ async def test_main_propagates_incomplete_backfill_failure(monkeypatch):
         def __init__(self, router, container, datastore=None):
             pass
 
+        def stop(self):
+            return None
+
         async def run(self, mode):
             raise BackfillIncompleteError(["synthetic incomplete list stream"])
 
@@ -111,15 +114,16 @@ async def _start_hybrid(scheduler, worker):
 
 
 @pytest.mark.asyncio
-async def test_hybrid_shutdown_reaps_workers_when_backfill_fails_during_stop():
+async def test_hybrid_shutdown_cancels_producers_and_reaps_workers():
     scheduler = _HybridScheduler(fail_after_stop=True)
     worker = _WaitingWorker(scheduler.worker_started)
     task = await _start_hybrid(scheduler, worker)
 
     task.cancel()
-    with pytest.raises(BackfillIncompleteError, match="synthetic failure during shutdown"):
+    with pytest.raises(asyncio.CancelledError):
         await task
 
+    assert scheduler.stopped.is_set()
     assert worker.done
 
 

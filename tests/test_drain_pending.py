@@ -390,6 +390,9 @@ def _container(client, *, queue_maxsize=1):
         research_max_api_retries=1,
         research_retry_wait_seconds=0,
         cooldown_seconds_429=0.01,
+        pydantic_config=SimpleNamespace(
+            web_fallback=SimpleNamespace(browser_profile="isolated-test-profile")
+        ),
     )
     return SimpleNamespace(
         config=config,
@@ -401,6 +404,7 @@ def _container(client, *, queue_maxsize=1):
         threads_limiter=AsyncMock(),
         lock_manager=MemoryLockManager(),
         research_run_id=None,
+        semaphore=asyncio.Semaphore(1),
         research_auth_ready=asyncio.Event(),
         wait_for_research_ready=AsyncMock(),
         wait_for_auth_refresh=AsyncMock(),
@@ -410,9 +414,14 @@ def _container(client, *, queue_maxsize=1):
     )
 
 
-def _posts_page(tid: int, posts=None):
+def _posts_page(tid: int, posts=None, *, has_more=False, current_page=1, total_page=1):
     posts = posts or []
-    dto = make_posts_response(posts)
+    dto = make_posts_response(
+        posts,
+        has_more=has_more,
+        current_page=current_page,
+        total_page=total_page,
+    )
     raw = SimpleNamespace(
         thread=SimpleNamespace(
             pid=100,
@@ -447,6 +456,25 @@ def _patch_drain_runtime(monkeypatch, container, router, datastore):
         app_main,
         "Scheduler",
         lambda **_kwargs: pytest.fail("drain-pending must not start a scheduler"),
+    )
+
+    async def pending_run_ids(_sessions, active_run_id, *, responsible_forums):
+        assert responsible_forums == ((7, "synthetic"),)
+        return (active_run_id,)
+
+    async def discover_missing(_sessions, _run_ids):
+        return 0
+
+    async def live_web_worker(_sessions, _run_ids, *, stop_event, **_kwargs):
+        await stop_event.wait()
+        return SimpleNamespace(unresolved_count=0)
+
+    monkeypatch.setattr(app_main, "pending_web_run_ids", pending_run_ids)
+    monkeypatch.setattr(app_main, "discover_missing_web_targets", discover_missing)
+    monkeypatch.setattr(app_main, "run_live_web_worker", live_web_worker)
+    monkeypatch.setattr(
+        "src.research.web_fallback.live.enqueue_missing_web_targets",
+        AsyncMock(return_value=()),
     )
 
 
@@ -549,11 +577,16 @@ async def test_drain_reopens_completed_run_with_pending_scope_and_audits_reason(
 @pytest.mark.asyncio
 async def test_drain_deadline_keeps_current_scope_recoverable_and_pauses_run(monkeypatch):
     started = asyncio.Event()
+    release_request = asyncio.Event()
     scope = _scope("thread_replies:1", "thread_replies", 1, generation=3)
 
     async def blocked_posts(tid, page_number):
         started.set()
-        await asyncio.Event().wait()
+        await release_request.wait()
+        return _posts_page(
+            tid,
+            [make_post(pid=100, tid=tid, fid=7, fname="synthetic", floor=1, reply_num=0)],
+        )
 
     client = _SyntheticClient(posts=blocked_posts, comments=lambda *_args: None)
     container = _container(client)
@@ -566,16 +599,21 @@ async def test_drain_deadline_keeps_current_scope_recoverable_and_pauses_run(mon
         app_main.drain_pending(run_id="run-synthetic", limit=1, max_seconds=0.05)
     )
     await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.sleep(0.1)
+    assert store.run_status == "paused_limit"
+    assert not result.done()
+    release_request.set()
     assert await asyncio.wait_for(result, timeout=1) == 1
 
     assert store.run_status == "paused_limit"
-    assert scope.status == "pending"
-    assert not store.checkpoints
+    assert scope.status == "completed"
+    assert store.checkpoints[("run-synthetic", "thread_replies:1:g3", 1)]["status"] == "completed"
 
 
 @pytest.mark.asyncio
 async def test_drain_cancellation_can_resume_same_run_without_losing_checkpoint(monkeypatch):
     started = asyncio.Event()
+    release_request = asyncio.Event()
     scope = _scope("thread_replies:1", "thread_replies", 1, generation=2)
     post_calls = 0
 
@@ -584,9 +622,21 @@ async def test_drain_cancellation_can_resume_same_run_without_losing_checkpoint(
         post_calls += 1
         if post_calls == 1:
             started.set()
-            await asyncio.Event().wait()
-        first_post = make_post(pid=100, tid=tid, fid=7, fname="synthetic", floor=1, reply_num=0)
-        return _posts_page(tid, [first_post])
+            await release_request.wait()
+            return _posts_page(
+                tid,
+                [make_post(pid=100, tid=tid, fid=7, fname="synthetic", floor=1, reply_num=0)],
+                has_more=True,
+                current_page=1,
+                total_page=2,
+            )
+        assert page_number == 2
+        return _posts_page(
+            tid,
+            [make_post(pid=100, tid=tid, fid=7, fname="synthetic", floor=1, reply_num=0)],
+            current_page=2,
+            total_page=2,
+        )
 
     async def comments(_tid, _pid, _page_number):
         return _comments_page([])
@@ -595,22 +645,26 @@ async def test_drain_cancellation_can_resume_same_run_without_losing_checkpoint(
     store = _ResearchStore([scope])
     monkeypatch.setattr("src.research.persistence.persist_research_page", AsyncMock())
 
-    def start_attempt():
+    def start_attempt(limit=1):
         container = _container(client)
         router = QueueRouter(maxsize=1)
         _patch_drain_runtime(monkeypatch, container, router, store)
-        return app_main.drain_pending(run_id="run-synthetic", limit=1, max_seconds=0)
+        return app_main.drain_pending(run_id="run-synthetic", limit=limit, max_seconds=0)
 
     first_attempt = asyncio.create_task(start_attempt())
     await asyncio.wait_for(started.wait(), timeout=1)
     first_attempt.cancel()
+    await asyncio.sleep(0)
+    release_request.set()
     with pytest.raises(asyncio.CancelledError):
         await first_attempt
     assert store.run_status == "interrupted"
-    assert scope.status == "pending"
-    assert not store.checkpoints
+    assert scope.status == "running"
+    assert store.checkpoints[("run-synthetic", "thread_replies:1:g2", 1)]["next_page"] == 2
 
-    assert await start_attempt() == 1
+    # The first page creates a durable comment child. Drain comments-first
+    # ordering needs both that child and its parent to resume the second page.
+    assert await start_attempt(limit=2) == 2
     assert post_calls == 2
     assert store.drain_resume_calls == [
         ("run-synthetic", "incomplete"),
@@ -621,8 +675,62 @@ async def test_drain_cancellation_can_resume_same_run_without_losing_checkpoint(
 
 
 @pytest.mark.asyncio
+async def test_drain_stops_api_when_live_web_returns_summary_early(monkeypatch):
+    api_started = asyncio.Event()
+    release_page = asyncio.Event()
+    web_returned = asyncio.Event()
+    scope = _scope("thread_replies:1", "thread_replies", 1, generation=6)
+    post_calls = []
+
+    async def posts(tid, page_number):
+        post_calls.append(page_number)
+        if page_number == 1:
+            api_started.set()
+            await release_page.wait()
+            return _posts_page(
+                tid,
+                [make_post(pid=100, tid=tid, fid=7, fname="synthetic", floor=1, reply_num=0)],
+                has_more=True,
+                current_page=1,
+                total_page=2,
+            )
+        pytest.fail("API page 2 must not start after the live WEB worker exits")
+
+    client = _SyntheticClient(posts=posts, comments=lambda *_args: _comments_page([]))
+    container = _container(client)
+    router = QueueRouter(maxsize=1)
+    store = _ResearchStore([scope])
+    _patch_drain_runtime(monkeypatch, container, router, store)
+    monkeypatch.setattr("src.research.persistence.persist_research_page", AsyncMock())
+
+    async def returned_summary(_sessions, _run_ids, *, stop_event, **_kwargs):
+        await api_started.wait()
+        web_returned.set()
+        return SimpleNamespace(stopped_reason="manual_login_not_confirmed", unresolved_count=1)
+
+    monkeypatch.setattr(app_main, "run_live_web_worker", returned_summary)
+
+    drain = asyncio.create_task(
+        app_main.drain_pending(run_id="run-synthetic", limit=1, max_seconds=0)
+    )
+    await asyncio.wait_for(web_returned.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert not drain.done()
+
+    release_page.set()
+    with pytest.raises(RuntimeError, match="returned before shutdown was requested"):
+        await asyncio.wait_for(drain, timeout=2)
+
+    assert post_calls == [1]
+    assert scope.status == "running"
+    assert store.checkpoints[("run-synthetic", "thread_replies:1:g6", 1)]["next_page"] == 2
+    assert store.run_status == "incomplete"
+
+
+@pytest.mark.asyncio
 async def test_bounded_queue_cancellation_keeps_generated_children_and_is_not_idle(monkeypatch):
     comment_started = asyncio.Event()
+    release_comment = asyncio.Event()
     parent_scope = _scope("thread_replies:1", "thread_replies", 1, generation=4)
     initial_comment = _scope(
         "post_comments:1:90",
@@ -640,7 +748,7 @@ async def test_bounded_queue_cancellation_keeps_generated_children_and_is_not_id
     async def comments(tid, pid, _page_number):
         if pid == 90:
             comment_started.set()
-            await asyncio.Event().wait()
+            await release_comment.wait()
         return _comments_page([])
 
     client = _SyntheticClient(posts=posts, comments=comments)
@@ -668,9 +776,11 @@ async def test_bounded_queue_cancellation_keeps_generated_children_and_is_not_id
         "post_comments:1:103",
     }
     assert router.total_qsize() == 1
-    assert router.tracker.pending >= 4
+    assert router.tracker.pending >= 3
 
     drain_task.cancel()
+    await asyncio.sleep(0)
+    release_comment.set()
     with pytest.raises(asyncio.CancelledError):
         await drain_task
 

@@ -576,6 +576,9 @@ async def test_workers_start_before_bounded_pending_recovery_and_scheduler():
         def __init__(self, *, router, container, datastore=None):
             self.router = router
 
+        def stop(self):
+            return None
+
         async def run(self, mode):
             assert mode == "backfill"
             await asyncio.wait_for(task_consumed.wait(), timeout=1)

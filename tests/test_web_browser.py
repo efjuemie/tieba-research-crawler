@@ -4,16 +4,25 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from lxml import html
 
+from src.core.auth import GateAwareSemaphore
+from src.research.web_fallback import browser as browser_module
 from src.research.web_fallback.browser import (
     BrowserProviderConfigurationError,
     PlaywrightWebFallbackProvider,
 )
+from src.research.web_fallback.dom import DOMExtractionResult
 from src.research.web_fallback.identity import Target
-from src.research.web_fallback.network import NESTED_FLOOR_PATH, PAGE_PC_PATH, USER_CARD_PATH
+from src.research.web_fallback.network import (
+    NESTED_FLOOR_PATH,
+    PAGE_PC_PATH,
+    USER_CARD_PATH,
+    NetworkExtractionResult,
+)
 
 TID = "81001"
 FID = "120"
@@ -118,6 +127,16 @@ class FakeExpansion:
             self.page.match_expected_response(response)
 
 
+class FakeMouse:
+    def __init__(self, page):
+        self.page = page
+
+    async def move(self, x, y):
+        self.page.hover_positions.append((x, y))
+        if self.page.hovered_html_text is not None:
+            self.page.html_text = self.page.hovered_html_text
+
+
 class FakeWrapper:
     def __init__(self, page):
         self.page = page
@@ -179,6 +198,9 @@ class FakePage:
         has_wrapper=True,
         has_nested_items=False,
         close_delay=0,
+        scroll_html_sequence=None,
+        comment_growth_hover_points=None,
+        hovered_html_text=None,
     ):
         self.url = "about:blank"
         self.html_text = html_text
@@ -200,10 +222,18 @@ class FakePage:
         self.has_wrapper = has_wrapper
         self.has_nested_items = has_nested_items
         self.close_delay = close_delay
+        self.scroll_html_sequence = list(scroll_html_sequence or ())
+        self.comment_growth_hover_points = list(comment_growth_hover_points or ())
+        self.hovered_html_text = hovered_html_text
+        self.hover_positions = []
+        self.comment_growth_hover_args = None
+        self.mouse = FakeMouse(self)
+        self.content_calls = 0
         self._navigation_started = None
         self.handlers = {}
         self.expected_responses = []
         self.closed = False
+        self.goto_urls = []
         self.goto_started = asyncio.Event()
 
     def on(self, event, callback):
@@ -224,6 +254,7 @@ class FakePage:
                 return
 
     async def goto(self, url, **_kwargs):
+        self.goto_urls.append(url)
         self.goto_started.set()
         self.url = self.redirect_url or url
         self._navigation_started = asyncio.get_running_loop().time()
@@ -268,6 +299,7 @@ class FakePage:
         return FakeExpectResponse(self, predicate, timeout)
 
     async def content(self):
+        self.content_calls += 1
         if (
             self.render_after
             and self._navigation_started is not None
@@ -276,6 +308,13 @@ class FakePage:
         ):
             return self.rendered_html_text
         return self.html_text
+
+    async def evaluate(self, script, arg=None):
+        if script == browser_module._COMMENT_GROWTH_HOVER_POINTS_SCRIPT:
+            self.comment_growth_hover_args = arg
+            return self.comment_growth_hover_points
+        if self.scroll_html_sequence:
+            self.html_text = self.scroll_html_sequence.pop(0)
 
     async def close(self):
         if self.close_delay:
@@ -418,6 +457,59 @@ def _nested_response(*, cid=CID, author_id=AUTHOR_ID):
     )
 
 
+def _comment_author_growth_html(
+    *,
+    include_nested_owner=True,
+    include_growth_icon=False,
+    growth_tooltip=False,
+    expose_cid=False,
+    conflicting_cid_aliases=False,
+    include_avatar=False,
+    portrait=PORTRAIT,
+):
+    nested_owner = ""
+    if include_nested_owner:
+        cid_attribute = f' data-cid="{CID}"' if expose_cid else ""
+        if conflicting_cid_aliases:
+            cid_attribute = f' data-cid="{CID}" data-id="{int(CID) + 1}"'
+        growth_icon = ""
+        avatar = (
+            '<img class="avatar" src="https://tieba-ares.cdn.bcebos.com/avatar.webp">'
+            if include_avatar
+            else ""
+        )
+        if include_growth_icon:
+            tooltip_attributes = ' aria-describedby="growth-tip"' if growth_tooltip else ""
+            growth_icon = (
+                '<span class="icon_tshows tooltip__reference"'
+                f'{tooltip_attributes}>'
+                '<img class="icon_tshows_img" '
+                'src="https://tieba-ares.cdn.bcebos.com/synthetic/comment-growth.webp">'
+                "</span>"
+            )
+        nested_owner = f"""
+          <div class="pb-lzl-item"{cid_attribute}>
+            <div class="head-line user-info"><div class="name-info">
+              {avatar}
+              <a class="head-name" href="https://tieba.baidu.com/home/main?id={portrait}">author</a>
+            </div>{growth_icon}</div>
+          </div>"""
+    tooltip = '<div id="growth-tip">贴吧成长等级：Lv. 7</div>' if growth_tooltip else ""
+    return f"""
+    <html><body>
+      <div class="pb-comment-item" data-id="{POST_ID}">
+        <div class="pb-content-wrap"><div class="richtext-item">
+          <span tid="{TID}" fid="{FID}" index="1"></span>
+        </div></div>
+        <div class="comment-content"><div class="lzl-wrapper">
+          <button class="show-more-lzl">Expand replies</button>
+          {nested_owner}
+        </div></div>
+      </div>
+      {tooltip}
+    </body></html>"""
+
+
 def _page_pc_response(*, cid=CID):
     return json.dumps(
         {
@@ -491,6 +583,88 @@ def _provider(context, budget=None, **kwargs):
         budget=budget or FakeBudget(),
         **kwargs,
     )
+
+
+def _gate_aware_budget(auth_ready, network_ready):
+    capacity = asyncio.Semaphore(1)
+
+    async def wait_all_gates():
+        await auth_ready.wait()
+        await network_ready.wait()
+
+    async def is_all_gates_open():
+        return auth_ready.is_set() and network_ready.is_set()
+
+    async def wait_network_gate():
+        await network_ready.wait()
+
+    async def is_network_gate_open():
+        return network_ready.is_set()
+
+    return (
+        GateAwareSemaphore(
+            capacity,
+            wait_all_gates,
+            is_all_gates_open,
+            wait_network_gate,
+            is_network_gate_open,
+        ),
+        capacity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_web_budget_ignores_api_auth_gate_but_waits_for_network_gate():
+    auth_ready = asyncio.Event()
+    network_ready = asyncio.Event()
+    budget, _capacity = _gate_aware_budget(auth_ready, network_ready)
+    page = FakePage(html_text=_thread_html())
+    provider = _provider(FakeContext(lambda: page), budget=budget)
+
+    web_task = asyncio.create_task(provider.collect(_thread_target()))
+    await asyncio.sleep(0.03)
+
+    assert not page.goto_started.is_set()
+    assert not web_task.done()
+    network_ready.set()
+    result = await asyncio.wait_for(web_task, timeout=1)
+
+    assert result.status == "ok"
+    assert not auth_ready.is_set()
+    api_task = asyncio.create_task(budget.acquire())
+    await asyncio.sleep(0.03)
+    assert not api_task.done()
+    auth_ready.set()
+    await asyncio.wait_for(api_task, timeout=1)
+    budget.release()
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_web_budget_cancellation_restores_capacity_and_auth_gate():
+    auth_ready = asyncio.Event()
+    network_ready = asyncio.Event()
+    network_ready.set()
+    budget, capacity = _gate_aware_budget(auth_ready, network_ready)
+    page = FakePage(html_text=_thread_html(), navigation_delay=5)
+    provider = _provider(FakeContext(lambda: page), budget=budget)
+
+    web_task = asyncio.create_task(provider.collect(_thread_target()))
+    await asyncio.wait_for(page.goto_started.wait(), timeout=1)
+    assert capacity._value == 0
+
+    web_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await web_task
+
+    assert capacity._value == 1
+    api_task = asyncio.create_task(budget.acquire())
+    await asyncio.sleep(0.03)
+    assert not api_task.done()
+    auth_ready.set()
+    await asyncio.wait_for(api_task, timeout=1)
+    budget.release()
+    await provider.close()
 
 
 @pytest.mark.asyncio
@@ -570,6 +744,173 @@ async def test_verified_comment_without_requested_network_value_is_ok():
         "status": "not_tested",
         "reason": "not_observed_in_response",
     }
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_growth_waits_for_hydrated_exact_author_header_and_uses_parent_pid():
+    page = FakePage(
+        html_text=_comment_author_growth_html(include_nested_owner=False),
+        rendered_html_text=_comment_author_growth_html(
+            include_growth_icon=True,
+            growth_tooltip=True,
+        ),
+        render_after=0.5,
+        nested_response_text=_nested_response(),
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=3)
+    target = _comment_target(
+        requested_fields=("global_growth_level", "global_growth_icon_url", "ip_location_text")
+    )
+
+    result = await provider.collect(target)
+
+    assert result.status == "ok"
+    assert page.goto_urls == [f"https://tieba.baidu.com/p/{TID}?pid={POST_ID}"]
+    assert result.diagnostics["comment_growth_hydration_waits"] > 0
+    assert {candidate.field_name for candidate in result.candidates} == {
+        "global_growth_level",
+        "global_growth_icon_url",
+    }
+    assert all(
+        "same_author_profile_growth" in candidate.identity.match_methods
+        for candidate in result.candidates
+    )
+    assert result.field_outcomes["ip_location_text"]["status"] == "not_tested"
+    assert page.hover_positions == []
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_growth_hovers_only_verified_author_tooltip_and_stops_on_growth():
+    page = FakePage(
+        html_text=_comment_author_growth_html(include_growth_icon=True),
+        hovered_html_text=_comment_author_growth_html(
+            include_growth_icon=True,
+            growth_tooltip=True,
+        ),
+        comment_growth_hover_points=[{"x": 10, "y": 20}, {"x": 30, "y": 40}],
+        nested_response_text=_nested_response(),
+    )
+    provider = _provider(FakeContext(lambda: page))
+    target = _comment_target(requested_fields=("global_growth_level", "global_growth_icon_url"))
+
+    result = await provider.collect(target)
+
+    assert result.status == "ok"
+    assert {candidate.field_name for candidate in result.candidates} == {
+        "global_growth_level",
+        "global_growth_icon_url",
+    }
+    assert page.comment_growth_hover_args == {
+        "parentPid": POST_ID,
+        "portrait": PORTRAIT,
+        "limit": 3,
+    }
+    assert page.hover_positions == [(10, 20)]
+    assert result.diagnostics["growth_hover_attempts"] == 1
+    assert ".searchParams.getAll('id')" in browser_module._COMMENT_GROWTH_HOVER_POINTS_SCRIPT
+    assert "classList.contains('tooltip__reference')" in browser_module._COMMENT_GROWTH_HOVER_POINTS_SCRIPT
+    assert "querySelectorAll('.icon_tshows')" in browser_module._COMMENT_GROWTH_HOVER_POINTS_SCRIPT
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_growth_requires_verified_network_identity_for_auxiliary_dom(monkeypatch):
+    page = FakePage(nested_response_text=_nested_response())
+    provider = _provider(FakeContext(lambda: page))
+    target = _comment_target(requested_fields=("global_growth_icon_url",))
+
+    monkeypatch.setattr(
+        browser_module,
+        "extract_nested_floor",
+        lambda *_args, **_kwargs: NetworkExtractionResult(
+            "ok",
+            None,
+            True,
+            (),
+            {"global_growth_icon_url": {"status": "not_tested", "reason": "no_evidence"}},
+        ),
+    )
+    monkeypatch.setattr(
+        browser_module,
+        "extract_comment_author_growth",
+        lambda *_args, **_kwargs: pytest.fail("auxiliary DOM must require network identity proof"),
+    )
+
+    result = await provider.collect(target)
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.candidates == ()
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_growth_marks_missing_global_badge_without_using_avatar_image():
+    page = FakePage(
+        html_text=_comment_author_growth_html(include_avatar=True),
+        nested_response_text=_nested_response(),
+    )
+    provider = _provider(FakeContext(lambda: page))
+    target = _comment_target(requested_fields=("global_growth_level", "global_growth_icon_url"))
+
+    result = await provider.collect(target)
+
+    assert result.status == "ok"
+    assert result.candidates == ()
+    for field_name in ("global_growth_level", "global_growth_icon_url"):
+        assert result.field_outcomes[field_name] == {
+            "status": "absent_on_page",
+            "reason": "global_growth_icon_not_present",
+        }
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_dom_comment_preserves_network_ip_without_auxiliary_growth_conflict(monkeypatch):
+    page = FakePage(
+        html_text=_comment_author_growth_html(expose_cid=True),
+        page_pc_response_text=_page_pc_response(),
+        nested_response_text=_nested_response(),
+    )
+    provider = _provider(FakeContext(lambda: page))
+    target = _comment_target(requested_fields=("ip_location_text", "global_growth_icon_url"))
+    monkeypatch.setattr(
+        browser_module,
+        "extract_comment_author_growth",
+        lambda *_args, **_kwargs: pytest.fail(
+            "exact comment DOM identity should skip the CID-less auxiliary extractor"
+        ),
+    )
+
+    result = await provider.collect(target)
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert [candidate.field_name for candidate in result.candidates] == ["ip_location_text"]
+    assert result.candidates[0].normalized_value == "合成地区"
+    assert result.field_outcomes["global_growth_icon_url"] == {
+        "status": "absent_on_page",
+        "reason": "global_growth_icon_not_present",
+    }
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_growth_rejects_conflicting_dom_cid_aliases():
+    page = FakePage(
+        html_text=_comment_author_growth_html(conflicting_cid_aliases=True),
+        nested_response_text=_nested_response(),
+    )
+    provider = _provider(FakeContext(lambda: page))
+    target = _comment_target(requested_fields=("global_growth_icon_url",))
+
+    result = await provider.collect(target)
+
+    assert result.status == "identity_unverified"
+    assert result.reason == "comment_data_id_invalid"
+    assert result.candidates == ()
     await provider.close()
 
 
@@ -676,7 +1017,141 @@ async def test_post_page_pc_identity_finishes_without_dom_owner_and_keeps_empty_
     assert result.field_outcomes["ip_location_text"]["reason"] == "ip_location_empty_in_response"
     assert result.field_outcomes["global_growth_level"]["reason"] == "global_growth_level_zero_is_unknown"
     assert result.field_outcomes["agree_count"]["reason"] == "not_observed_in_response"
+    assert "pid=45003" in page.goto_urls[0]
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_post_page_snapshot_reuses_one_live_page_for_other_exact_post_ids():
+    payload = json.loads(_post_page_pc_response())
+    payload["post_list"].append({"id": 45004, "author_id": int(AUTHOR_ID)})
+    page = FakePage(
+        html_text=_post_html(portrait=PORTRAIT),
+        page_pc_response_text=json.dumps(payload, ensure_ascii=False),
+    )
+    context = FakeContext(lambda: page)
+    provider = _provider(context)
+
+    first = await provider.collect(_post_target())
+    second = await provider.collect(
+        _post_target(target_id="45004", pid="45004")
+    )
+
+    assert first.status == second.status == "ok"
+    assert first.identity_verified is second.identity_verified is True
+    assert second.diagnostics["page_cache_hits"] == 1
+    assert second.diagnostics["pages"] == 0
+    assert len(context.pages) == 1
+    assert len(page.goto_urls) == 1
+    assert page.closed is False
+    await provider.close()
+    assert page.closed is True
+
+
+@pytest.mark.asyncio
+async def test_post_waits_for_virtualized_owner_after_exact_network_identity():
+    page = FakePage(
+        html_text="<html><body></body></html>",
+        page_pc_response_text=_post_page_pc_response(),
+        scroll_html_sequence=[_post_html(portrait=PORTRAIT)],
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=0.3)
+
+    result = await provider.collect(_post_target())
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.diagnostics["post_owner_scrolls"] == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_growth_hover_uses_owner_header_and_includes_self_tooltip_reference(monkeypatch):
+    selectors = []
+
+    class HoverReference:
+        def __init__(self, page):
+            self.page = page
+
+        async def hover(self, **_kwargs):
+            self.page.hovered = True
+
+    class ReferenceLocator:
+        def __init__(self, page, count):
+            self.page = page
+            self.count_value = count
+
+        async def count(self):
+            return self.count_value
+
+        def nth(self, _index):
+            return HoverReference(self.page)
+
+    class HeaderLocator:
+        def __init__(self, page, count):
+            self.page = page
+            self.count_value = count
+
+        async def count(self):
+            return self.count_value
+
+        def locator(self, selector):
+            selectors.append(selector)
+            count = 1 if selector == (
+                ".icon_tshows.tooltip__reference, .icon_tshows .tooltip__reference"
+            ) else 0
+            return ReferenceLocator(self.page, count)
+
+    class OwnerLocator:
+        def __init__(self, page):
+            self.page = page
+
+        async def count(self):
+            return 1
+
+        def locator(self, selector):
+            selectors.append(selector)
+            return HeaderLocator(self.page, 1 if selector == ":scope > .head-line.user-info" else 2)
+
+    class FakePage:
+        url = f"https://tieba.baidu.com/p/{TID}?pid=45003"
+
+        def __init__(self):
+            self.hovered = False
+
+        def locator(self, selector):
+            assert selector == '.pb-comment-item[data-id="45003"]'
+            return OwnerLocator(self)
+
+        async def content(self):
+            return "<html></html>"
+
+    target = _post_target(
+        requested_fields=("global_growth_level", "global_growth_icon_url")
+    )
+    current = DOMExtractionResult("ok", None, True, ())
+    found = DOMExtractionResult(
+        "ok", None, True, (SimpleNamespace(field_name="global_growth_icon_url"),)
+    )
+    page = FakePage()
+    monkeypatch.setattr(
+        browser_module,
+        "extract_dom_candidates",
+        lambda *_args: found if page.hovered else current,
+    )
+
+    result = await browser_module._hover_growth_and_extract_dom(
+        page,
+        target,
+        current,
+        (),
+        asyncio.get_running_loop().time() + 1,
+        {"growth_hover_attempts": 0},
+    )
+
+    assert result.candidates[0].field_name == "global_growth_icon_url"
+    assert ":scope > .head-line.user-info" in selectors
+    assert ".icon_tshows.tooltip__reference, .icon_tshows .tooltip__reference" in selectors
 
 
 @pytest.mark.asyncio
@@ -1109,7 +1584,7 @@ async def test_missing_optional_playwright_shows_install_command(tmp_path, monke
         budget=FakeBudget(),
     )
 
-    with pytest.raises(BrowserProviderConfigurationError, match="uv sync --group login"):
+    with pytest.raises(BrowserProviderConfigurationError, match="uv sync.*playwright install chromium"):
         await provider._ensure_context()
 
     await provider.close()

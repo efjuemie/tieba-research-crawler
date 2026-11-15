@@ -10,6 +10,7 @@
 
 import asyncio
 import platform
+import signal
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
@@ -18,6 +19,7 @@ from tiebameow.utils.logger import init_logger, logger
 
 from src.core import DataStore, initialize_application
 from src.core.monitor import SystemMonitor
+from src.research.web_fallback.live import discover_missing_web_targets, pending_web_run_ids, run_live_web_worker
 from src.scraper import Scheduler, Worker
 from src.scraper.router import QueueRouter
 from src.scraper.tasks import FullScanCommentsTask, FullScanPostsTask, IncrementalScanCommentsTask, Priority, Task
@@ -27,8 +29,6 @@ init_logger(
     enable_error_filelog=True,
     diagnose=False,
 )
-
-GRACEFUL_SHUTDOWN_TIMEOUT = 60
 
 
 async def _cancel_and_reap_tasks(tasks: list[asyncio.Task], aggregate: asyncio.Future | None = None) -> None:
@@ -208,19 +208,55 @@ async def _pending_scan_batches(
         yield scoped
 
 
+async def _stop_scheduler_tasks(scheduler: Scheduler, scheduler_tasks: list[asyncio.Task]) -> None:
+    scheduler.stop()
+    for task in scheduler_tasks:
+        if not task.done():
+            task.cancel()
+    if scheduler_tasks:
+        await asyncio.gather(*scheduler_tasks, return_exceptions=True)
+
+
+async def _stop_api_workers(workers: list[Worker], worker_tasks: list[asyncio.Task]) -> None:
+    for worker in workers:
+        stop = getattr(worker, "stop_after_current", None)
+        if stop is not None:
+            stop()
+    for index, task in enumerate(worker_tasks):
+        worker = workers[index] if index < len(workers) else None
+        if worker is None or not hasattr(worker, "stop_after_current"):
+            if not task.done():
+                task.cancel()
+    if worker_tasks:
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+
+async def _require_web_worker_to_wait_for_stop(
+    web_worker_task: asyncio.Task,
+    web_stop_event: asyncio.Event | None,
+) -> Any:
+    summary = await web_worker_task
+    if web_stop_event is None or not web_stop_event.is_set():
+        reason = getattr(summary, "stopped_reason", None) or "unspecified"
+        unresolved = getattr(summary, "unresolved_count", "unknown")
+        raise RuntimeError(
+            "The live WEB fallback worker returned before shutdown was requested "
+            f"(reason={reason}, unresolved={unresolved})."
+        )
+    return summary
+
+
 async def _run_periodic_mode(
     scheduler: Scheduler,
     workers: list[Worker],
     router: QueueRouter,
     worker_tasks: list[asyncio.Task] | None = None,
+    *,
+    web_worker_task: asyncio.Task | None = None,
+    web_stop_event: asyncio.Event | None = None,
+    on_api_stopped: Any | None = None,
 ) -> None:
-    """运行周期模式，支持优雅退出。
-
-    优雅退出流程：
-    1. 收到取消信号后，停止调度器（不再生成新任务）
-    2. 等待所有通道队列清空（带超时）
-    3. 取消所有 Worker
-    """
+    """运行周期模式； cooperative stop leaves queued API scopes for recovery."""
     tasks: list[asyncio.Task] = []
 
     scheduler_task = asyncio.create_task(scheduler.run(mode="periodic"), name="scheduler")
@@ -228,49 +264,30 @@ async def _run_periodic_mode(
     if worker_tasks is None:
         worker_tasks = [asyncio.create_task(w.run(), name=f"worker-{w.lane}-{w.worker_id}") for w in workers]
     tasks.extend(worker_tasks)
+    web_watch_task = None
+    if web_worker_task is not None:
+        web_watch_task = asyncio.create_task(
+            _require_web_worker_to_wait_for_stop(web_worker_task, web_stop_event),
+            name="live-web-worker-supervisor",
+        )
+        tasks.append(web_watch_task)
 
     aggregate = asyncio.gather(*tasks)
     try:
         await asyncio.shield(aggregate)
     except asyncio.CancelledError:
         logger.info("Received shutdown signal. Starting graceful shutdown...")
-
-        scheduler.stop()
-
-        if not scheduler_task.done():
-            try:
-                await asyncio.wait_for(scheduler_task, timeout=5)
-            except TimeoutError:
-                scheduler_task.cancel()
-                try:
-                    await scheduler_task
-                except asyncio.CancelledError:
-                    pass
-
-        logger.info(
-            "Waiting for all lane tasks to complete (timeout={}s, queued_now={})...",
-            GRACEFUL_SHUTDOWN_TIMEOUT,
-            router.total_qsize(),
-        )
-        try:
-            join_tasks = [q.join() for q in router.lanes.values()]
-            await asyncio.wait_for(asyncio.gather(*join_tasks), timeout=GRACEFUL_SHUTDOWN_TIMEOUT)
-            logger.info("All lane tasks completed.")
-        except TimeoutError:
-            remaining = router.total_qsize()
-            logger.warning("Graceful shutdown timeout. queued_now={} across all lanes.", remaining)
-
-        worker_tasks = [t for t in tasks if t.get_name().startswith("worker-")]
-        for t in worker_tasks:
-            if not t.done():
-                t.cancel()
-        if worker_tasks:
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
-
-        logger.info("Graceful shutdown completed.")
+        await _stop_scheduler_tasks(scheduler, [scheduler_task])
+        await _stop_api_workers(workers, worker_tasks)
+        if on_api_stopped is not None:
+            await on_api_stopped()
+        logger.info("API producers stopped; WEB queue drained for stored targets.")
         raise
     except Exception:
-        scheduler.stop()
+        await _stop_scheduler_tasks(scheduler, [scheduler_task])
+        await _stop_api_workers(workers, worker_tasks)
+        if on_api_stopped is not None:
+            await on_api_stopped()
         raise
     finally:
         await _cancel_and_reap_tasks(tasks, aggregate)
@@ -282,18 +299,11 @@ async def _run_hybrid_mode(
     router: QueueRouter,
     worker_tasks: list[asyncio.Task] | None = None,
     *,
-    datastore: DataStore | None = None,
-    research_run_id: str | None = None,
+    web_worker_task: asyncio.Task | None = None,
+    web_stop_event: asyncio.Event | None = None,
+    on_api_stopped: Any | None = None,
 ) -> None:
-    """运行混合模式，支持优雅退出。
-
-    混合模式同时运行周期调度器和回溯调度器。
-    优雅退出流程：
-    1. 收到取消信号后，停止周期调度器（不再生成新任务）
-    2. 等待回溯调度器完成（如果还在运行）
-    3. 等待所有通道队列清空（带超时）
-    4. 取消所有 Worker
-    """
+    """Run periodic and backfill producers with one cooperative drain path."""
     tasks: list[asyncio.Task] = []
 
     periodic_task = asyncio.create_task(scheduler.run(mode="periodic"), name="scheduler-periodic")
@@ -305,87 +315,104 @@ async def _run_hybrid_mode(
     if worker_tasks is None:
         worker_tasks = [asyncio.create_task(w.run(), name=f"worker-{w.lane}-{w.worker_id}") for w in workers]
     tasks.extend(worker_tasks)
+    web_watch_task = None
+    if web_worker_task is not None:
+        web_watch_task = asyncio.create_task(
+            _require_web_worker_to_wait_for_stop(web_worker_task, web_stop_event),
+            name="live-web-worker-supervisor",
+        )
+        tasks.append(web_watch_task)
 
     aggregate = asyncio.gather(*tasks)
     try:
         await asyncio.shield(aggregate)
     except asyncio.CancelledError:
         logger.info("Received shutdown signal in hybrid mode. Starting graceful shutdown...")
-
-        scheduler.stop()
-
-        if not periodic_task.done():
-            try:
-                await asyncio.wait_for(periodic_task, timeout=5)
-            except TimeoutError:
-                periodic_task.cancel()
-                try:
-                    await periodic_task
-                except asyncio.CancelledError:
-                    pass
-
-        backfill_error: Exception | None = None
-        backfill_cancelled = False
-        if not backfill_task.done():
-            logger.info("Waiting for backfill scheduler to complete...")
-            try:
-                await asyncio.wait_for(asyncio.shield(backfill_task), timeout=10)
-            except TimeoutError:
-                logger.warning("Backfill scheduler timeout, cancelling...")
-                backfill_cancelled = True
-                backfill_task.cancel()
-                await asyncio.gather(backfill_task, return_exceptions=True)
-            except asyncio.CancelledError:
-                backfill_cancelled = True
-            except Exception as error:
-                backfill_error = error
-
-        if backfill_task.done() and not backfill_task.cancelled() and backfill_error is None:
-            backfill_error = backfill_task.exception()
-        elif backfill_task.cancelled():
-            backfill_cancelled = True
-
-        logger.info(
-            "Waiting for all lane tasks to complete (timeout={}s, queued_now={})...",
-            GRACEFUL_SHUTDOWN_TIMEOUT,
-            router.total_qsize(),
-        )
-        queue_drained = False
-        try:
-            await asyncio.wait_for(router.wait_idle(), timeout=GRACEFUL_SHUTDOWN_TIMEOUT)
-            queue_drained = True
-            logger.info("All lane tasks completed.")
-        except TimeoutError:
-            remaining = router.total_qsize()
-            logger.warning("Graceful shutdown timeout. queued_now={} across all lanes.", remaining)
-
-        if datastore is not None and research_run_id is not None:
-            if not queue_drained or backfill_cancelled:
-                await datastore.set_research_run_status_if(
-                    research_run_id,
-                    {"running", "completed", "incomplete"},
-                    "interrupted",
-                    "hybrid_shutdown_before_backfill_drain",
-                )
-            elif backfill_error is None:
-                await datastore.reconcile_research_run_status_after_drain(research_run_id)
-
-        worker_tasks = [t for t in tasks if t.get_name().startswith("worker-")]
-        for t in worker_tasks:
-            if not t.done():
-                t.cancel()
-        if worker_tasks:
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
-
-        logger.info("Graceful shutdown completed.")
-        if backfill_error is not None:
-            raise backfill_error from None
+        await _stop_scheduler_tasks(scheduler, [periodic_task, backfill_task])
+        await _stop_api_workers(workers, worker_tasks)
+        if on_api_stopped is not None:
+            await on_api_stopped()
+        logger.info("API producers stopped; WEB queue drained for stored targets.")
         raise
     except Exception:
-        scheduler.stop()
+        await _stop_scheduler_tasks(scheduler, [periodic_task, backfill_task])
+        await _stop_api_workers(workers, worker_tasks)
+        if on_api_stopped is not None:
+            await on_api_stopped()
         raise
     finally:
         await _cancel_and_reap_tasks(tasks, aggregate)
+
+
+async def _run_backfill_mode(
+    scheduler: Scheduler,
+    workers: list[Worker],
+    router: QueueRouter,
+    worker_tasks: list[asyncio.Task],
+    *,
+    web_worker_task: asyncio.Task | None,
+    web_stop_event: asyncio.Event | None = None,
+    on_api_stopped: Any | None,
+) -> None:
+    scheduler_task = asyncio.create_task(scheduler.run(mode="backfill"), name="scheduler")
+
+    async def wait_for_api_drain() -> None:
+        await scheduler_task
+        await router.wait_idle()
+
+    api_drain_task = asyncio.create_task(wait_for_api_drain(), name="api-backfill-drain")
+    web_watch_task = (
+        asyncio.create_task(
+            _require_web_worker_to_wait_for_stop(web_worker_task, web_stop_event),
+            name="live-web-worker-supervisor",
+        )
+        if web_worker_task is not None
+        else None
+    )
+    try:
+        if web_watch_task is not None:
+            done, _pending = await asyncio.wait(
+                {api_drain_task, web_watch_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if web_watch_task in done:
+                await web_watch_task
+                raise RuntimeError("The live WEB fallback worker exited before API producers stopped.")
+        await api_drain_task
+        await _stop_api_workers(workers, worker_tasks)
+        if on_api_stopped is not None:
+            await on_api_stopped()
+        if web_watch_task is not None:
+            await web_watch_task
+    except asyncio.CancelledError:
+        await _stop_scheduler_tasks(scheduler, [scheduler_task])
+        if not api_drain_task.done():
+            api_drain_task.cancel()
+            await asyncio.gather(api_drain_task, return_exceptions=True)
+        await _stop_api_workers(workers, worker_tasks)
+        if on_api_stopped is not None:
+            await on_api_stopped()
+        raise
+    except Exception:
+        await _stop_scheduler_tasks(scheduler, [scheduler_task])
+        if not api_drain_task.done():
+            api_drain_task.cancel()
+            await asyncio.gather(api_drain_task, return_exceptions=True)
+        await _stop_api_workers(workers, worker_tasks)
+        if on_api_stopped is not None:
+            await on_api_stopped()
+        raise
+    finally:
+        if not api_drain_task.done():
+            api_drain_task.cancel()
+            await asyncio.gather(api_drain_task, return_exceptions=True)
+        if not scheduler_task.done():
+            scheduler_task.cancel()
+        await asyncio.gather(scheduler_task, return_exceptions=True)
+        if web_watch_task is not None and not web_watch_task.done():
+            web_watch_task.cancel()
+        if web_watch_task is not None:
+            await asyncio.gather(web_watch_task, return_exceptions=True)
 
 
 async def _prepare_research_run(
@@ -483,9 +510,103 @@ async def drain_pending(
         raise ValueError("--max-seconds must be zero or a positive integer.")
 
     container, router = await initialize_application(mode="backfill")
+    shutdown_event = asyncio.Event()
+    restore_signal_handlers = _install_shutdown_signal_handlers(shutdown_event)
     datastore: DataStore | None = None
+    workers: list[Worker] = []
     worker_tasks: list[asyncio.Task] = []
+    web_worker_task: asyncio.Task | None = None
+    web_watch_task: asyncio.Task | None = None
+    web_stop_event: asyncio.Event | None = None
+    web_run_ids: tuple[str, ...] = ()
     active_run_id: str | None = None
+    api_drain_task: asyncio.Task | None = None
+    api_monitor_task: asyncio.Task | None = None
+    web_finished = False
+    web_summary: Any | None = None
+    cancelled = False
+    initial_run_status: str | None = None
+    web_discovered_count = 0
+
+    async def start_web_worker(current_run_id: str) -> None:
+        nonlocal web_worker_task, web_watch_task, web_stop_event, web_run_ids, web_discovered_count
+        responsible_forums = tuple((int(forum.fid), str(forum.fname)) for forum in (container.forums or []))
+        web_run_ids = await pending_web_run_ids(
+            datastore.async_sessionmaker,
+            current_run_id,
+            responsible_forums=responsible_forums,
+        )
+        web_stop_event = asyncio.Event()
+        web_config = container.config.pydantic_config.web_fallback
+        web_worker_task = asyncio.create_task(
+            run_live_web_worker(
+                datastore.async_sessionmaker,
+                web_run_ids,
+                stop_event=web_stop_event,
+                browser_profile=web_config.browser_profile,
+                request_budget=container.semaphore,
+                browser_config=web_config,
+            ),
+            name="web-fallback-worker",
+        )
+        web_watch_task = asyncio.create_task(
+            _require_web_worker_to_wait_for_stop(web_worker_task, web_stop_event),
+            name="live-web-worker-supervisor",
+        )
+        web_discovered_count = await discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids)
+
+    async def stop_api_and_drain_web() -> Any | None:
+        nonlocal web_finished, web_summary
+        if workers:
+            await _stop_api_workers(workers, worker_tasks)
+        if web_worker_task is None or web_stop_event is None or web_finished:
+            return web_summary
+        discovery_error: Exception | None = None
+        exited_before_shutdown = False
+        try:
+            try:
+                await discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids)
+            except Exception as error:
+                discovery_error = error
+                logger.exception("Could not rescan stored API metadata before WEB shutdown: {}", error)
+            exited_before_shutdown = web_worker_task.done() and not web_stop_event.is_set()
+        finally:
+            web_stop_event.set()
+        try:
+            web_summary = await web_worker_task
+        finally:
+            web_finished = True
+            if web_watch_task is not None:
+                await asyncio.gather(web_watch_task, return_exceptions=True)
+        if web_watch_task is not None:
+            await web_watch_task
+        if exited_before_shutdown:
+            raise RuntimeError("The live WEB fallback worker exited before drain-pending requested shutdown.")
+        unresolved_count = getattr(web_summary, "unresolved_count", 0)
+        if unresolved_count:
+            for pending_run_id in web_run_ids:
+                await datastore.set_research_run_status_if(
+                    pending_run_id,
+                    {"running", "completed", "incomplete"},
+                    "incomplete",
+                    "web_fallback_unresolved_tasks",
+                )
+        else:
+            for pending_run_id in web_run_ids:
+                if (
+                    pending_run_id == run_id
+                    and initial_run_status == "completed"
+                    and web_discovered_count == 0
+                    and not getattr(web_summary, "collected_count", 0)
+                    and not getattr(web_summary, "completed_count", 0)
+                    and not getattr(web_summary, "partial_count", 0)
+                ):
+                    continue
+                await datastore.reconcile_research_run_status_after_drain(pending_run_id)
+        if discovery_error is not None:
+            raise discovery_error
+        return web_summary
+
     try:
         datastore = DataStore(container)
         if not getattr(container.config, "research_enabled", False):
@@ -494,10 +615,8 @@ async def drain_pending(
         if not forums:
             raise ValueError("Research backfill requires at least one initialized forum.")
         run_status = await datastore.load_research_run_for_drain(run_id, forums)
+        initial_run_status = run_status
         responsible_fids = {int(forum.fid) for forum in (container.forums or [])}
-
-        # Select a fixed initial subset before starting workers. This keeps
-        # dynamic child scopes out of the user's initial --limit count.
         selected = await _snapshot_pending_research_scopes(
             datastore,
             run_id,
@@ -505,116 +624,228 @@ async def drain_pending(
             tid=tid,
             limit=limit,
         )
-        if not selected:
-            logger.info("No pending research detail scopes selected; run status remains {}.", run_status)
-            return 0
 
-        if not await datastore.resume_research_run_for_drain(run_id, run_status):
-            raise RuntimeError(f"Research run {run_id} could not be activated from status {run_status!r}.")
-        active_run_id = run_id
-        container.research_run_id = active_run_id
-        research_run_cache = getattr(container, "research_run_cache", None)
-        if research_run_cache is not None:
-            research_run_cache.clear()
-        activation_reason = "drain_reopened_completed_run" if run_status == "completed" else None
-        logger.info(
-            "Research run selected for drain: {} (previous status={}, reason={}).",
-            active_run_id,
-            run_status,
-            activation_reason,
-        )
-        await _prepare_research_auth(container, datastore, active_run_id)
-
-        workers: list[Worker] = []
-        worker_id = 0
-        for lane, count in (
-            ("posts", container.config.worker_posts),
-            ("comments", container.config.worker_comments),
-        ):
-            for _ in range(count):
-                workers.append(
-                    Worker(
-                        worker_id,
-                        router.get_queue(lane),
-                        container,
-                        datastore,
-                        router,
-                        lane=lane,
-                    )
-                )
-                worker_id += 1
-
-        worker_tasks = [
-            asyncio.create_task(worker.run(), name=f"worker-{worker.lane}-{worker.worker_id}")
-            for worker in workers
-        ]
-        logger.info(
-            "Draining research run {}: initial_scopes={}, tid={}, limit={}, max_seconds={}",
-            active_run_id,
-            len(selected),
-            tid,
-            limit,
-            max_seconds,
-        )
-
-        async def enqueue_and_wait_idle() -> None:
-            await _enqueue_research_scope_batch(
-                router,
-                selected,
-                responsible_fids,
+        if selected:
+            if not await datastore.resume_research_run_for_drain(run_id, run_status):
+                raise RuntimeError(f"Research run {run_id} could not be activated from status {run_status!r}.")
+            active_run_id = run_id
+            container.research_run_id = active_run_id
+            research_run_cache = getattr(container, "research_run_cache", None)
+            if research_run_cache is not None:
+                research_run_cache.clear()
+            activation_reason = "drain_reopened_completed_run" if run_status == "completed" else None
+            logger.info(
+                "Research run selected for drain: {} (previous status={}, reason={}).",
                 active_run_id,
+                run_status,
+                activation_reason,
             )
-            await router.wait_idle()
-
-        try:
-            if max_seconds == 0:
-                await enqueue_and_wait_idle()
-            else:
-                async with asyncio.timeout(max_seconds):
-                    await enqueue_and_wait_idle()
-        except TimeoutError:
-            await datastore.set_research_run_status_if(
-                active_run_id,
-                {"running", "incomplete"},
-                "paused_limit",
-                "drain_max_seconds_reached",
-            )
-            logger.warning("drain-pending reached its {} second deadline.", max_seconds)
+            await _prepare_research_auth(container, datastore, active_run_id)
         else:
+            active_run_id = run_id
+            container.research_run_id = active_run_id
+            logger.info("No pending API detail scopes selected; draining stored WEB metadata for run {}.", run_id)
+
+        await start_web_worker(active_run_id)
+
+        if selected:
+            worker_id = 0
+            for lane, count in (
+                ("posts", container.config.worker_posts),
+                ("comments", container.config.worker_comments),
+            ):
+                for _ in range(count):
+                    workers.append(
+                        Worker(
+                            worker_id,
+                            router.get_queue(lane),
+                            container,
+                            datastore,
+                            router,
+                            lane=lane,
+                        )
+                    )
+                    worker_id += 1
+            worker_tasks = [
+                asyncio.create_task(worker.run(), name=f"worker-{worker.lane}-{worker.worker_id}")
+                for worker in workers
+            ]
+            logger.info(
+                "Draining research run {}: initial_scopes={}, tid={}, limit={}, max_seconds={}",
+                active_run_id,
+                len(selected),
+                tid,
+                limit,
+                max_seconds,
+            )
+
+            async def enqueue_and_wait_idle() -> bool:
+                await _enqueue_research_scope_batch(router, selected, responsible_fids, active_run_id)
+                try:
+                    if max_seconds == 0:
+                        await router.wait_idle()
+                    else:
+                        async with asyncio.timeout(max_seconds):
+                            await router.wait_idle()
+                except TimeoutError:
+                    return False
+                return True
+
+            api_drain_task = asyncio.create_task(enqueue_and_wait_idle(), name="api-detail-drain")
+
+            async def wait_for_api_drain_or_web_exit() -> None:
+                if web_watch_task is None:
+                    await api_drain_task
+                    return
+                done, _pending = await asyncio.wait(
+                    {api_drain_task, web_watch_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if web_watch_task in done:
+                    await web_watch_task
+                await api_drain_task
+
+            api_monitor_task = asyncio.create_task(
+                wait_for_api_drain_or_web_exit(),
+                name="api-web-drain-supervisor",
+            )
+            cancelled = await _await_mode_or_shutdown(api_monitor_task, shutdown_event)
+            if not cancelled:
+                api_drained = await api_drain_task
+                if not api_drained:
+                    await datastore.set_research_run_status_if(
+                        active_run_id,
+                        {"running", "incomplete"},
+                        "paused_limit",
+                        "drain_max_seconds_reached",
+                    )
+                    logger.warning("drain-pending reached its {} second API detail deadline.", max_seconds)
+
+        web_summary = await stop_api_and_drain_web()
+        unresolved_count = getattr(web_summary, "unresolved_count", 0)
+        if cancelled:
+            for pending_run_id in web_run_ids:
+                await datastore.set_research_run_status_if(
+                    pending_run_id,
+                    {"running", "completed", "incomplete", "paused_limit"},
+                    "interrupted",
+                    "drain_cancelled_after_current_api_page",
+                )
+        elif selected and not unresolved_count:
             status = await datastore.reconcile_research_run_status_after_drain(active_run_id)
             logger.info("drain-pending finished; run status is {}.", status)
 
         return len(selected)
     except asyncio.CancelledError:
-        if datastore is not None and active_run_id is not None:
-            await datastore.set_research_run_status_if(
-                active_run_id,
-                {"running", "incomplete"},
-                "interrupted",
-                "drain_cancelled",
-            )
+        cancelled = True
+        if api_drain_task is not None and not api_drain_task.done():
+            api_drain_task.cancel()
+            await asyncio.gather(api_drain_task, return_exceptions=True)
+        if api_monitor_task is not None and not api_monitor_task.done():
+            api_monitor_task.cancel()
+            await asyncio.gather(api_monitor_task, return_exceptions=True)
+        if datastore is not None:
+            await stop_api_and_drain_web()
+            for pending_run_id in web_run_ids or ((active_run_id,) if active_run_id else ()):
+                await datastore.set_research_run_status_if(
+                    pending_run_id,
+                    {"running", "completed", "incomplete", "paused_limit"},
+                    "interrupted",
+                    "drain_cancelled_after_current_api_page",
+                )
         raise
     except Exception as error:
-        if datastore is not None and active_run_id is not None:
-            await datastore.set_research_run_status_if(
-                active_run_id,
-                {"running"},
-                "incomplete",
-                f"drain_failed_{type(error).__name__}",
-            )
+        if datastore is not None:
+            if api_monitor_task is not None and not api_monitor_task.done():
+                api_monitor_task.cancel()
+                await asyncio.gather(api_monitor_task, return_exceptions=True)
+            if workers:
+                await _stop_api_workers(workers, worker_tasks)
+            try:
+                await stop_api_and_drain_web()
+            except Exception:
+                logger.exception("WEB queue did not fully drain after drain-pending failure.")
+            if active_run_id is not None:
+                await datastore.set_research_run_status_if(
+                    active_run_id,
+                    {"running"},
+                    "incomplete",
+                    f"drain_failed_{type(error).__name__}",
+                )
         raise
     finally:
-        for task in worker_tasks:
-            if not task.done():
-                task.cancel()
-        if worker_tasks:
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
+        if api_drain_task is not None and not api_drain_task.done():
+            api_drain_task.cancel()
+            await asyncio.gather(api_drain_task, return_exceptions=True)
+        if api_monitor_task is not None and not api_monitor_task.done():
+            api_monitor_task.cancel()
+            await asyncio.gather(api_monitor_task, return_exceptions=True)
+        if workers:
+            await _stop_api_workers(workers, worker_tasks)
+        if web_worker_task is not None and not web_finished:
+            try:
+                await stop_api_and_drain_web()
+            except Exception:
+                logger.exception("WEB fallback shutdown did not finish cleanly; durable tasks remain recoverable.")
+        restore_signal_handlers()
         if datastore is not None:
             try:
                 await datastore.close()
             except Exception:
                 pass
         await container.teardown()
+
+
+def _install_shutdown_signal_handlers(shutdown_event: asyncio.Event):
+    loop = asyncio.get_running_loop()
+    previous_handlers: dict[signal.Signals, Any] = {}
+    installed: list[signal.Signals] = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous_handlers[signum] = signal.getsignal(signum)
+            loop.add_signal_handler(signum, shutdown_event.set)
+            installed.append(signum)
+        except (NotImplementedError, RuntimeError, ValueError):
+            continue
+
+    def restore() -> None:
+        for signum in installed:
+            loop.remove_signal_handler(signum)
+            try:
+                signal.signal(signum, previous_handlers[signum])
+            except (OSError, ValueError):
+                pass
+
+    return restore
+
+
+async def _await_mode_or_shutdown(mode_task: asyncio.Task, shutdown_event: asyncio.Event) -> bool:
+    signal_task = asyncio.create_task(shutdown_event.wait(), name="cooperative-shutdown-wait")
+    try:
+        done, _pending = await asyncio.wait(
+            {mode_task, signal_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except asyncio.CancelledError:
+        if not mode_task.done():
+            mode_task.cancel()
+        await asyncio.gather(mode_task, return_exceptions=True)
+        raise
+    finally:
+        if not signal_task.done():
+            signal_task.cancel()
+        await asyncio.gather(signal_task, return_exceptions=True)
+
+    if signal_task in done or shutdown_event.is_set():
+        if not mode_task.done():
+            mode_task.cancel()
+        try:
+            await mode_task
+        except asyncio.CancelledError:
+            pass
+        return True
+    await mode_task
+    return False
 
 
 async def main(
@@ -625,25 +856,88 @@ async def main(
 ):
     """统一入口，根据模式启动应用。
 
-    - periodic: 周期性调度器 + 多 worker，常驻运行，支持优雅退出。
-    - backfill: 一次性回溯调度器 + 多 worker；等待队列清空后优雅退出。
+    - periodic: 周期性调度器、API workers 和 WEB fallback worker 并行运行。
+    - backfill: 回溯调度器、API workers 和 WEB fallback worker 并行运行。
     - hybrid: 周期调度器常驻 + 回溯调度器跑一轮 + 多 worker。
     """
     container, router = await initialize_application(mode=mode)
 
+    shutdown_event = asyncio.Event()
+    restore_signal_handlers = _install_shutdown_signal_handlers(shutdown_event)
     monitor_task: asyncio.Task | None = None
-    if container.config.metrics_enabled:
-        start_http_server(container.config.metrics_port)
-        logger.info("Prometheus metrics server started on port {}", container.config.metrics_port)
-
-        monitor = SystemMonitor(container)
-        monitor_task = asyncio.create_task(monitor.run(), name="system-monitor")
-
     tasks: list[asyncio.Task] = []
     datastore: DataStore | None = None
     mark_interrupted_after_cancel = False
     research_run_id: str | None = None
+    scheduler: Scheduler | None = None
+    workers: list[Worker] = []
+    worker_tasks: list[asyncio.Task] = []
+    mode_task: asyncio.Task | None = None
+    web_worker_task: asyncio.Task | None = None
+    web_stop_event: asyncio.Event | None = None
+    web_run_ids: tuple[str, ...] = ()
+    web_finished = False
+    web_summary: Any | None = None
+
+    async def finish_web_after_api_stopped() -> Any | None:
+        nonlocal web_finished, web_summary
+        if datastore is None:
+            return web_summary
+        if web_worker_task is None or web_stop_event is None:
+            if research_run_id is not None:
+                await datastore.reconcile_research_run_status_after_drain(research_run_id)
+            return web_summary
+        if web_finished:
+            return web_summary
+
+        discovery_error: Exception | None = None
+        exited_before_shutdown = False
+        try:
+            try:
+                created = await discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids)
+                if created:
+                    logger.info("Queued {} missing metadata targets after API producers stopped.", created)
+            except Exception as error:
+                discovery_error = error
+                logger.exception("Could not rescan stored API metadata before WEB shutdown: {}", error)
+            exited_before_shutdown = web_worker_task.done() and not web_stop_event.is_set()
+        finally:
+            web_stop_event.set()
+
+        try:
+            web_summary = await web_worker_task
+        finally:
+            web_finished = True
+
+        if exited_before_shutdown:
+            raise RuntimeError(
+                "The live WEB fallback worker exited before API shutdown requested a final drain."
+            )
+        unresolved_count = getattr(web_summary, "unresolved_count", 0)
+        if unresolved_count:
+            for pending_run_id in web_run_ids:
+                await datastore.set_research_run_status_if(
+                    pending_run_id,
+                    {"running", "completed", "incomplete"},
+                    "incomplete",
+                    "web_fallback_unresolved_tasks",
+                )
+        else:
+            for pending_run_id in web_run_ids:
+                await datastore.reconcile_research_run_status_after_drain(pending_run_id)
+
+        if discovery_error is not None:
+            raise discovery_error
+        return web_summary
+
     try:
+        if container.config.metrics_enabled:
+            start_http_server(container.config.metrics_port)
+            logger.info("Prometheus metrics server started on port {}", container.config.metrics_port)
+
+            monitor = SystemMonitor(container)
+            monitor_task = asyncio.create_task(monitor.run(), name="system-monitor")
+
         logger.info("Starting application in {} mode.", mode)
 
         datastore = DataStore(container)
@@ -651,7 +945,6 @@ async def main(
         research_run_id = await _prepare_research_run(container, datastore, mode, resume=resume, run_id=run_id)
 
         # 按通道创建 Worker 组
-        workers: list[Worker] = []
         worker_id = 0
         lane_counts: dict[Literal["threads", "posts", "comments"], int] = {
             "threads": container.config.worker_threads,
@@ -685,37 +978,109 @@ async def main(
             research_run_id=research_run_id,
         )
 
-        if mode == "periodic":
-            await _run_periodic_mode(scheduler, workers, router, worker_tasks=worker_tasks)
-
-        elif mode == "backfill":
-            scheduler_task = asyncio.create_task(scheduler.run(mode="backfill"), name="scheduler")
-            tasks.append(scheduler_task)
-
-            await scheduler_task
-            await router.wait_idle()
-            if research_run_id is not None:
-                await datastore.reconcile_research_run_status_after_drain(research_run_id)
-
-        else:  # hybrid
-            await _run_hybrid_mode(
-                scheduler,
-                workers,
-                router,
-                worker_tasks=worker_tasks,
-                datastore=datastore,
-                research_run_id=research_run_id,
+        if research_run_id is not None and hasattr(datastore, "async_sessionmaker"):
+            responsible_forums = tuple((int(forum.fid), str(forum.fname)) for forum in (container.forums or []))
+            web_run_ids = await pending_web_run_ids(
+                datastore.async_sessionmaker,
+                research_run_id,
+                responsible_forums=responsible_forums,
             )
+            web_stop_event = asyncio.Event()
+            web_config = container.config.pydantic_config.web_fallback
+            web_worker_task = asyncio.create_task(
+                run_live_web_worker(
+                    datastore.async_sessionmaker,
+                    web_run_ids,
+                    stop_event=web_stop_event,
+                    browser_profile=web_config.browser_profile,
+                    request_budget=container.semaphore,
+                    browser_config=web_config,
+                ),
+                name="web-fallback-worker",
+            )
+            tasks.append(web_worker_task)
+            await discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids)
+
+        if mode == "periodic":
+            mode_task = asyncio.create_task(
+                _run_periodic_mode(
+                    scheduler,
+                    workers,
+                    router,
+                    worker_tasks=worker_tasks,
+                    web_worker_task=web_worker_task,
+                    web_stop_event=web_stop_event,
+                    on_api_stopped=finish_web_after_api_stopped,
+                ),
+                name="periodic-mode",
+            )
+        elif mode == "backfill":
+            mode_task = asyncio.create_task(
+                _run_backfill_mode(
+                    scheduler,
+                    workers,
+                    router,
+                    worker_tasks,
+                    web_worker_task=web_worker_task,
+                    web_stop_event=web_stop_event,
+                    on_api_stopped=finish_web_after_api_stopped,
+                ),
+                name="backfill-mode",
+            )
+        else:  # hybrid
+            mode_task = asyncio.create_task(
+                _run_hybrid_mode(
+                    scheduler,
+                    workers,
+                    router,
+                    worker_tasks=worker_tasks,
+                    web_worker_task=web_worker_task,
+                    web_stop_event=web_stop_event,
+                    on_api_stopped=finish_web_after_api_stopped,
+                ),
+                name="hybrid-mode",
+            )
+        tasks.append(mode_task)
+        if await _await_mode_or_shutdown(mode_task, shutdown_event):
+            mark_interrupted_after_cancel = research_run_id is not None
 
     except asyncio.CancelledError:
         logger.info("Received cancellation in {} mode.", mode)
+        shutdown_event.set()
         mark_interrupted_after_cancel = research_run_id is not None
+        if mode_task is not None and not mode_task.done():
+            mode_task.cancel()
+            await asyncio.gather(mode_task, return_exceptions=True)
         raise
 
     except Exception as e:
         logger.exception("Application failed to start or run: {}", e)
+        if datastore is not None and research_run_id is not None:
+            try:
+                await datastore.set_research_run_status_if(
+                    research_run_id,
+                    {"running"},
+                    "incomplete",
+                    f"application_failed_{type(e).__name__}",
+                )
+            except Exception:
+                logger.exception("Failed to persist incomplete state for the failed research run.")
         raise
     finally:
+        if mode_task is not None and not mode_task.done():
+            mode_task.cancel()
+            await asyncio.gather(mode_task, return_exceptions=True)
+
+        if scheduler is not None:
+            scheduler.stop()
+        if workers:
+            await _stop_api_workers(workers, worker_tasks)
+        if web_worker_task is not None and not web_finished:
+            try:
+                await finish_web_after_api_stopped()
+            except Exception:
+                logger.exception("WEB fallback shutdown did not finish cleanly; durable tasks remain recoverable.")
+
         if monitor_task and not monitor_task.done():
             monitor_task.cancel()
             try:
@@ -733,12 +1098,14 @@ async def main(
             try:
                 await datastore.set_research_run_status_if(
                     research_run_id,
-                    {"running"},
+                    {"running", "completed", "incomplete"},
                     "interrupted",
-                    "main_cancelled_before_completion",
+                    "cooperative_shutdown_after_current_api_page",
                 )
             except Exception:
                 logger.exception("Failed to persist interrupted state for the cancelled research run.")
+
+        restore_signal_handlers()
 
         logger.info("Shutting down application...")
 

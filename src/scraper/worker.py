@@ -128,14 +128,85 @@ class TaskHandler(ABC):
         container: Container,
         datastore: DataStore,
         router: QueueRouter,
+        *,
+        stop_event: asyncio.Event | None = None,
     ):
         self.worker_id = worker_id
         self.container = container
         self.datastore = datastore
         self.router = router
+        self.stop_event = stop_event
         self.lock_manager: LockManager = container.lock_manager
         self.batch_size = 100
         self.log = logger.bind(name=f"Worker-{worker_id}")
+
+    def _stop_requested(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    async def _await_api_gate(self, awaitable: Any) -> Any:
+        """Let shutdown interrupt waits that have not started an API request."""
+        if self.stop_event is None:
+            return await awaitable
+        if self.stop_event.is_set():
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise asyncio.CancelledError
+
+        operation = asyncio.ensure_future(awaitable)
+        stopped = asyncio.create_task(self.stop_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {operation, stopped},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stopped in done:
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+                raise asyncio.CancelledError
+            return await operation
+        finally:
+            if not operation.done():
+                operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            if not stopped.done():
+                stopped.cancel()
+            await asyncio.gather(stopped, return_exceptions=True)
+
+    async def _enqueue_task_unless_stopping(self, task: Task) -> bool:
+        """Avoid blocking shutdown while a bounded API queue is full."""
+        if self.stop_event is None:
+            await self.router.put(task)
+            return True
+        if self.stop_event.is_set():
+            return False
+
+        try:
+            self.router.put_nowait(task)
+            return True
+        except asyncio.QueueFull:
+            pass
+
+        enqueue = asyncio.create_task(self.router.put(task))
+        stopped = asyncio.create_task(self.stop_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {enqueue, stopped},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if enqueue in done:
+                await enqueue
+                return True
+            enqueue.cancel()
+            await asyncio.gather(enqueue, return_exceptions=True)
+            return False
+        finally:
+            if not enqueue.done():
+                enqueue.cancel()
+            await asyncio.gather(enqueue, return_exceptions=True)
+            if not stopped.done():
+                stopped.cancel()
+            await asyncio.gather(stopped, return_exceptions=True)
 
     async def try_acquire_lock(self, key: str, ttl: int = 300) -> bool:
         """尝试获取锁。
@@ -290,9 +361,13 @@ class TaskHandler(ABC):
 
         async def request_once(*, bypass_pause: bool = False):
             if research_enabled and not bypass_pause:
-                await self.container.wait_for_research_ready()
+                await self._await_api_gate(self.container.wait_for_research_ready())
+            if self._stop_requested():
+                raise asyncio.CancelledError
             with RATELIMIT_WAIT_DURATION.labels(limiter_type=api_type).time():
-                await limiter.acquire()
+                await self._await_api_gate(limiter.acquire())
+            if self._stop_requested():
+                raise asyncio.CancelledError
 
             start = time.perf_counter()
             status = "success"
@@ -320,6 +395,8 @@ class TaskHandler(ABC):
                     await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
                 return FetchedPage(response=response, attempts=attempt)
             except RetriableApiError as error:
+                if self._stop_requested():
+                    raise asyncio.CancelledError from error
                 if research_enabled and error.code == 4011:
                     run_id = getattr(self.container, "research_run_id", None)
                     if run_id:
@@ -330,9 +407,11 @@ class TaskHandler(ABC):
                             f"{api_type}_api_error_code_4011",
                         )
                     try:
-                        response = await self.container.wait_for_auth_refresh(
-                            lambda: request_once(bypass_pause=True),
-                            run_id=run_id,
+                        response = await self._await_api_gate(
+                            self.container.wait_for_auth_refresh(
+                                lambda: request_once(bypass_pause=True),
+                                run_id=run_id,
+                            )
                         )
                     except RetriableApiError as refresh_error:
                         if refresh_error.code == 429:
@@ -343,9 +422,11 @@ class TaskHandler(ABC):
                                     "paused_rate_limit",
                                     f"{api_type}_api_error_code_429_after_auth_refresh",
                                 )
-                            await self.container.wait_for_rate_limit(
-                                self.container.config.cooldown_seconds_429,
-                                run_id=run_id,
+                            await self._await_api_gate(
+                                self.container.wait_for_rate_limit(
+                                    self.container.config.cooldown_seconds_429,
+                                    run_id=run_id,
+                                )
                             )
                             if attempt >= attempt_limit:
                                 await self.container.block_research_network()
@@ -353,7 +434,7 @@ class TaskHandler(ABC):
                             if run_id:
                                 await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
                             wait_seconds = self.container.config.research_retry_wait_seconds
-                            await asyncio.sleep(wait_seconds * attempt)
+                            await self._await_api_gate(asyncio.sleep(wait_seconds * attempt))
                             continue
                         if refresh_error.code == 220034:
                             if run_id:
@@ -377,9 +458,11 @@ class TaskHandler(ABC):
                             "paused_rate_limit",
                             f"{api_type}_api_error_code_429",
                         )
-                    await self.container.wait_for_rate_limit(
-                        self.container.config.cooldown_seconds_429,
-                        run_id=run_id,
+                    await self._await_api_gate(
+                        self.container.wait_for_rate_limit(
+                            self.container.config.cooldown_seconds_429,
+                            run_id=run_id,
+                        )
                     )
                     if attempt >= attempt_limit:
                         await self.container.block_research_network()
@@ -387,7 +470,7 @@ class TaskHandler(ABC):
                     if run_id:
                         await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
                     wait_seconds = self.container.config.research_retry_wait_seconds
-                    await asyncio.sleep(wait_seconds * attempt)
+                    await self._await_api_gate(asyncio.sleep(wait_seconds * attempt))
                     continue
                 if research_enabled and error.code == 220034:
                     run_id = getattr(self.container, "research_run_id", None)
@@ -404,7 +487,7 @@ class TaskHandler(ABC):
                 if attempt >= attempt_limit:
                     raise
                 wait_seconds = getattr(self.container.config, "research_retry_wait_seconds", 0.5)
-                await asyncio.sleep(_retry_delay(wait_seconds, attempt))
+                await self._await_api_gate(asyncio.sleep(_retry_delay(wait_seconds, attempt)))
 
         raise RuntimeError("Research API retry loop exited without a response.")
 
@@ -418,6 +501,7 @@ class TaskHandler(ABC):
             self.research_enabled
             and self.container.config.fetch_user_forum_info
             and response.source_api in {"aiotieba.get_posts", "aiotieba.get_comments"}
+            and not self._stop_requested()
         ):
             await self._persist_user_forum_snapshots(response, sessionmaker_)
 
@@ -473,13 +557,20 @@ class TaskHandler(ABC):
                 targets.setdefault((fid, user_id), getattr(user, "portrait", None) or None)
 
         for (fid, user_id), portrait in targets.items():
-            await self._fetch_user_forum_snapshot(
-                fetch_user_forum_info,
-                sessionmaker_,
-                fid=fid,
-                user_id=user_id,
-                portrait=portrait,
-            )
+            if self._stop_requested():
+                break
+            try:
+                await self._fetch_user_forum_snapshot(
+                    fetch_user_forum_info,
+                    sessionmaker_,
+                    fid=fid,
+                    user_id=user_id,
+                    portrait=portrait,
+                )
+            except asyncio.CancelledError:
+                if not self._stop_requested():
+                    raise
+                break
 
     async def _fetch_user_forum_snapshot(
         self,
@@ -511,6 +602,10 @@ class TaskHandler(ABC):
             if dto.status != "retryable_failure":
                 break
 
+            if self._stop_requested():
+                await persist_research_page(sessionmaker_, latest_page)
+                return
+
             if dto.error_code == 4011:
                 if run_id:
                     await self.datastore.set_research_run_status_if(
@@ -521,9 +616,11 @@ class TaskHandler(ABC):
                     )
                 self.container.research_auth_ready.clear()
                 try:
-                    latest_page = await self.container.wait_for_auth_refresh(
-                        fetch_or_raise_expected_errors,
-                        run_id=run_id,
+                    latest_page = await self._await_api_gate(
+                        self.container.wait_for_auth_refresh(
+                            fetch_or_raise_expected_errors,
+                            run_id=run_id,
+                        )
                     )
                 except RetriableApiError as error:
                     if error.code == 429:
@@ -572,7 +669,7 @@ class TaskHandler(ABC):
                 raise RetriableApiError(220034, "Research user-forum request was blocked.")
 
             if attempt < attempt_limit:
-                await asyncio.sleep(self.container.config.research_retry_wait_seconds * attempt)
+                await self._await_api_gate(asyncio.sleep(self.container.config.research_retry_wait_seconds * attempt))
                 continue
 
             await persist_research_page(sessionmaker_, latest_page)
@@ -590,9 +687,11 @@ class TaskHandler(ABC):
                 "paused_rate_limit",
                 "user_forum_api_error_code_429",
             )
-        await self.container.wait_for_rate_limit(
-            self.container.config.cooldown_seconds_429,
-            run_id=run_id,
+        await self._await_api_gate(
+            self.container.wait_for_rate_limit(
+                self.container.config.cooldown_seconds_429,
+                run_id=run_id,
+            )
         )
         if attempt >= attempt_limit:
             await self.container.block_research_network()
@@ -610,6 +709,26 @@ class TaskHandler(ABC):
         if run_id and hasattr(self.datastore, "record_research_checkpoint"):
             return await self.datastore.record_research_checkpoint(run_id=run_id, **values)
         return True
+
+    async def _enqueue_missing_web_targets(
+        self,
+        run_id: str | None,
+        *,
+        thread_ids: Sequence[int] = (),
+        post_ids: Sequence[int] = (),
+        comment_ids: Sequence[int] = (),
+    ) -> None:
+        if not self.research_enabled or not run_id or not hasattr(self.datastore, "async_sessionmaker"):
+            return
+        from ..research.web_fallback.live import enqueue_missing_web_targets
+
+        await enqueue_missing_web_targets(
+            self.datastore.async_sessionmaker,
+            run_id,
+            thread_ids=thread_ids,
+            post_ids=post_ids,
+            comment_ids=comment_ids,
+        )
 
     @staticmethod
     def _continuation_from_page(
@@ -730,6 +849,17 @@ class ThreadsTaskHandler(TaskHandler):
 
     async def handle(self, task_content: ScanThreadsTask) -> ThreadPageResult:
         """Fetch one page; the backfill scheduler owns page continuation."""
+        if self._stop_requested():
+            return ThreadPageResult(
+                has_more=False,
+                current_page=task_content.pn,
+                total_pages=0,
+                total_count=0,
+                tids=(),
+                non_top_create_times=(),
+                non_top_tids=(),
+                continuation_json=task_content.continuation_json or {},
+            )
         fname = task_content.fname
         pn = task_content.pn
         is_good = task_content.is_good
@@ -837,6 +967,8 @@ class ThreadsTaskHandler(TaskHandler):
                 continuation_json=continuation_json,
             )
 
+        await self._enqueue_missing_web_targets(run_id, thread_ids=tuple(all_tids))
+
         return ThreadPageResult(
             has_more=threads_data.page.has_more,
             current_page=threads_data.page.current_page,
@@ -933,7 +1065,10 @@ class ThreadsTaskHandler(TaskHandler):
                 fid=thread.fid,
                 fname=thread.fname,
             )
-            await self.router.put(Task(priority=priority, content=new_task_content))
+            if self._stop_requested():
+                continue
+            if not await self._enqueue_task_unless_stopping(Task(priority=priority, content=new_task_content)):
+                continue
             self.log.info("[{}吧] Scheduled FullScanPostsTask for new tid={}", thread.fname, thread.tid)
 
     async def _process_old_threads(self, threads_data: ThreadsDTO, old_tids: set[int], backfill: bool):
@@ -995,9 +1130,12 @@ class ThreadsTaskHandler(TaskHandler):
                     fid=thread_data.fid,
                     fname=thread_data.fname,
                 )
-                await self.router.put(
+                if self._stop_requested():
+                    continue
+                if not await self._enqueue_task_unless_stopping(
                     Task(priority=Priority.BACKFILL_POSTS if backfill else Priority.MEDIUM, content=full_task)
-                )
+                ):
+                    continue
                 self.log.info("[{}吧] Scheduled research detail scan for tid={}", thread_data.fname, thread_data.tid)
             elif stored_thread and thread_data.last_time > stored_thread.last_time:
                 self.log.debug(
@@ -1015,7 +1153,12 @@ class ThreadsTaskHandler(TaskHandler):
                     target_last_time=thread_data.last_time,
                     target_reply_num=thread_data.reply_num,
                 )
-                await self.router.put(Task(priority=priority, content=update_task_content))
+                if self._stop_requested():
+                    continue
+                if not await self._enqueue_task_unless_stopping(
+                    Task(priority=priority, content=update_task_content)
+                ):
+                    continue
                 self.log.info(
                     "[{}吧] Scheduled IncrementalScanPostsTask for updated tid={}",
                     thread_data.fname,
@@ -1219,16 +1362,23 @@ class FullScanPostsTaskHandler(TaskHandler):
                 generation=task.generation,
                 session=session,
             )
-            if not committed:
-                return False, []
-            if not has_more:
+            if committed and not has_more:
                 await self.datastore.remove_pending_thread_scan_in_session(session, task.tid)
+
+        await self._enqueue_missing_web_targets(
+            run_id,
+            thread_ids=(task.tid,) if first_pid > 0 else (),
+            post_ids=tuple(post.pid for post in posts),
+        )
+        if not committed:
+            return False, []
 
         if not task.backfill:
             for post in posts:
                 await self.datastore.push_object_event("post", post)
         for child_task in child_tasks:
-            await self.router.put(Task(priority=parent_priority, content=child_task))
+            if not await self._enqueue_task_unless_stopping(Task(priority=parent_priority, content=child_task)):
+                break
         return True, child_tasks
 
     async def handle(self, task_content: FullScanPostsTask):
@@ -1283,6 +1433,8 @@ class FullScanPostsTaskHandler(TaskHandler):
 
         try:
             while True:
+                if self._stop_requested():
+                    return
                 fetched = await self.get_posts(
                     tid,
                     pn,
@@ -1442,6 +1594,11 @@ class FullScanPostsTaskHandler(TaskHandler):
 
         post_models = [Post.from_dto(p) for p in posts]
         await self.datastore.save_items(post_models)
+        await self._enqueue_missing_web_targets(
+            getattr(self.container, "research_run_id", None),
+            thread_ids=(tid,) if first_pid > 0 else (),
+            post_ids=tuple(post.pid for post in posts),
+        )
 
         priority = Priority.BACKFILL_POSTS if backfill else Priority.LOW
 
@@ -1471,8 +1628,14 @@ class FullScanPostsTaskHandler(TaskHandler):
                     backfill=backfill,
                     parent_kind="reply_post",
                 )
-                await self.router.put(Task(priority=priority, content=comment_task))
-                self.log.info("[{}吧] Scheduled FullScanCommentsTask for pid={} in tid={}", post.fname, post.pid, tid)
+                if not self._stop_requested():
+                    await self._enqueue_task_unless_stopping(Task(priority=priority, content=comment_task))
+                    self.log.info(
+                        "[{}吧] Scheduled FullScanCommentsTask for pid={} in tid={}",
+                        post.fname,
+                        post.pid,
+                        tid,
+                    )
 
         if first_pid > 0:
             for post in page_posts:
@@ -1499,7 +1662,7 @@ class FullScanPostsTaskHandler(TaskHandler):
                     backfill=backfill,
                     task_kind="full",
                 )
-                await self.router.put(
+                await self._enqueue_task_unless_stopping(
                     Task(
                         priority=priority,
                         content=FullScanCommentsTask(
@@ -1543,6 +1706,8 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
             return
 
         try:
+            if self._stop_requested():
+                return
             latest_fetched = await self.get_posts(
                 tid,
                 pn=0xFFFF,
@@ -1566,6 +1731,9 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
             found_new_content = await self._scan_thread_pages(
                 tid, start_pn, rn, stored_last_time, latest_page, backfill
             )
+
+            if self._stop_requested():
+                return
 
             self.log.debug("Finished incremental scan for tid={}.", tid)
 
@@ -1592,7 +1760,7 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                     total_pages=start_pn,
                     expected_new_comments=expected_new,
                 )
-                await self.router.put(Task(priority=Priority.BACKGROUND, content=deep_task))
+                await self._enqueue_task_unless_stopping(Task(priority=Priority.BACKGROUND, content=deep_task))
         except UnretriableApiError as e:
             if e.code == 4:
                 self.log.warning(
@@ -1643,6 +1811,8 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
             if pn == start_pn and initial_page_data:
                 posts_page = initial_page_data
             else:
+                if self._stop_requested():
+                    return found_new_content
                 fetched = await self.get_posts(
                     tid,
                     pn,
@@ -1667,7 +1837,7 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                 self.log.debug("No new posts found on tid={}, pn={}. Stopping scan.", tid, pn)
                 break
 
-        if not found_new_content:
+        if not found_new_content and not self._stop_requested():
             hot_fetched = await self.get_posts(
                 tid,
                 pn=1,
@@ -1715,6 +1885,12 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
 
         tid = posts_page.objs[0].tid if posts_page.objs else None
         current_page = posts_page.page.current_page
+
+        await self._enqueue_missing_web_targets(
+            getattr(self.container, "research_run_id", None),
+            thread_ids=(tid,) if tid is not None else (),
+            post_ids=tuple(post.pid for post in posts),
+        )
 
         found_new_content = bool(new_pids)
 
@@ -1800,13 +1976,14 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                     backfill=backfill,
                     parent_kind="reply_post",
                 )
-                await self.router.put(Task(priority=priority, content=comment_task))
-                self.log.info(
-                    "[{}吧] Scheduled FullScanCommentsTask for new pid={} in tid={}",
-                    post.fname,
-                    post.pid,
-                    post.tid,
-                )
+                if not self._stop_requested():
+                    await self._enqueue_task_unless_stopping(Task(priority=priority, content=comment_task))
+                    self.log.info(
+                        "[{}吧] Scheduled FullScanCommentsTask for new pid={} in tid={}",
+                        post.fname,
+                        post.pid,
+                        post.tid,
+                    )
 
     async def _process_old_posts(self, old_pids: set[int], posts: list[PostDTO], backfill: bool) -> bool:
         """处理已存在的回复，检查是否有更新。
@@ -1869,12 +2046,13 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                         pid=post_data.pid,
                         backfill=backfill,
                     )
-                await self.router.put(Task(priority=priority, content=update_task_content))
-                self.log.info(
-                    "[{}吧] Scheduled IncrementalScanCommentsTask for updated pid={}",
-                    post_data.fname,
-                    post_data.pid,
-                )
+                if not self._stop_requested():
+                    await self._enqueue_task_unless_stopping(Task(priority=priority, content=update_task_content))
+                    self.log.info(
+                        "[{}吧] Scheduled IncrementalScanCommentsTask for updated pid={}",
+                        post_data.fname,
+                        post_data.pid,
+                    )
 
         if posts_to_update:
             post_models = [Post.from_dto(p) for p in posts_to_update]
@@ -2000,7 +2178,12 @@ class FullScanCommentsTaskHandler(TaskHandler):
                 await self.datastore.remove_pending_comment_scan_in_session(
                     session, task.tid, task.pid, task_kind="full"
                 )
-            return committed
+
+        await self._enqueue_missing_web_targets(
+            run_id,
+            comment_ids=tuple(comment.cid for comment in page.objs),
+        )
+        return committed
 
     async def handle(self, task_content: FullScanCommentsTask):
         tid = task_content.tid
@@ -2062,6 +2245,8 @@ class FullScanCommentsTaskHandler(TaskHandler):
 
         try:
             while True:
+                if self._stop_requested():
+                    return
                 fetched = await self.get_comments(tid, pid, pn)
                 page = self._dto(fetched.response)
                 self._validate_terminal_metadata(
@@ -2156,6 +2341,8 @@ class FullScanCommentsTaskHandler(TaskHandler):
                     )
                 if not page.page.has_more:
                     break
+                if self._stop_requested():
+                    return
                 pn += 1
                 if pn % 5 == 0:
                     await asyncio.sleep(0)
@@ -2261,6 +2448,11 @@ class FullScanCommentsTaskHandler(TaskHandler):
         all_cids_on_page = [c.cid for c in comments_page.objs]
         new_cids = await self.datastore.filter_new_ids("comment", all_cids_on_page)
 
+        await self._enqueue_missing_web_targets(
+            getattr(self.container, "research_run_id", None),
+            comment_ids=tuple(all_cids_on_page),
+        )
+
         if not new_cids:
             self.log.debug("No new comments on pid={}, pn={}.", pid, pn)
             return
@@ -2302,6 +2494,8 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
         backfill = task_content.backfill
 
         try:
+            if self._stop_requested():
+                return
             comments_fetched = await self.get_comments(tid, pid)
             comments_page = self._dto(comments_fetched.response)
             await self._persist_research_page(comments_fetched.response)
@@ -2314,6 +2508,8 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
             total_pages = comments_page.page.total_page
 
             await self._scan_comment_pages(tid, pid, total_pages, comments_page, backfill)
+            if self._stop_requested():
+                return
             await self._finalize_comment_scan(tid, pid)
         except UnretriableApiError as e:
             if e.code == 4:
@@ -2357,6 +2553,8 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
             if pn == 1:
                 comments_page = initial_page_data
             else:
+                if self._stop_requested():
+                    return
                 fetched = await self.get_comments(tid, pid, pn)
                 comments_page = self._dto(fetched.response)
                 await self._persist_research_page(fetched.response)
@@ -2386,6 +2584,11 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
         all_cids_on_page = [c.cid for c in comments_page.objs]
         new_cids = await self.datastore.filter_new_ids("comment", all_cids_on_page)
         old_cids = set(all_cids_on_page) - new_cids
+
+        await self._enqueue_missing_web_targets(
+            getattr(self.container, "research_run_id", None),
+            comment_ids=tuple(all_cids_on_page),
+        )
 
         if not new_cids:
             self.log.debug("No new comments on pid={}, pn={}.", pid, pn)
@@ -2497,6 +2700,8 @@ class DeepScanTaskHandler(TaskHandler):
         new_comments_found = 0
 
         for pn in pages:
+            if self._stop_requested():
+                return new_comments_found
             self.log.debug("DeepScan: Scanning tid={}, pn={}.", tid, pn)
 
             fetched = await self.get_posts(
@@ -2509,10 +2714,15 @@ class DeepScanTaskHandler(TaskHandler):
             )
             posts_page = self._dto(fetched.response)
             await self._persist_research_page(fetched.response)
-
             if not posts_page or not posts_page.objs:
                 self.log.warning("DeepScan: No posts found on tid={}, pn={}.", tid, pn)
                 continue
+
+            await self._enqueue_missing_web_targets(
+                getattr(self.container, "research_run_id", None),
+                thread_ids=(tid,),
+                post_ids=tuple(post.pid for post in posts_page.objs if post.floor != 1),
+            )
 
             updates = await self._check_posts_for_comment_updates(posts_page.objs)
             new_comments_found += updates
@@ -2591,7 +2801,7 @@ class DeepScanTaskHandler(TaskHandler):
                             pid=post.pid,
                             backfill=False,
                         )
-                    await self.router.put(Task(priority=Priority.MEDIUM, content=update_task))
+                    await self._enqueue_task_unless_stopping(Task(priority=Priority.MEDIUM, content=update_task))
                     self.log.info(
                         "DeepScan: Scheduled IncrementalScanCommentsTask for pid={} in tid={}.",
                         post.pid,
@@ -2681,16 +2891,66 @@ class Worker:
         self.container = container
         self.datastore = datastore
         self.log = logger.bind(worker_id=worker_id, lane=lane)
+        self._stop_event = asyncio.Event()
 
         # 初始化任务处理器
         self.handlers = {
-            ScanThreadsTask: ThreadsTaskHandler(worker_id, container, datastore, router),
-            FullScanPostsTask: FullScanPostsTaskHandler(worker_id, container, datastore, router),
-            IncrementalScanPostsTask: IncrementalScanPostsTaskHandler(worker_id, container, datastore, router),
-            FullScanCommentsTask: FullScanCommentsTaskHandler(worker_id, container, datastore, router),
-            IncrementalScanCommentsTask: IncrementalScanCommentsTaskHandler(worker_id, container, datastore, router),
-            DeepScanTask: DeepScanTaskHandler(worker_id, container, datastore, router),
+            ScanThreadsTask: ThreadsTaskHandler(worker_id, container, datastore, router, stop_event=self._stop_event),
+            FullScanPostsTask: FullScanPostsTaskHandler(
+                worker_id, container, datastore, router, stop_event=self._stop_event
+            ),
+            IncrementalScanPostsTask: IncrementalScanPostsTaskHandler(
+                worker_id, container, datastore, router, stop_event=self._stop_event
+            ),
+            FullScanCommentsTask: FullScanCommentsTaskHandler(
+                worker_id, container, datastore, router, stop_event=self._stop_event
+            ),
+            IncrementalScanCommentsTask: IncrementalScanCommentsTaskHandler(
+                worker_id, container, datastore, router, stop_event=self._stop_event
+            ),
+            DeepScanTask: DeepScanTaskHandler(
+                worker_id, container, datastore, router, stop_event=self._stop_event
+            ),
         }
+
+    def stop_after_current(self) -> None:
+        """Finish the active API page, then stop before another request or task."""
+        self._stop_event.set()
+
+    async def _get_next_task(self) -> Task | None:
+        if self._stop_event.is_set():
+            return None
+        queue_get = asyncio.create_task(self.queue.get())
+        stop_wait = asyncio.create_task(self._stop_event.wait())
+        task: Task | None = None
+        transferred = False
+        try:
+            done, _pending = await asyncio.wait(
+                {queue_get, stop_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if queue_get in done:
+                task = queue_get.result()
+                if self._stop_event.is_set():
+                    return None
+                transferred = True
+                return task
+            return None
+        finally:
+            if not queue_get.done():
+                queue_get.cancel()
+            await asyncio.gather(queue_get, return_exceptions=True)
+            if not transferred and not queue_get.cancelled():
+                if task is None:
+                    try:
+                        task = queue_get.result()
+                    except BaseException:
+                        task = None
+                if task is not None:
+                    self.queue.task_done(task)
+            if not stop_wait.done():
+                stop_wait.cancel()
+            await asyncio.gather(stop_wait, return_exceptions=True)
 
     async def run(self):
         """工作器主循环，持续从队列中获取并处理任务。"""
@@ -2701,7 +2961,9 @@ class Worker:
             while True:
                 task: Task | None = None
                 try:
-                    task = await self.queue.get()
+                    task = await self._get_next_task()
+                    if task is None:
+                        break
                     self.log.debug(
                         "Got task: {} with priority {}.", task.content.__class__.__name__, task.priority.name
                     )
@@ -2738,7 +3000,12 @@ class Worker:
             completion = getattr(content, "completion", None)
             with TASK_DURATION.labels(type=task_type).time():
                 try:
-                    result = await handler.handle(content)
+                    api_stop_guard = getattr(getattr(self.container, "semaphore", None), "api_stop_guard", None)
+                    if api_stop_guard is None:
+                        result = await handler.handle(content)
+                    else:
+                        async with api_stop_guard(self._stop_event):
+                            result = await handler.handle(content)
                 except asyncio.CancelledError:
                     if completion is not None and not completion.done():
                         completion.cancel()

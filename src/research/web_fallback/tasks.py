@@ -21,6 +21,7 @@ from src.core.models import (
 )
 from src.research.models import (
     ResearchComment,
+    ResearchContentObservation,
     ResearchPost,
     ResearchThread,
     ResearchWebEnrichmentAttempt,
@@ -63,6 +64,31 @@ LEGACY_WEB_FIELD_TYPES: dict[str, type] = {
     "share_count": int,
     "forum_level_icon_ref": str,
 }
+
+_ZERO_UNKNOWN_REASONS = frozenset(
+    {
+        "zero_presence_unverified",
+        "zero_presence_unverified_in_parsed_object",
+    }
+)
+_GROWTH_FIELDS = frozenset({"global_growth_level", "global_growth_icon_url"})
+_CONTENT_MARKERS = {
+    "thread": ("thread_first_post", "aiotieba.get_posts"),
+    "post": ("post", "aiotieba.get_posts"),
+    "comment": ("comment", "aiotieba.get_comments"),
+}
+_THREAD_LIST_METADATA_FIELDS = frozenset(
+    {
+        "author_user_name",
+        "author_nickname",
+        "author_portrait",
+        "forum_level",
+        "global_growth_level",
+        "global_growth_icon_url",
+        "is_bawu",
+        "ip_location_text",
+    }
+)
 
 _TARGET_FIELDS: dict[str, frozenset[str]] = {
     "thread": frozenset(
@@ -162,6 +188,7 @@ class WebEnrichmentTaskLease:
     target_observed_at: datetime
     scope_generation: int
     parent_scope_generation: int | None
+    max_attempts: int
 
 
 def _target_fields(target_type: str) -> frozenset[str]:
@@ -187,6 +214,74 @@ def _normalize_requested_fields(fields: Sequence[str], target_type: str | None =
                 f"Fields unsupported for {target_type}: {', '.join(sorted(unsupported))}."
             )
     return normalized
+
+
+def _unknown_canonical_value(current: Any, field_name: str, missing_reasons: dict[str, Any]) -> bool:
+    if current is None:
+        return True
+    if field_name == "global_growth_level" and isinstance(current, int) and not isinstance(current, bool):
+        return current <= 0
+    if field_name in {"global_growth_icon_url", "ip_location_text"} and isinstance(current, str):
+        if not current.strip():
+            return True
+    if missing_reasons.get(field_name) not in _ZERO_UNKNOWN_REASONS:
+        return False
+    if isinstance(current, bool):
+        return field_name == "is_bawu" and current is False
+    return isinstance(current, int) and current == 0
+
+
+def _unknown_requested_fields(row: Any, fields: Sequence[str], *, pair_growth_fields: bool) -> tuple[str, ...]:
+    missing_reasons = dict(getattr(row, "missing_reasons_json", None) or {})
+    output = [
+        name
+        for name in fields
+        if name not in _GROWTH_FIELDS
+        and _unknown_canonical_value(getattr(row, name, None), name, missing_reasons)
+    ]
+    requested_growth = set(fields) & _GROWTH_FIELDS
+    if requested_growth:
+        growth_unknown = {
+            name
+            for name in (_GROWTH_FIELDS if pair_growth_fields else requested_growth)
+            if _unknown_canonical_value(getattr(row, name, None), name, missing_reasons)
+        }
+        if pair_growth_fields and growth_unknown == _GROWTH_FIELDS:
+            output.extend(sorted(_GROWTH_FIELDS))
+        elif not pair_growth_fields:
+            output.extend(sorted(growth_unknown))
+    return tuple(sorted(set(output)))
+
+
+def _content_marker_matches(
+    row: Any,
+    target_type: str,
+    target_id: int,
+    marker: ResearchContentObservation | None,
+) -> bool:
+    if marker is None:
+        return False
+    owner_type, expected_source = _CONTENT_MARKERS[target_type]
+    return (
+        marker.owner_type == owner_type
+        and marker.owner_id == target_id
+        and marker.tid == row.tid
+        and marker.source_api == expected_source
+        and getattr(row, "source_api", None) == expected_source
+        and _now(marker.observed_at) == _now(row.observed_at)
+    )
+
+
+def _thread_list_metadata_matches(row: Any, tid: int) -> bool:
+    return (
+        row.tid == tid
+        and getattr(row, "source_api", None) == "aiotieba.get_threads"
+        and getattr(row, "author_user_id", None) is not None
+        and row.author_user_id > 0
+        and getattr(row, "fid", None) is not None
+        and row.fid > 0
+        and getattr(row, "observed_at", None) is not None
+    )
 
 
 def _now(value: datetime | None) -> datetime:
@@ -255,11 +350,15 @@ async def enqueue_web_enrichment_tasks(
     dry_run: bool = False,
     priority: int = 0,
     max_attempts: int = 3,
+    only_missing_fields: bool = False,
+    pair_growth_fields: bool = False,
 ) -> EnqueueSummary:
     """Create deduplicated field tasks only for content represented in this run.
 
-    Detail scopes that are not complete remain durable as ``pending_api_detail``;
-    they become leaseable after a later enqueue sees the same proof complete.
+    Incomplete detail scopes can be leased only when the exact stored target has
+    a complete content snapshot marker or a verified list row requests author
+    metadata; the run scope and its generation still fence the task. Optionally
+    restrict requests to fields that remain unknown.
     """
     if target_type is not None and target_type not in _TARGET_FIELDS:
         raise ValueError(f"Unsupported web target type: {target_type}.")
@@ -270,6 +369,8 @@ async def enqueue_web_enrichment_tasks(
         raise ValueError("limit must be a positive integer.")
     if max_attempts < 1:
         raise ValueError("max_attempts must be positive.")
+    if not isinstance(only_missing_fields, bool) or not isinstance(pair_growth_fields, bool):
+        raise ValueError("only_missing_fields and pair_growth_fields must be booleans.")
     if isinstance(priority, bool) or not isinstance(priority, int):
         raise ValueError("priority must be an integer.")
     ids = None if target_ids is None else {_positive_target_id(value) for value in target_ids}
@@ -312,9 +413,11 @@ async def enqueue_web_enrichment_tasks(
         type_order = (target_type,) if target_type else ("thread", "post", "comment")
         for current_type in type_order:
             applicable_fields = tuple(field for field in requested if field in _target_fields(current_type))
+            if pair_growth_fields and set(applicable_fields) & _GROWTH_FIELDS:
+                applicable_fields = tuple(sorted(set(applicable_fields) | _GROWTH_FIELDS))
             if not applicable_fields:
                 continue
-            if target_type is not None and applicable_fields != requested:
+            if target_type is not None and set(requested) - _target_fields(current_type):
                 raise ValueError(f"Some requested fields are unsupported for {current_type}.")
             valid_tids = sorted(thread_scopes)
             stmt = None
@@ -358,9 +461,23 @@ async def enqueue_web_enrichment_tasks(
                 if parent_pid_filter is not None:
                     stmt = stmt.where(ResearchComment.parent_post_pid == parent_pid_filter)
                 stmt = stmt.order_by(ResearchComment.tid, ResearchComment.parent_post_pid, ResearchComment.cid)
-            if limit is not None:
-                stmt = stmt.limit(limit)
             entities = (await session.scalars(stmt)).all()
+            marker_owner_type = _CONTENT_MARKERS[current_type][0]
+            entity_ids = [
+                row.tid if current_type == "thread" else row.pid if current_type == "post" else row.cid
+                for row in entities
+            ]
+            content_markers: dict[int, ResearchContentObservation] = {}
+            if entity_ids:
+                marker_rows = (
+                    await session.scalars(
+                        select(ResearchContentObservation).where(
+                            ResearchContentObservation.owner_type == marker_owner_type,
+                            ResearchContentObservation.owner_id.in_(entity_ids),
+                        )
+                    )
+                ).all()
+                content_markers = {marker.owner_id: marker for marker in marker_rows}
 
             for row in entities:
                 target_tid = row.tid
@@ -403,7 +520,25 @@ async def enqueue_web_enrichment_tasks(
                     target_id, pid, cid, target_parent_pid = row.pid, row.pid, None, None
                 else:
                     target_id, pid, cid, target_parent_pid = row.cid, None, row.cid, row.parent_post_pid
-                field_names = tuple(applicable_fields)
+                field_names = (
+                    _unknown_requested_fields(
+                        row,
+                        applicable_fields,
+                        pair_growth_fields=pair_growth_fields,
+                    )
+                    if only_missing_fields
+                    else tuple(applicable_fields)
+                )
+                if not field_names:
+                    skipped["requested_fields_already_known"] = skipped.get(
+                        "requested_fields_already_known", 0
+                    ) + 1
+                    continue
+                marker = content_markers.get(target_id)
+                marker_proves_target = _content_marker_matches(row, current_type, target_id, marker)
+                list_thread_proves_target = (
+                    current_type == "thread" and _thread_list_metadata_matches(row, target_tid)
+                )
                 key = _task_key(
                     run_id=run_id,
                     target_type=current_type,
@@ -420,8 +555,13 @@ async def enqueue_web_enrichment_tasks(
                     scope_generation=parent_scope.generation if parent_scope else thread_scope.generation,
                     parent_scope_generation=thread_scope.generation if parent_scope else None,
                 )
-                ready = thread_scope.status == "completed" and (
-                    parent_scope is None or parent_scope.status == "completed"
+                ready = (
+                    thread_scope.status == "completed"
+                    and (parent_scope is None or parent_scope.status == "completed")
+                ) or marker_proves_target or (
+                    list_thread_proves_target
+                    and current_type == "thread"
+                    and set(field_names).issubset(_THREAD_LIST_METADATA_FIELDS)
                 )
                 planned.append(
                     {
@@ -457,33 +597,14 @@ async def enqueue_web_enrichment_tasks(
                         "updated_at": now,
                     }
                 )
-        planned.sort(key=operator.itemgetter("target_type", "target_id", "task_key"))
+        planned.sort(
+            key=operator.itemgetter("target_type", "tid", "target_id", "task_key")
+        )
         if limit is not None:
             planned = planned[:limit]
 
-        plans = tuple(
-            WebEnrichmentTargetPlan(
-                task_key=task["task_key"],
-                target_type=task["target_type"],
-                target_id=task["target_id"],
-                tid=task["tid"],
-                pid=task["pid"],
-                cid=task["cid"],
-                parent_post_pid=task["parent_post_pid"],
-                author_user_id=task["author_user_id"],
-                author_portrait=task["author_portrait"],
-                fid=task["fid"],
-                requested_fields=tuple(task["requested_fields_json"]),
-                target_observed_at=task["target_observed_at"],
-                scope_generation=task["scope_generation"],
-                parent_scope_generation=task["parent_scope_generation"],
-                eligibility_status=task["status"],
-                field_statuses=task["field_statuses_json"],
-            )
-            for task in planned
-        )
-
         if dry_run or not planned:
+            plans = _planned_targets(planned)
             return EnqueueSummary(
                 run_id,
                 len(planned),
@@ -514,13 +635,52 @@ async def enqueue_web_enrichment_tasks(
                 .where(ResearchWebEnrichmentTask.task_key == key)
                 .with_for_update()
             )
-            if existing is not None and existing.status == "pending_api_detail" and task["status"] == "pending_web":
-                existing.status = "pending_web"
-                existing.updated_at = now
-                existing.last_error_type = None
-                existing.last_error = None
+            if existing is not None and task["status"] == "pending_web":
+                if existing.status == "pending_api_detail":
+                    existing.status = "pending_web"
+                elif existing.status == "partially_completed":
+                    if existing.attempts < existing.max_attempts:
+                        existing.status = "pending_web"
+                        existing.field_statuses_json = {
+                            name: {"status": "pending", "reason": None}
+                            for name in task["requested_fields_json"]
+                        }
+                        existing.completed_at = None
+                    else:
+                        existing.status = "failed_final"
+                        task["status"] = "failed_final"
+                if existing.status == "pending_web":
+                    existing.updated_at = now
+                    existing.last_error_type = None
+                    existing.last_error = None
+
+        plans = _planned_targets(planned)
 
     return EnqueueSummary(run_id, len(planned), created, deduplicated, skipped, tuple(task_keys), plans)
+
+
+def _planned_targets(planned: Sequence[dict[str, Any]]) -> tuple[WebEnrichmentTargetPlan, ...]:
+    return tuple(
+        WebEnrichmentTargetPlan(
+            task_key=task["task_key"],
+            target_type=task["target_type"],
+            target_id=task["target_id"],
+            tid=task["tid"],
+            pid=task["pid"],
+            cid=task["cid"],
+            parent_post_pid=task["parent_post_pid"],
+            author_user_id=task["author_user_id"],
+            author_portrait=task["author_portrait"],
+            fid=task["fid"],
+            requested_fields=tuple(task["requested_fields_json"]),
+            target_observed_at=task["target_observed_at"],
+            scope_generation=task["scope_generation"],
+            parent_scope_generation=task["parent_scope_generation"],
+            eligibility_status=task["status"],
+            field_statuses=task["field_statuses_json"],
+        )
+        for task in planned
+    )
 
 
 async def plan_web_enrichment_targets(
@@ -607,6 +767,9 @@ async def lease_web_enrichment_tasks(
             .order_by(
                 ResearchWebEnrichmentTask.priority.desc(),
                 ResearchWebEnrichmentTask.created_at,
+                ResearchWebEnrichmentTask.target_type,
+                ResearchWebEnrichmentTask.tid,
+                ResearchWebEnrichmentTask.target_id,
                 ResearchWebEnrichmentTask.task_key,
             )
             .limit(limit)
@@ -656,6 +819,7 @@ async def lease_web_enrichment_tasks(
                     target_observed_at=task.target_observed_at,
                     scope_generation=task.scope_generation,
                     parent_scope_generation=task.parent_scope_generation,
+                    max_attempts=task.max_attempts,
                 )
             )
         # Expired jobs at the retry bound cannot be leased again.

@@ -5,6 +5,7 @@ from urllib.parse import urlencode
 
 import pytest
 
+from src.research.web_fallback.dom import extract_comment_author_growth
 from src.research.web_fallback.identity import Target, make_request_context
 from src.research.web_fallback.network import extract_nested_floor
 
@@ -111,6 +112,31 @@ def _extract(payload, *, target: Target | None = None, context=None, status=200)
     )
 
 
+def _comment_author_growth_html():
+    return f"""
+    <html><body>
+      <div class="pb-content-wrap">
+        <div class="richtext-item"><span tid="{TID}" fid="{FID}" index="1"></span></div>
+      </div>
+      <div class="pb-comment-item" data-id="{POST_ID}">
+        <div class="comment-content"><div class="lzl-wrapper">
+          <div class="pb-lzl-item" data-cid="9007199254740994">
+            <div class="head-line user-info">
+              <div class="name-info">
+                <a class="head-name" href="https://tieba.baidu.com/home/main?id=tb.1.synthetic">作者</a>
+              </div>
+              <span class="icon_tshows tooltip__reference" aria-describedby="growth-tip">
+                <img class="icon_tshows_img" src="https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp">
+              </span>
+            </div>
+            <div id="growth-tip">贴吧成长等级：Lv. 6</div>
+          </div>
+        </div></div>
+      </div>
+    </body></html>
+    """
+
+
 def test_nested_floor_uses_python_raw_json_ids_and_explicit_zero_presence():
     result = _extract(_payload())
 
@@ -130,6 +156,11 @@ def test_nested_floor_uses_python_raw_json_ids_and_explicit_zero_presence():
     assert candidates["author_nickname"].identity.context_id == "request-capture-1"
     assert candidates["author_nickname"].identity.author_user_id == AUTHOR_ID
     assert candidates["author_nickname"].identity.fid == FID
+    assert "request_parent_post_pid" in candidates["author_nickname"].identity.match_methods
+    assert "response_cid" in candidates["author_nickname"].identity.match_methods
+    assert "response_author_id" in candidates["author_nickname"].identity.match_methods
+    assert "response_forum_id" not in candidates["author_nickname"].identity.match_methods
+    assert "response_parent_post_id" not in candidates["author_nickname"].identity.match_methods
     assert "request_fid" in candidates["author_nickname"].identity.match_methods
     assert "response_fid" in candidates["author_nickname"].identity.match_methods
     assert "author_nickname" not in result.field_outcomes
@@ -213,6 +244,7 @@ def test_nested_floor_growth_icon_url_requires_structured_growth_semantics(asset
         ({"cid": "9007199254740994"}, "cid_missing_from_response"),
         ({"author_id": "77004", "nested_author_id": "77004"}, "response_author_id_mismatch"),
         ({"author_id": "77003", "nested_author_id": "77004"}, "response_author_id_disagreement"),
+        ({"author_id": "malformed", "nested_author_id": "malformed"}, "invalid_response_author_id"),
         ({"fid": "121"}, "response_fid_mismatch"),
     ],
 )
@@ -222,6 +254,62 @@ def test_nested_floor_identity_mismatch_never_emits_candidates(kwargs, reason):
     assert result.identity_verified is False
     assert result.reason == reason
     assert result.candidates == ()
+
+
+@pytest.mark.parametrize(
+    ("alias", "value", "reason"),
+    [
+        ("tid", "9999", "response_tid_mismatch"),
+        ("thread_id", "9999", "response_tid_mismatch"),
+        ("forum_id", "9999", "response_fid_mismatch"),
+        ("parent_post_id", "9999", "response_parent_pid_mismatch"),
+        ("pid", "9999", "response_parent_identity_mismatch"),
+        ("post_id", "9999", "response_parent_identity_mismatch"),
+    ],
+)
+def test_nested_floor_rejects_exposed_conflicting_context_aliases(alias, value, reason):
+    payload = _payload()
+    payload["data"]["post_list"][0][alias] = value
+
+    result = _extract(payload)
+
+    assert result.status == "identity_unverified"
+    assert result.reason == reason
+    assert result.identity_evidence is None
+    assert result.candidates == ()
+
+
+def test_nested_floor_identity_composes_with_comment_author_growth_without_body_parent_proof():
+    target = _target(requested_fields=("global_growth_level", "global_growth_icon_url"))
+    payload = _payload()
+    payload["data"]["post_list"][0]["author"].pop("user_growth")
+    network_result = _extract(payload, target=target)
+    assert network_result.status == "ok"
+    assert network_result.candidates == ()
+    assert network_result.identity_evidence is not None
+    assert "request_parent_post_pid" in network_result.identity_evidence.match_methods
+    assert "response_cid" in network_result.identity_evidence.match_methods
+    assert "response_author_id" in network_result.identity_evidence.match_methods
+    assert "response_parent_post_id" not in network_result.identity_evidence.match_methods
+    assert "response_sub_post_list_pid" not in network_result.identity_evidence.match_methods
+
+    dom_result = extract_comment_author_growth(
+        target,
+        f"https://tieba.baidu.com/p/{TID}?pid=123&pn=74",
+        _comment_author_growth_html(),
+        network_result.identity_evidence,
+    )
+    candidates = {candidate.field_name: candidate for candidate in dom_result.candidates}
+
+    assert dom_result.status == "ok"
+    assert dom_result.identity_verified is True
+    assert candidates["global_growth_level"].normalized_value == 6
+    assert candidates["global_growth_icon_url"].normalized_value == (
+        "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp"
+    )
+    assert all(candidate.source_url == f"https://tieba.baidu.com/p/{TID}" for candidate in candidates.values())
+    assert all("request_parent_post_pid" in c.identity.match_methods for c in candidates.values())
+    assert all("same_author_profile_growth" in c.identity.match_methods for c in candidates.values())
 
 
 @pytest.mark.parametrize(

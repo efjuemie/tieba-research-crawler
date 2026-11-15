@@ -178,10 +178,12 @@ fetch_user_forum_info = false
 max_api_retries = 3
 retry_wait_seconds = 0.5
 
-# 仅在显式 field-backfill / web-audit 命令中使用；所有请求仍共用 rate_limit.global_rps。
+# 自动网页补采和显式 field-backfill / web-audit 命令共用这些设置。
 [web_fallback]
-# 每次目标任务最多访问一个页面，并最多自然展开一次。
+# 项目专用隔离浏览器资料目录；可按本机需要覆盖，不要使用个人 Chrome Profile。
+browser_profile = "data/web-fallback-profile"
+# 每个目标最多访问一个页面，并最多自然展开十次；可在本机配置中调低。
 max_pages = 1
-max_expansions = 1
-# 每个目标浏览器任务的超时秒数。
-timeout_seconds = 30.0
+max_expansions = 10
+# 每个目标浏览器任务的超时秒数；可在本机配置中调低。
+timeout_seconds = 90.0

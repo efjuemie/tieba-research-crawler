@@ -10,19 +10,31 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+
+from src.research.models import (
+    ResearchComment,
+    ResearchPost,
+    ResearchThread,
+    ResearchWebEnrichmentTask,
+)
 
 from .identity import Target
 from .tasks import (
+    _GROWTH_FIELDS,
     WebEnrichmentTargetPlan,
+    _unknown_canonical_value,
     enqueue_web_enrichment_tasks,
     lease_web_enrichment_tasks,
     plan_web_enrichment_targets,
     resume_web_enrichment_tasks,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +59,20 @@ class FieldBackfillSummary:
     partial_count: int
     stopped_reason: str | None
     skipped: dict[str, int]
+    diagnostics: dict[str, int | float]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class WebWorkerSummary:
+    run_ids: tuple[str, ...]
+    collected_count: int
+    completed_count: int
+    partial_count: int
+    unresolved_count: int
+    stopped_reason: str | None
     diagnostics: dict[str, int | float]
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,6 +131,21 @@ def _target_from_plan(plan: WebEnrichmentTargetPlan) -> Target:
     )
 
 
+def _target_from_lease(lease: Any) -> Target:
+    return Target(
+        target_type=lease.target_type,
+        target_id=lease.target_id,
+        tid=lease.tid,
+        fid=lease.fid,
+        pid=lease.pid,
+        cid=lease.cid,
+        parent_post_pid=lease.parent_post_pid,
+        author_user_id=lease.author_user_id,
+        author_portrait=lease.author_portrait,
+        requested_fields=tuple(lease.requested_fields),
+    )
+
+
 async def run_field_backfill(
     sessions: Any,
     run_id: str,
@@ -140,6 +181,8 @@ async def run_field_backfill(
             limit=limit,
             dry_run=True,
             max_attempts=max_attempts,
+            only_missing_fields=True,
+            pair_growth_fields=True,
         )
     else:
         summary = await enqueue_web_enrichment_tasks(
@@ -150,6 +193,8 @@ async def run_field_backfill(
             limit=limit,
             dry_run=False,
             max_attempts=max_attempts,
+            only_missing_fields=True,
+            pair_growth_fields=True,
         )
     plans = tuple(summary.planned_targets)
     eligible = tuple(plan for plan in plans if plan.eligibility_status == "pending_web")
@@ -232,11 +277,19 @@ async def run_field_backfill(
                     candidates,
                     field_outcomes=outcomes,
                     diagnostics=getattr(result, "diagnostics", {}),
+                    identity_verified=getattr(result, "identity_verified", None),
+                    identity_methods=getattr(result, "identity_methods", ()),
                 )
                 if getattr(reconciled, "status", None) == "completed":
                     completed += 1
                 else:
                     partial += 1
+                    retry_summary = await _enqueue_remaining_fields(sessions, lease)
+                    for retry_plan in retry_summary.planned_targets:
+                        if retry_plan.eligibility_status == "pending_web":
+                            plan_by_key[retry_plan.task_key] = retry_plan
+                            if retry_plan.task_key not in remaining_keys:
+                                remaining_keys.append(retry_plan.task_key)
                 continue
 
             task_status = _task_failure_status(status, reason)
@@ -301,6 +354,474 @@ async def run_field_backfill(
         stopped_reason=stopped_reason,
         skipped=dict(summary.skipped),
         diagnostics=dict(diagnostic_counts),
+    )
+
+
+async def _enqueue_remaining_fields(sessions: Any, lease: Any):
+    options: dict[str, Any] = {
+        "target_type": lease.target_type,
+        "target_ids": (lease.target_id,),
+        "tid": lease.tid,
+        "fid": lease.fid,
+        "limit": 1,
+        "max_attempts": lease.max_attempts,
+        "only_missing_fields": True,
+        "pair_growth_fields": True,
+    }
+    if lease.target_type == "comment":
+        options["parent_pid"] = lease.parent_post_pid
+    return await enqueue_web_enrichment_tasks(
+        sessions,
+        lease.run_id,
+        lease.requested_fields,
+        **options,
+    )
+
+
+async def _process_durable_web_lease(sessions: Any, provider: Any, lease: Any):
+    result = await provider.collect(_target_from_lease(lease))
+    status = getattr(result, "status", "failed_retryable")
+    reason = getattr(result, "reason", None)
+    diagnostics = getattr(result, "diagnostics", {})
+    if status == "ok":
+        candidates = tuple(getattr(result, "candidates", ()))
+        outcomes = _not_observed_outcomes(
+            lease.requested_fields,
+            candidates,
+            getattr(result, "field_outcomes", None),
+        )
+        reconciled = await _complete_task(
+            sessions,
+            lease.task_key,
+            lease.lease_token,
+            candidates,
+            field_outcomes=outcomes,
+            diagnostics=diagnostics,
+            identity_verified=getattr(result, "identity_verified", None),
+            identity_methods=getattr(result, "identity_methods", ()),
+        )
+        return getattr(reconciled, "status", "partially_completed"), result
+
+    task_status = _task_failure_status(status, reason)
+    await _fail_task(
+        sessions,
+        lease.task_key,
+        lease.lease_token,
+        status=task_status,
+        reason_code=_safe_reason(reason or status),
+        field_outcomes=_failure_outcomes(lease.requested_fields, status, reason),
+        diagnostics=diagnostics,
+        retry_after=30 if task_status == "failed_retryable" else None,
+    )
+    return task_status, result
+
+
+async def _lease_one_web_task(sessions: Any, run_ids: Sequence[str], worker_id: str):
+    for run_id in run_ids:
+        leases = await lease_web_enrichment_tasks(
+            sessions,
+            run_id,
+            worker_id,
+            limit=1,
+        )
+        if leases:
+            return leases[0]
+    return None
+
+
+async def _snapshot_run_ids(run_ids: Sequence[str] | Callable[[], Sequence[str]]) -> tuple[str, ...]:
+    values = run_ids() if callable(run_ids) else run_ids
+    if asyncio.iscoroutine(values):
+        values = await values
+    if isinstance(values, str):
+        values = (values,)
+    return tuple(dict.fromkeys(value for value in values if isinstance(value, str) and value))
+
+
+async def _count_unresolved_web_tasks(sessions: Any, run_ids: Sequence[str]) -> int:
+    if not run_ids:
+        return 0
+    async with sessions() as session:
+        tasks = (
+            await session.scalars(
+                select(ResearchWebEnrichmentTask).where(
+                    ResearchWebEnrichmentTask.run_id.in_(tuple(run_ids))
+                )
+            )
+        ).all()
+        models = {
+            "thread": (ResearchThread, ResearchThread.tid),
+            "post": (ResearchPost, ResearchPost.pid),
+            "comment": (ResearchComment, ResearchComment.cid),
+        }
+        rows_by_type: dict[str, dict[int, Any]] = {}
+        for target_type, (model, id_column) in models.items():
+            target_ids = {
+                task.target_id
+                for task in tasks
+                if task.target_type == target_type and task.status == "partially_completed"
+            }
+            if not target_ids:
+                rows_by_type[target_type] = {}
+                continue
+            rows = (
+                await session.scalars(select(model).where(id_column.in_(target_ids)))
+            ).all()
+            rows_by_type[target_type] = {
+                getattr(row, id_column.key): row for row in rows
+            }
+
+    unresolved = 0
+    for task in tasks:
+        if task.status == "completed":
+            continue
+        if task.status == "partially_completed" and _partial_task_fields_satisfied(
+            task, rows_by_type.get(task.target_type, {}).get(task.target_id)
+        ):
+            continue
+        unresolved += 1
+    return unresolved
+
+
+def _partial_task_fields_satisfied(task: Any, row: Any | None) -> bool:
+    if (
+        row is None
+        or row.tid != task.tid
+        or row.author_user_id != task.author_user_id
+        or row.fid != task.fid
+        or _utc_datetime(row.observed_at) != _utc_datetime(task.target_observed_at)
+        or (
+            task.target_type == "comment"
+            and row.parent_post_pid != task.parent_post_pid
+        )
+    ):
+        return False
+    requested = tuple(task.requested_fields_json)
+    if not requested:
+        return False
+    field_statuses = dict(task.field_statuses_json or {})
+    if any(
+        isinstance(field_statuses.get(name), dict)
+        and field_statuses[name].get("status") == "conflict"
+        for name in requested
+    ):
+        return False
+    missing_reasons = dict(row.missing_reasons_json or {})
+    requested_growth = set(requested) & _GROWTH_FIELDS
+    if requested_growth and not any(
+        not _unknown_canonical_value(getattr(row, name, None), name, missing_reasons)
+        for name in _GROWTH_FIELDS
+    ):
+        return False
+    return all(
+        not _unknown_canonical_value(getattr(row, name, None), name, missing_reasons)
+        for name in requested
+        if name not in _GROWTH_FIELDS
+    )
+
+
+async def _next_retry_delay(sessions: Any, run_ids: Sequence[str]) -> float | None:
+    if not run_ids:
+        return None
+    now = datetime.now(UTC)
+    async with sessions() as session:
+        retry_at = await session.scalar(
+            select(func.min(ResearchWebEnrichmentTask.next_retry_at)).where(
+                ResearchWebEnrichmentTask.run_id.in_(tuple(run_ids)),
+                ResearchWebEnrichmentTask.status == "failed_retryable",
+                ResearchWebEnrichmentTask.next_retry_at.is_not(None),
+            )
+        )
+        lease_until = await session.scalar(
+            select(func.min(ResearchWebEnrichmentTask.lease_until)).where(
+                ResearchWebEnrichmentTask.run_id.in_(tuple(run_ids)),
+                ResearchWebEnrichmentTask.status == "running",
+                ResearchWebEnrichmentTask.lease_until.is_not(None),
+            )
+        )
+    future = [
+        value
+        for value in (retry_at, lease_until)
+        if value is not None and _utc_datetime(value) is not None and _utc_datetime(value) > now
+    ]
+    if not future:
+        return None
+    return max(0.0, min((_utc_datetime(value) - now).total_seconds() for value in future))
+
+
+async def _confirm_login_or_stop(
+    provider: Any,
+    stop_event: Any | None,
+    *,
+    confirmation: Any | None = None,
+) -> bool:
+    confirm = asyncio.create_task(
+        _confirm_manual_login(provider, 24 * 60 * 60, confirmation=confirmation)
+    )
+    stopped = asyncio.create_task(stop_event.wait()) if stop_event is not None else None
+    children = tuple(task for task in (confirm, stopped) if task is not None)
+    try:
+        if stopped is None:
+            return bool(await confirm)
+        done, _pending = await asyncio.wait(
+            children,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stopped in done:
+            return False
+        return bool(await confirm)
+    finally:
+        for task in children:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*children, return_exceptions=True)
+
+
+async def drain_pending_web_enrichment(
+    sessions: Any,
+    run_ids: Sequence[str],
+    *,
+    provider: Any,
+    wait_for_login: bool = True,
+    login_confirmation: Any | None = None,
+) -> WebWorkerSummary:
+    """Drain durable web tasks across runs using one caller-owned provider."""
+    normalized_run_ids = await _snapshot_run_ids(run_ids)
+    collected = 0
+    completed = 0
+    partial = 0
+    diagnostics: Counter[str] = Counter()
+    stopped_reason = None
+    login_resumed: set[str] = set()
+
+    while normalized_run_ids:
+        lease = await _lease_one_web_task(sessions, normalized_run_ids, "live-web-fallback")
+        if lease is None:
+            retry_delay = await _next_retry_delay(sessions, normalized_run_ids)
+            if retry_delay is None:
+                break
+            await asyncio.sleep(max(0.05, retry_delay))
+            continue
+
+        collected += 1
+        try:
+            status, result = await _process_durable_web_lease(sessions, provider, lease)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            result = _status_result("timeout", "web_worker_target_failed")
+            status = "failed_retryable"
+            await _fail_task(
+                sessions,
+                lease.task_key,
+                lease.lease_token,
+                status=status,
+                reason_code="web_worker_target_failed",
+                field_outcomes=_failure_outcomes(lease.requested_fields, "timeout", "web_worker_target_failed"),
+                diagnostics={},
+                retry_after=30,
+            )
+        _add_diagnostics(diagnostics, getattr(result, "diagnostics", {}))
+
+        if status == "completed":
+            completed += 1
+        elif status == "partially_completed":
+            partial += 1
+            await _enqueue_remaining_fields(sessions, lease)
+
+        reason = getattr(result, "reason", None)
+        if status == "blocked" and _is_rate_limited(reason):
+            stopped_reason = "http_429"
+            break
+        if status in {"blocked", "needs_login"}:
+            if (
+                wait_for_login
+                and _is_login_or_verification(getattr(result, "status", status), reason)
+                and lease.task_key not in login_resumed
+                and getattr(provider, "has_manual_login_page", False)
+            ):
+                if not await _confirm_login_or_stop(provider, None, confirmation=login_confirmation):
+                    stopped_reason = "manual_login_not_confirmed"
+                    break
+                await _close_manual_login_page(provider)
+                resumed = await resume_web_enrichment_tasks(
+                    sessions,
+                    lease.run_id,
+                    statuses=("blocked", "needs_login"),
+                    task_keys=(lease.task_key,),
+                )
+                if resumed:
+                    login_resumed.add(lease.task_key)
+                    continue
+                stopped_reason = "manual_resume_not_applied"
+                break
+            stopped_reason = _safe_reason(reason or status)
+            break
+
+    unresolved = await _count_unresolved_web_tasks(sessions, normalized_run_ids)
+    if stopped_reason is None:
+        stopped_reason = (
+            "queue_drained_with_unresolved_tasks" if unresolved else "queue_drained"
+        )
+    return WebWorkerSummary(
+        run_ids=normalized_run_ids,
+        collected_count=collected,
+        completed_count=completed,
+        partial_count=partial,
+        unresolved_count=unresolved,
+        stopped_reason=stopped_reason,
+        diagnostics=dict(diagnostics),
+    )
+
+
+async def run_live_web_fallback_worker(
+    sessions: Any,
+    run_ids: Callable[[], Sequence[str]],
+    *,
+    stop_event: Any,
+    browser_profile: str | Path,
+    request_budget: Any | None = None,
+    browser_config: Any | None = None,
+    provider_factory: Any | None = None,
+    headed: bool = True,
+    wait_for_login: bool = True,
+    login_confirmation: Any | None = None,
+) -> WebWorkerSummary:
+    """Keep one serialized browser worker open, then drain on graceful shutdown."""
+    if browser_profile is None:
+        raise ValueError("an explicit isolated browser_profile is required")
+    if wait_for_login and not headed:
+        raise ValueError("wait_for_login requires headed=True")
+    if stop_event is None or not hasattr(stop_event, "is_set") or not hasattr(stop_event, "wait"):
+        raise ValueError("an asyncio stop_event is required")
+
+    if request_budget is None:
+        request_budget = make_request_budget(_configured_global_rps())
+    if browser_config is None:
+        browser_config = _configured_web_settings()
+    factory = provider_factory or _make_browser_provider
+    provider = factory(
+        budget=request_budget,
+        profile_dir=browser_profile,
+        settings=browser_config,
+        headed=headed,
+        keep_login_page=wait_for_login,
+    )
+    if asyncio.iscoroutine(provider):
+        provider = await provider
+
+    collected = 0
+    completed = 0
+    partial = 0
+    diagnostics: Counter[str] = Counter()
+    stopped_reason = None
+    login_resumed: set[str] = set()
+    all_run_ids: set[str] = set()
+    try:
+        while not stop_event.is_set():
+            current_run_ids = await _snapshot_run_ids(run_ids)
+            all_run_ids.update(current_run_ids)
+            lease = await _lease_one_web_task(sessions, current_run_ids, "live-web-fallback")
+            if lease is None:
+                retry_delay = await _next_retry_delay(sessions, current_run_ids)
+                await _wait_for_stop_or_timeout(stop_event, min(retry_delay or 0.5, 1.0))
+                continue
+
+            collected += 1
+            try:
+                status, result = await _process_durable_web_lease(sessions, provider, lease)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                result = _status_result("timeout", "web_worker_target_failed")
+                status = "failed_retryable"
+                await _fail_task(
+                    sessions,
+                    lease.task_key,
+                    lease.lease_token,
+                    status=status,
+                    reason_code="web_worker_target_failed",
+                    field_outcomes=_failure_outcomes(
+                        lease.requested_fields, "timeout", "web_worker_target_failed"
+                    ),
+                    diagnostics={},
+                    retry_after=30,
+                )
+            _add_diagnostics(diagnostics, getattr(result, "diagnostics", {}))
+            if status == "completed":
+                completed += 1
+            elif status == "partially_completed":
+                partial += 1
+                await _enqueue_remaining_fields(sessions, lease)
+
+            reason = getattr(result, "reason", None)
+            if status == "blocked" and _is_rate_limited(reason):
+                stopped_reason = "http_429"
+                break
+            if status in {"blocked", "needs_login"}:
+                if (
+                    wait_for_login
+                    and _is_login_or_verification(getattr(result, "status", status), reason)
+                    and lease.task_key not in login_resumed
+                    and getattr(provider, "has_manual_login_page", False)
+                ):
+                    if not await _confirm_login_or_stop(
+                        provider, stop_event, confirmation=login_confirmation
+                    ):
+                        stopped_reason = (
+                            "stop_requested_during_login"
+                            if stop_event.is_set()
+                            else "manual_login_not_confirmed"
+                        )
+                        break
+                    await _close_manual_login_page(provider)
+                    resumed = await resume_web_enrichment_tasks(
+                        sessions,
+                        lease.run_id,
+                        statuses=("blocked", "needs_login"),
+                        task_keys=(lease.task_key,),
+                    )
+                    if resumed:
+                        login_resumed.add(lease.task_key)
+                        continue
+                    stopped_reason = "manual_resume_not_applied"
+                    break
+                stopped_reason = _safe_reason(reason or status)
+                break
+
+        if stop_event.is_set() and stopped_reason is None:
+            current_run_ids = await _snapshot_run_ids(run_ids)
+            all_run_ids.update(current_run_ids)
+            drained = await drain_pending_web_enrichment(
+                sessions,
+                tuple(sorted(all_run_ids)),
+                provider=provider,
+                wait_for_login=wait_for_login,
+                login_confirmation=login_confirmation,
+            )
+            collected += drained.collected_count
+            completed += drained.completed_count
+            partial += drained.partial_count
+            _add_diagnostics(diagnostics, drained.diagnostics)
+            stopped_reason = (
+                "stop_requested_drained"
+                if drained.unresolved_count == 0
+                else drained.stopped_reason
+            )
+    finally:
+        await _close_provider(provider)
+
+    all_run_ids.update(await _snapshot_run_ids(run_ids))
+    unresolved = await _count_unresolved_web_tasks(sessions, tuple(sorted(all_run_ids)))
+    return WebWorkerSummary(
+        run_ids=tuple(sorted(all_run_ids)),
+        collected_count=collected,
+        completed_count=completed,
+        partial_count=partial,
+        unresolved_count=unresolved,
+        stopped_reason=stopped_reason
+        or ("queue_drained" if unresolved == 0 else "queue_drained_with_unresolved_tasks"),
+        diagnostics=dict(diagnostics),
     )
 
 
@@ -613,6 +1134,9 @@ def _add_diagnostics(counter: Counter[str], values: Any) -> None:
         "observed_subresource_requests",
         "http_429",
         "auth_pauses",
+        "page_cache_hits",
+        "post_owner_scrolls",
+        "growth_hover_attempts",
     ):
         value = values.get(name)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
@@ -636,6 +1160,9 @@ def _safe_diagnostics(values: Any) -> dict[str, Any]:
         "observed_subresource_requests",
         "http_429",
         "auth_pauses",
+        "page_cache_hits",
+        "post_owner_scrolls",
+        "growth_hover_attempts",
     ):
         value = values.get(name)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
@@ -680,6 +1207,13 @@ async def _confirm_manual_login(provider: Any, timeout_seconds: float, *, confir
     except (OSError, ValueError, NotImplementedError, TimeoutError):
         print("当前控制台不支持可取消的终端确认；请在交互式 Terminal 运行或取消本次任务。", file=sys.stderr)
         return False
+
+
+async def _wait_for_stop_or_timeout(stop_event: Any, timeout_seconds: float) -> None:
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=max(0.05, timeout_seconds))
+    except TimeoutError:
+        pass
 
 
 async def _wait_for_terminal_enter(timeout_seconds: float, *, stream: Any | None = None) -> bool:
@@ -913,8 +1447,11 @@ def _json_default(value: Any) -> Any:
 __all__ = [
     "FieldBackfillSummary",
     "TargetFilters",
+    "WebWorkerSummary",
+    "drain_pending_web_enrichment",
     "make_request_budget",
     "normalize_target_filters",
     "run_field_backfill",
+    "run_live_web_fallback_worker",
     "run_web_audit",
 ]

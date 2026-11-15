@@ -20,6 +20,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from src.core.models import ResearchRun, ResearchTaskScope
 from src.research.models import (
     ResearchComment,
+    ResearchContentObservation,
     ResearchFieldObservation,
     ResearchPost,
     ResearchThread,
@@ -35,7 +36,15 @@ from .identity import (
     canonical_growth_icon_url,
     parse_positive_id,
 )
-from .tasks import LEGACY_WEB_FIELD_TYPES, WEB_FIELD_TYPES, _record_failure_audit, _safe_reason
+from .tasks import (
+    _CONTENT_MARKERS,
+    _THREAD_LIST_METADATA_FIELDS,
+    LEGACY_WEB_FIELD_TYPES,
+    WEB_FIELD_TYPES,
+    _record_failure_audit,
+    _safe_reason,
+    _unknown_canonical_value,
+)
 
 
 class _ReconcileRejectedError(Exception):
@@ -78,12 +87,6 @@ _STATUS_BY_FIELD = frozenset(
         "failed_final",
     }
 )
-_ZERO_UNKNOWN_REASONS = frozenset(
-    {
-        "zero_presence_unverified",
-        "zero_presence_unverified_in_parsed_object",
-    }
-)
 _FID_PROOF_METHODS = frozenset(
     {
         "body_fid",
@@ -94,6 +97,7 @@ _FID_PROOF_METHODS = frozenset(
         "known_api_tid_fid_binding",
     }
 )
+_GROWTH_FIELDS = frozenset({"global_growth_level", "global_growth_icon_url"})
 _SAFE_QUERY_KEYS = frozenset({"tid", "thread_id", "kz", "fid", "pid", "post_id", "cid", "offset"})
 _IDENTITY_MISMATCH_SUFFIXES = ("_mismatch", "_disagreement")
 
@@ -345,7 +349,7 @@ def _conditions(task: ResearchWebEnrichmentTask):
     return model, conditions
 
 
-async def _lock_and_validate_scopes(session, task: ResearchWebEnrichmentTask) -> None:
+async def _lock_and_validate_scopes(session, task: ResearchWebEnrichmentTask) -> str | None:
     thread_scope = await session.scalar(
         select(ResearchTaskScope)
         .where(
@@ -359,10 +363,9 @@ async def _lock_and_validate_scopes(session, task: ResearchWebEnrichmentTask) ->
         task.parent_scope_generation if task.target_type == "comment" else task.scope_generation
     ):
         raise _ReconcileRejectedError("failed_final", "scope_generation_changed")
-    if thread_scope.status != "completed":
-        raise _ReconcileRejectedError("failed_final", "thread_replies_not_completed")
     if task.fid is not None and thread_scope.fid is not None and thread_scope.fid != task.fid:
         raise _ReconcileRejectedError("identity_unverified", "thread_scope_fid_mismatch")
+    content_scope_incomplete = thread_scope.status != "completed"
     if task.target_type == "comment":
         comment_scope = await session.scalar(
             select(ResearchTaskScope)
@@ -380,10 +383,34 @@ async def _lock_and_validate_scopes(session, task: ResearchWebEnrichmentTask) ->
             or comment_scope.parent_generation != thread_scope.generation
         ):
             raise _ReconcileRejectedError("failed_final", "comment_scope_generation_changed")
-        if comment_scope.status != "completed":
-            raise _ReconcileRejectedError("failed_final", "post_comments_not_completed")
         if task.fid is not None and comment_scope.fid is not None and comment_scope.fid != task.fid:
             raise _ReconcileRejectedError("identity_unverified", "comment_scope_fid_mismatch")
+        content_scope_incomplete = content_scope_incomplete or comment_scope.status != "completed"
+    if not content_scope_incomplete:
+        return None
+
+    owner_type, expected_source = _CONTENT_MARKERS[task.target_type]
+    marker = await session.scalar(
+        select(ResearchContentObservation)
+        .where(
+            ResearchContentObservation.owner_type == owner_type,
+            ResearchContentObservation.owner_id == task.target_id,
+        )
+    )
+    if (
+        marker is None
+        or marker.owner_type != owner_type
+        or marker.owner_id != task.target_id
+        or marker.tid != task.tid
+        or marker.source_api != expected_source
+        or _utc(marker.observed_at) != _utc(task.target_observed_at)
+    ):
+        if task.target_type == "thread":
+            # A verified list row can support metadata only. The locked row and
+            # page_pc identity proof are checked by the caller before any merge.
+            return "aiotieba.get_threads"
+        raise _ReconcileRejectedError("failed_final", "content_snapshot_marker_mismatch")
+    return expected_source
 
 
 async def _lock_target(session, task: ResearchWebEnrichmentTask):
@@ -399,17 +426,6 @@ async def _lock_target(session, task: ResearchWebEnrichmentTask):
     if task.target_type == "comment" and row.parent_post_pid != task.parent_post_pid:
         raise _ReconcileRejectedError("identity_unverified", "target_database_parent_changed")
     return model, conditions, row
-
-
-def _unknown_canonical_value(current: Any, field_name: str, missing_reasons: Mapping[str, Any]) -> bool:
-    if current is None:
-        return True
-    reason = missing_reasons.get(field_name)
-    if reason not in _ZERO_UNKNOWN_REASONS:
-        return False
-    if isinstance(current, bool):
-        return field_name == "is_bawu" and current is False
-    return isinstance(current, int) and current == 0
 
 
 def _outcomes_by_field(
@@ -540,6 +556,8 @@ async def complete_web_enrichment_task(
     *,
     field_outcomes: Mapping[str, Any] | None = None,
     diagnostics: Mapping[str, Any] | None = None,
+    identity_verified: bool | None = None,
+    identity_methods: Sequence[str] = (),
     now: datetime | None = None,
 ) -> WebReconcileResult:
     """Validate a whole candidate batch, then merge it with one target in a short transaction."""
@@ -576,8 +594,30 @@ async def complete_web_enrichment_task(
             if identity_failure is not None:
                 raise _ReconcileRejectedError("identity_unverified", identity_failure)
 
-            await _lock_and_validate_scopes(session, task)
+            required_content_source = await _lock_and_validate_scopes(session, task)
             model, conditions, row = await _lock_target(session, task)
+            if required_content_source is not None and row.source_api != required_content_source:
+                raise _ReconcileRejectedError("identity_unverified", "target_content_source_mismatch")
+            if required_content_source == "aiotieba.get_threads":
+                if not set(requested_fields).issubset(_THREAD_LIST_METADATA_FIELDS):
+                    raise _ReconcileRejectedError(
+                        "identity_unverified", "thread_list_metadata_field_not_allowed"
+                    )
+                required_methods = {
+                    "response_forum_id",
+                    "response_thread_id",
+                    "thread_post_id_matches_first_floor_id",
+                    "response_author_id",
+                }
+                if identity_verified is not True or not required_methods.issubset(set(identity_methods)):
+                    raise _ReconcileRejectedError("identity_unverified", "thread_list_page_pc_proof_missing")
+                if any(
+                    not required_methods.issubset(set(item["identity"]["match_methods"]))
+                    for item in validated
+                ):
+                    raise _ReconcileRejectedError(
+                        "identity_unverified", "thread_list_candidate_page_pc_proof_missing"
+                    )
             missing_reasons = dict(row.missing_reasons_json or {})
             sources = dict(row.field_sources_json or {})
             values_to_set: dict[str, Any] = {}
@@ -858,6 +898,15 @@ async def complete_web_enrichment_task(
                 if field_name not in candidate_status_by_field:
                     candidate_status_by_field[field_name] = "absent_on_page"
                     outcomes.setdefault(field_name, {"status": "absent_on_page", "reason": "no_candidate_observed"})
+                prior_source = sources.get(field_name)
+                field_source = dict(prior_source) if isinstance(prior_source, Mapping) else {}
+                field_source["web_check"] = {
+                    "status": candidate_status_by_field[field_name],
+                    "reason": outcomes.get(field_name, {}).get("reason", ""),
+                    "task_key": task_key,
+                    "checked_at": current_time.isoformat(),
+                }
+                sources[field_name] = field_source
 
             for item in validated:
                 status = observation_statuses.get(id(item), "audit_only")
@@ -923,7 +972,20 @@ async def complete_web_enrichment_task(
                 in {"absent_on_page", "needs_evidence", "not_tested", "not_observed_in_bounded_page"}
             )
             requested_statuses = [candidate_status_by_field[name] for name in requested_fields]
-            if all(status in {"applied", "confirmed"} for status in requested_statuses):
+            growth_requested = set(requested_fields) & _GROWTH_FIELDS
+            growth_satisfied = growth_requested == _GROWTH_FIELDS and any(
+                candidate_status_by_field[name] in {"applied", "confirmed"}
+                for name in _GROWTH_FIELDS
+            )
+            non_growth_statuses = [
+                candidate_status_by_field[name]
+                for name in requested_fields
+                if name not in _GROWTH_FIELDS
+            ]
+            if all(status in {"applied", "confirmed"} for status in requested_statuses) or (
+                growth_satisfied
+                and all(status in {"applied", "confirmed"} for status in non_growth_statuses)
+            ):
                 task_status = "completed"
             elif all(status == "unsupported_by_source" for status in requested_statuses):
                 task_status = "unsupported_by_source"

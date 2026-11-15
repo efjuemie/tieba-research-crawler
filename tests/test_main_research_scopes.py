@@ -176,9 +176,9 @@ async def test_main_cancellation_marks_running_research_run_interrupted(monkeypa
 
         async def set_research_run_status_if(self, run_id, expected, status, reason):
             assert run_id == "run-synthetic"
-            assert expected == {"running"}
+            assert expected == {"running", "completed", "incomplete"}
             assert status == "interrupted"
-            assert reason == "main_cancelled_before_completion"
+            assert reason == "cooperative_shutdown_after_current_api_page"
             events.append("run_interrupted")
             return True
 
@@ -204,6 +204,9 @@ async def test_main_cancellation_marks_running_research_run_interrupted(monkeypa
     class FakeScheduler:
         def __init__(self, **_kwargs):
             pass
+
+        def stop(self):
+            return None
 
         async def run(self, mode):
             assert mode == "backfill"

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 from types import SimpleNamespace
 
 import pytest
@@ -95,6 +97,9 @@ async def test_backfill_reconciles_after_scheduler_checkpoint_and_detail_drain(m
             assert mode == "backfill"
             events.append("list_scheduler_finished")
 
+        def stop(self):
+            return None
+
     datastore_instance = datastore
 
     async def initialize(*, mode):
@@ -120,116 +125,280 @@ async def test_backfill_reconciles_after_scheduler_checkpoint_and_detail_drain(m
 
 
 @pytest.mark.asyncio
-async def test_hybrid_reconciles_only_after_stopping_producers_and_draining(monkeypatch):
+async def test_sigterm_stops_api_page_then_drains_live_web_before_teardown(monkeypatch):
     events = []
-    scheduler_stopped = asyncio.Event()
-    periodic_started = asyncio.Event()
-    backfill_started = asyncio.Event()
+    api_page_started = asyncio.Event()
+    web_started = asyncio.Event()
+    api_active = False
+    discovery_calls = 0
 
-    class FakeScheduler:
-        def stop(self):
-            events.append("scheduler_stopped")
-            scheduler_stopped.set()
+    class FakeContainer:
+        config = SimpleNamespace(
+            metrics_enabled=False,
+            worker_threads=0,
+            worker_posts=1,
+            worker_comments=0,
+            research_enabled=True,
+            fetch_user_forum_info=False,
+            max_backfill_pages=0,
+            pydantic_config=SimpleNamespace(
+                web_fallback=SimpleNamespace(browser_profile="isolated-test-profile")
+            ),
+        )
+        forums = [SimpleNamespace(fid=7, fname="synthetic")]
+        semaphore = object()
 
-        async def run(self, mode):
-            events.append(f"{mode}_started")
-            if mode == "periodic":
-                periodic_started.set()
-            else:
-                backfill_started.set()
-            await scheduler_stopped.wait()
-            if mode == "backfill":
-                events.append("backfill_finished")
-
-    class FakeRouter:
-        async def wait_idle(self):
-            events.append("queue_drained")
-
-        def total_qsize(self):
-            return 0
+        async def teardown(self):
+            events.append("container_torn_down")
 
     class FakeDataStore:
+        async_sessionmaker = object()
+
+        async def start_research_run(self, **_kwargs):
+            return "synthetic-run"
+
         async def reconcile_research_run_status_after_drain(self, run_id):
             assert run_id == "synthetic-run"
-            assert events[-1] == "queue_drained"
+            assert events.index("web_completed") < len(events)
             events.append("run_reconciled")
             return "completed"
 
-    task = asyncio.create_task(
-        app_main._run_hybrid_mode(
-            FakeScheduler(),
-            [],
-            FakeRouter(),
-            worker_tasks=[],
-            datastore=FakeDataStore(),
-            research_run_id="synthetic-run",
-        )
-    )
-    await asyncio.wait_for(asyncio.gather(periodic_started.wait(), backfill_started.wait()), timeout=1)
+        async def set_research_run_status_if(self, *args):
+            events.append(("run_status", args[-2], args[-1]))
+            return True
 
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        async def close(self):
+            events.append("database_closed")
 
-    assert events.index("scheduler_stopped") < events.index("backfill_finished")
-    assert events.index("backfill_finished") < events.index("queue_drained")
-    assert events.index("queue_drained") < events.index("run_reconciled")
+    class FakeScheduler:
+        def __init__(self, **_kwargs):
+            self.stopped = asyncio.Event()
+
+        def stop(self):
+            self.stopped.set()
+
+        async def run(self, mode):
+            assert mode == "periodic"
+            await self.stopped.wait()
+
+    class FakeWorker:
+        def __init__(self, worker_id, *_args, lane, **_kwargs):
+            self.worker_id = worker_id
+            self.lane = lane
+            self.stop_requested = asyncio.Event()
+
+        async def run(self):
+            nonlocal api_active
+            api_active = True
+            events.append("api_page_started")
+            api_page_started.set()
+            await self.stop_requested.wait()
+            events.append("api_page_committed")
+            api_active = False
+
+        def stop_after_current(self):
+            self.stop_requested.set()
+
+    async def initialize(*, mode):
+        assert mode == "periodic"
+        return FakeContainer(), QueueRouter()
+
+    async def no_recovery(*_args, **_kwargs):
+        return None
+
+    async def pending_run_ids(_sessions, current_run_id, *, responsible_forums):
+        assert current_run_id == "synthetic-run"
+        assert responsible_forums == ((7, "synthetic"),)
+        return (current_run_id,)
+
+    async def discover(_sessions, run_ids):
+        nonlocal discovery_calls
+        assert run_ids == ("synthetic-run",)
+        discovery_calls += 1
+        if discovery_calls > 1:
+            assert "api_page_committed" in events
+        events.append("web_target_rescan_startup" if discovery_calls == 1 else "web_target_rescan_shutdown")
+        return 1
+
+    async def live_web_worker(_sessions, _run_ids, *, stop_event, **_kwargs):
+        await api_page_started.wait()
+        assert api_active
+        events.append("web_started_while_api_active")
+        web_started.set()
+        await stop_event.wait()
+        assert "web_target_rescan_shutdown" in events
+        events.append("web_completed")
+        return SimpleNamespace(unresolved_count=0)
+
+    datastore = FakeDataStore()
+    original_await_mode_or_shutdown = app_main._await_mode_or_shutdown
+
+    async def tracked_await_mode_or_shutdown(mode_task, shutdown_event):
+        result = await original_await_mode_or_shutdown(mode_task, shutdown_event)
+        events.append(("shutdown_result", result, shutdown_event.is_set()))
+        return result
+
+    monkeypatch.setattr(app_main, "initialize_application", initialize)
+    monkeypatch.setattr(app_main, "DataStore", lambda _container: datastore)
+    monkeypatch.setattr(app_main, "Scheduler", FakeScheduler)
+    monkeypatch.setattr(app_main, "Worker", FakeWorker)
+    monkeypatch.setattr(app_main, "_recover_pending_tasks", no_recovery)
+    monkeypatch.setattr(app_main, "pending_web_run_ids", pending_run_ids)
+    monkeypatch.setattr(app_main, "discover_missing_web_targets", discover)
+    monkeypatch.setattr(app_main, "run_live_web_worker", live_web_worker)
+    monkeypatch.setattr(app_main, "_await_mode_or_shutdown", tracked_await_mode_or_shutdown)
+
+    task = asyncio.create_task(app_main.main("periodic"))
+    await asyncio.wait_for(web_started.wait(), timeout=1)
+    os.kill(os.getpid(), signal.SIGTERM)
+    await asyncio.wait_for(task, timeout=1)
+
+    assert events.index("web_started_while_api_active") < events.index("api_page_committed")
+    assert events.index("api_page_committed") < events.index("web_target_rescan_shutdown")
+    assert events.index("web_target_rescan_shutdown") < events.index("web_completed")
+    assert events.index("web_completed") < events.index("run_reconciled")
+    assert events.index("web_completed") < events.index("database_closed") < events.index("container_torn_down")
+    assert any(
+        event[0] == "run_status" and event[1] == "interrupted"
+        for event in events
+        if isinstance(event, tuple)
+    ), [event for event in events if isinstance(event, tuple)]
+    assert ("shutdown_result", True, True) in events
 
 
 @pytest.mark.asyncio
-async def test_hybrid_drain_timeout_marks_interrupted_without_reconciliation(monkeypatch):
-    scheduler_stopped = asyncio.Event()
+async def test_backfill_stops_api_producers_if_live_web_worker_exits_early():
+    events = []
+    worker_started = asyncio.Event()
+    worker_stop = asyncio.Event()
 
     class FakeScheduler:
+        def __init__(self):
+            self.stopped = asyncio.Event()
+
         def stop(self):
-            scheduler_stopped.set()
+            self.stopped.set()
 
         async def run(self, mode):
-            assert mode in {"periodic", "backfill"}
-            await scheduler_stopped.wait()
+            assert mode == "backfill"
+            await self.stopped.wait()
+
+    class FakeWorker:
+        async def run(self):
+            worker_started.set()
+            await worker_stop.wait()
+            events.append("api_page_committed")
+
+        def stop_after_current(self):
+            worker_stop.set()
 
     class FakeRouter:
         async def wait_idle(self):
             await asyncio.Event().wait()
 
-        def total_qsize(self):
-            return 1
+    async def fail_web_worker():
+        await worker_started.wait()
+        events.append("web_worker_failed")
+        raise RuntimeError("synthetic web worker failure")
 
-    class FakeDataStore:
-        def __init__(self):
-            self.status_updates = []
-            self.reconciled = False
+    worker = FakeWorker()
+    worker_task = asyncio.create_task(worker.run())
+    web_worker_task = asyncio.create_task(fail_web_worker())
 
-        async def set_research_run_status_if(self, *args):
-            self.status_updates.append(args)
-            return True
+    async def producers_stopped():
+        assert "api_page_committed" in events
+        events.append("producers_stopped")
 
-        async def reconcile_research_run_status_after_drain(self, _run_id):
-            self.reconciled = True
-
-    datastore = FakeDataStore()
-    monkeypatch.setattr(app_main, "GRACEFUL_SHUTDOWN_TIMEOUT", 0.01)
-    task = asyncio.create_task(
-        app_main._run_hybrid_mode(
+    with pytest.raises(RuntimeError, match="synthetic web worker failure"):
+        await app_main._run_backfill_mode(
             FakeScheduler(),
-            [],
+            [worker],
             FakeRouter(),
-            worker_tasks=[],
-            datastore=datastore,
-            research_run_id="synthetic-run",
+            [worker_task],
+            web_worker_task=web_worker_task,
+            on_api_stopped=producers_stopped,
         )
-    )
-    await asyncio.sleep(0)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
 
-    assert datastore.status_updates == [
-        (
-            "synthetic-run",
-            {"running", "completed", "incomplete"},
-            "interrupted",
-            "hybrid_shutdown_before_backfill_drain",
-        )
-    ]
-    assert not datastore.reconciled
+    assert events.index("web_worker_failed") < events.index("api_page_committed")
+    assert events.index("api_page_committed") < events.index("producers_stopped")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["periodic", "hybrid", "backfill"])
+async def test_normal_live_web_summary_stops_api_producers_in_every_mode(mode):
+    events = []
+    api_stop = asyncio.Event()
+    web_stop = asyncio.Event()
+
+    class FakeScheduler:
+        def __init__(self):
+            self.stopped = asyncio.Event()
+
+        def stop(self):
+            self.stopped.set()
+
+        async def run(self, mode):
+            assert mode in {"periodic", "backfill"}
+            await self.stopped.wait()
+
+    class FakeWorker:
+        async def run(self):
+            events.append("api_started")
+            await api_stop.wait()
+            events.append("api_finished")
+
+        def stop_after_current(self):
+            api_stop.set()
+
+    class FakeRouter:
+        async def wait_idle(self):
+            await asyncio.Event().wait()
+
+    async def returned_summary():
+        return SimpleNamespace(stopped_reason="manual_login_not_confirmed", unresolved_count=1)
+
+    async def producers_stopped():
+        assert "api_finished" in events
+        events.append("producers_stopped")
+        web_stop.set()
+
+    scheduler = FakeScheduler()
+    worker = FakeWorker()
+    worker_task = asyncio.create_task(worker.run())
+    web_worker_task = asyncio.create_task(returned_summary())
+    run_mode = {
+        "periodic": lambda: app_main._run_periodic_mode(
+            scheduler,
+            [worker],
+            FakeRouter(),
+            worker_tasks=[worker_task],
+            web_worker_task=web_worker_task,
+            web_stop_event=web_stop,
+            on_api_stopped=producers_stopped,
+        ),
+        "hybrid": lambda: app_main._run_hybrid_mode(
+            scheduler,
+            [worker],
+            FakeRouter(),
+            worker_tasks=[worker_task],
+            web_worker_task=web_worker_task,
+            web_stop_event=web_stop,
+            on_api_stopped=producers_stopped,
+        ),
+        "backfill": lambda: app_main._run_backfill_mode(
+            scheduler,
+            [worker],
+            FakeRouter(),
+            [worker_task],
+            web_worker_task=web_worker_task,
+            web_stop_event=web_stop,
+            on_api_stopped=producers_stopped,
+        ),
+    }[mode]
+
+    with pytest.raises(RuntimeError, match="returned before shutdown was requested"):
+        await run_mode()
+
+    assert events == ["api_started", "api_finished", "producers_stopped"]
+    assert scheduler.stopped.is_set()
+    assert web_stop.is_set()

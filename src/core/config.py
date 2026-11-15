@@ -207,11 +207,12 @@ class ResearchConfig(BaseModel):
 
 
 class WebFallbackConfig(BaseModel):
-    """Bounded defaults for explicit, local web enrichment commands."""
+    """Bounded browser settings for automatic and explicit web enrichment."""
 
+    browser_profile: str = "data/web-fallback-profile"
     max_pages: int = Field(default=1, ge=1, le=10)
-    max_expansions: int = Field(default=1, ge=0, le=10)
-    timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    max_expansions: int = Field(default=10, ge=0, le=10)
+    timeout_seconds: float = Field(default=90.0, gt=0, le=120)
 
 
 class PydanticConfig(BaseSettings):

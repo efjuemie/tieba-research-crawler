@@ -2,7 +2,7 @@
 
 本项目从 [TiebaMeow/TiebaScraper](https://github.com/TiebaMeow/TiebaScraper) 延伸，使用 `aiotieba` 访问贴吧接口，并保留上游历史与 [MIT 许可](LICENSE)中的版权声明。项目面向本机研究采集，保存原始用户 ID、昵称和帖子内容，不做匿名化。
 
-> **当前状态（2026-11-15）**：最新全库批次含 89 个主题、2,173 条一级回复、77 条楼中楼、1,619 个用户、2,089 条吧内快照和 542 条媒体记录。60 个详情响应页已保存且无失败，canonical 主题数仍为 89；详情子范围仍有未完成项，不能称整轮或全吧采集完成。字段覆盖与样本边界见下方和[字段来源审计](docs/FIELD_SOURCE_AUDIT.md)。
+> **当前状态（2026-11-15，V5）**：交付批次含 89 个主题、2,173 条一级回复、77 条楼中楼、1,619 个用户、2,097 条吧内快照和 542 条媒体记录。成长数字或图标覆盖分别为 89/89、2,173/2,173、72/77；IP 地点非空分别为 80、1,441、76。原有缺失字段目标已尝试定向补采；5 条楼中楼仍没有可验证的成长徽章。字段证据、尝试范围和限制见[字段来源审计](docs/FIELD_SOURCE_AUDIT.md)。这些结果不代表全站内容完整。
 
 ## 最新字段范围
 
@@ -83,9 +83,19 @@ uv run python main.py --mode hybrid
 
 调度器逐页等待工作器确认后再投递下一页，并在贴吧间轮转。线程接口连续返回后续页时，`max_backfill_pages = 0` 会继续翻页，直到接口确认结束或当前流进入暂停/失败状态。
 
+普通采集也会检查已保存的首楼、回复和评论。增长等级数值与图标都缺失，或 IP 地点为空时，程序会把目标写入网页补采队列；一个隔离浏览器工作器会与 API 工作器并行处理。浏览器使用 `[web_fallback] browser_profile` 指定的资料目录，默认是 `data/web-fallback-profile`。首次使用前安装 Chromium：
+
+```sh
+uv run playwright install chromium
+```
+
+网页导航与 API 请求共用 `[rate_limit] global_rps` 预算。网页补采只尝试已由 API 保存并能通过内容标记、代际和目标身份校验的字段。
+
+默认每个网页目标只访问一个直接定位页面，最多自然展开十次，单目标任务超时为 90 秒。该搜索仍按目标和展开次数有界；可在 `[web_fallback]` 中显式设置更小的 `max_expansions` 或 `timeout_seconds`，配置会保留较低值。
+
 ### 请求频率
 
-默认 `[rate_limit] global_rps = 0.2`，约每 5 秒最多发出一次研究客户端请求。所有通过本程序 `ResearchClient` 的请求共用这一个预算，包括帖子、回复、评论和可选用户资料查询。`threads_rps`、`posts_rps`、`comments_rps` 还分别限制对应接口；调整单接口值不会提高全局上限。该默认值只是项目本机的限速配置，不代表贴吧官方承诺的安全频率。
+默认 `[rate_limit] global_rps = 0.2`，约每 5 秒最多发出一次研究客户端或网页受控导航请求。API 的帖子、回复、评论和可选用户资料请求，以及浏览器受控导航共用这一个预算。`threads_rps`、`posts_rps`、`comments_rps` 还分别限制对应 API 接口；调整单接口值不会提高全局上限。该默认值只是项目本机的限速配置，不代表贴吧官方承诺的安全频率。
 
 ### 恢复已有 run
 
@@ -103,7 +113,7 @@ uv run python main.py --mode backfill --resume --run-id YOUR_RUN_ID
 
 `--run-id` 必须和 `--resume` 一起使用。`--resume` 选择当前论坛范围下最新的可恢复 run；没有匹配的 run 时程序会报错，不会自动另开新 run。回溯列表在重启后会重放最近一个已完成的非终止页一次，以应对顶部内容变化；内容行按 ID 幂等更新。检查点记录列表、帖子详情和评论页状态，导出的质量报告会显示未完成、暂停和计数差异。
 
-本机主入口的一次真实演练验证了列表 checkpoint 的 SIGINT/同 run 恢复：已完成的第 1 页会在重启时重放，run 状态保留为 `interrupted`。该结果不验证详情 scope 完成、IDE GUI 停止或长页端到端行为。进程退出码 0 不等于 run 已正常完成；请查看数据库 run 状态与 checkpoint，不要强制结束进程或删除 checkpoint。
+一次较早的主入口演练验证了列表 checkpoint 的 SIGINT/同 run 恢复：已完成的第 1 页会在重启时重放，run 状态保留为 `interrupted`。V5 异步网页补采收尾经受控信号测试和独立审阅，但没有实际 IDE GUI 停止或 SIGKILL 验收；强制结束的行为不作保证。进程退出码 0 不等于 run 已正常完成；请查看数据库 run 状态与 checkpoint，不要强制结束进程或删除 checkpoint。
 
 ## 登录与用户快照
 
@@ -155,10 +165,9 @@ uv run python main.py drain-pending --run-id YOUR_RUN_ID --tid YOUR_TID --limit 
 uv run python -m src.research field-backfill --run-id YOUR_RUN_ID --target-type comment --tid YOUR_TID --cid YOUR_CID --field ip_location_text --field agree_count --limit 1 --dry-run
 ```
 
-`--dry-run` 不创建补采任务、不打开浏览器、不写字段观察。API 未完成的目标为 `pending_api_detail`，应先用 `drain-pending`。正式执行需安装可选浏览器依赖，并指定项目专用资料目录：
+`--dry-run` 不创建补采任务、不打开浏览器、不写字段观察。网页补采通常等待 API 详情范围完成；已有记录若具备本次 run 的当前 scope generation（评论还需匹配 parent generation）、精确 canonical 身份、观察水位和类型化完整内容标记，可在整个 scope 完成前补采元数据。`get_threads` 列表来源的主题只有在原生 TID/FID、作者 UID 和首楼证据均吻合时，才允许补采作者元数据；不补计数、正文或内容标记，也不改变 scope 完成状态。缺少这些证明的目标，包括无可靠标记的 legacy 记录，仍停在 `pending_api_detail`，应先用 `drain-pending`。网页补采使用项目专用的隔离资料目录：
 
 ```sh
-uv sync --group login
 uv run playwright install chromium
 uv run python -m src.research field-backfill --run-id YOUR_RUN_ID --target-type comment --tid YOUR_TID --cid YOUR_CID --field ip_location_text --field agree_count --limit 1 --max-seconds 300 --browser-profile secrets/tieba-web-profile --headed --wait-for-login
 ```
@@ -229,7 +238,7 @@ uv run python -m src.research export --entity-scope completed-threads --output e
 
 CSV 原样保留研究文本。用 Excel 查看时请通过“从文本／CSV”导入，把 ID 列设为文本，避免大整数被截断；以 `=,+,-,@` 开头的原始文本也可能被 Excel 当作公式。不要用 Excel 自动格式后的内容覆盖原始 CSV。
 
-早期 V1/V2 批次数字是当时快照，已由后续全库导出更新。当前批次中正文非空数为主题 87/89（85 条 API 已核实、2 条旧列表 fallback 未核实；另有 2 条纯媒体主题正文为空）、一级回复 2,150/2,173、楼中楼 74/77。属地非空数分别为 80、1,441、23；正成长等级数分别为 86、2,095、27。没有导出等级值 `0`；这不代表缺失行已确认真实为零。媒体 URL 数组非空行数为主题 38、一级回复 117、楼中楼 0；独立媒体表 542 行含 226 条图片引用和 316 条表情引用，没有真实视频样本。成长图标 URL 在三类内容 CSV 中分别为主题 1 条、一级回复 3 条、楼中楼 1 条；这些是定向页面证据，不能外推为批量覆盖。批次和行数校验通过不代表平台采集完整。
+V1/V2/V3 数字是历史快照。V5 批次正文非空数为主题 87/89（85 条 API 核实、2 条旧列表 fallback 未核实；另有 2 条纯媒体主题正文为空）、一级回复 2,150/2,173、楼中楼 74/77；这次字段补采没有改动正文。成长数字非空分别为 86、2,095、37，成长图标 URL 非空分别为 4、81、36；数字或图标至少有一项的覆盖分别为 89/89、2,173/2,173、72/77。IP 地点非空为 80、1,441、76。5 条楼中楼的身份与父楼已核实，但仅找到头像、没有成长徽章，故没有填造图标 URL。没有内容行导出等级 `0`；未验证的 protobuf 标量零仍按未知处理。媒体 URL 数组非空行为主题 38、一级回复 117、楼中楼 0；媒体表 542 行含 226 条图片引用和 316 条表情引用，没有真实视频样本。准确的缺失原因与网页尝试结果见[字段审计](docs/FIELD_SOURCE_AUDIT.md)。批次和行数校验通过不代表平台采集完整。
 
 ## VS Code 与 PyCharm
 

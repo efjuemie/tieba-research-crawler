@@ -9,6 +9,7 @@ from src.core.models import ResearchRun, ResearchTaskScope
 from src.research.models import (
     RESEARCH_TABLES,
     ResearchComment,
+    ResearchContentObservation,
     ResearchPost,
     ResearchThread,
     ResearchWebEnrichmentAttempt,
@@ -509,6 +510,311 @@ async def test_unfinished_detail_is_not_leased_then_same_task_becomes_ready(rese
     lease = (await lease_web_enrichment_tasks(maker, "run-web-001", "worker-a"))[0]
     assert lease.task_key == summary.task_keys[0]
     assert lease.requested_fields == ("global_growth_level",)
+
+
+@pytest.mark.asyncio
+async def test_partial_scope_can_use_exact_complete_content_marker(research_db):
+    engine, maker = research_db
+    with Session(engine) as session, session.begin():
+        scope = session.get(ResearchTaskScope, ("run-web-001", "thread_replies:1001"))
+        scope.status = "pending"
+        session.add(
+            ResearchContentObservation(
+                owner_type="post",
+                owner_id=2101,
+                tid=1001,
+                source_api="aiotieba.get_posts",
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+    assert summary.planned_targets[0].eligibility_status == "pending_web"
+    assert len(await lease_web_enrichment_tasks(maker, "run-web-001", "worker-a")) == 1
+
+
+@pytest.mark.asyncio
+async def test_incomplete_thread_scope_can_use_verified_list_metadata_row(research_db):
+    engine, maker = research_db
+    with Session(engine) as session, session.begin():
+        scope = session.get(ResearchTaskScope, ("run-web-001", "thread_replies:1001"))
+        scope.status = "pending"
+        thread = session.get(ResearchThread, 1001)
+        thread.source_api = "aiotieba.get_threads"
+
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_level"],
+        target_type="thread",
+        target_ids=[1001],
+        tid=1001,
+        only_missing_fields=True,
+        pair_growth_fields=True,
+    )
+    assert summary.planned_targets[0].eligibility_status == "pending_web"
+    assert summary.planned_targets[0].requested_fields == (
+        "global_growth_icon_url",
+        "global_growth_level",
+    )
+
+
+@pytest.mark.asyncio
+async def test_incomplete_thread_list_row_does_not_enable_counter_collection(research_db):
+    engine, maker = research_db
+    with Session(engine) as session, session.begin():
+        scope = session.get(ResearchTaskScope, ("run-web-001", "thread_replies:1001"))
+        scope.status = "pending"
+        thread = session.get(ResearchThread, 1001)
+        thread.source_api = "aiotieba.get_threads"
+        thread.agree_count = None
+
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["agree_count"],
+        target_type="thread",
+        target_ids=[1001],
+        tid=1001,
+        only_missing_fields=True,
+    )
+
+    assert summary.planned_targets[0].eligibility_status == "pending_api_detail"
+    assert await lease_web_enrichment_tasks(
+        maker, "run-web-001", "worker-a", task_keys=summary.task_keys
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_missing_field_filter_precedes_limit_and_growth_fallback_is_paired(research_db):
+    engine, maker = research_db
+    with Session(engine) as session, session.begin():
+        known = session.get(ResearchPost, 2101)
+        known.agree_count = 4
+
+    limited = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["agree_count"],
+        target_type="post",
+        tid=1001,
+        limit=1,
+        only_missing_fields=True,
+    )
+    assert [plan.target_id for plan in limited.planned_targets] == [2102]
+
+    growth = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_level"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+        pair_growth_fields=True,
+    )
+    assert growth.planned_targets[0].requested_fields == (
+        "global_growth_icon_url",
+        "global_growth_level",
+    )
+
+
+@pytest.mark.asyncio
+async def test_growth_url_alone_satisfies_growth_fallback_and_partial_task_retries_are_bounded(research_db):
+    engine, maker = research_db
+    with Session(engine) as session, session.begin():
+        post = session.get(ResearchPost, 2101)
+        post.global_growth_icon_url = "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp"
+
+    satisfied = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_level"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+        pair_growth_fields=True,
+    )
+    assert satisfied.planned_count == 0
+
+    retriable = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2102],
+        tid=1001,
+        only_missing_fields=True,
+        max_attempts=2,
+    )
+    lease = (await lease_web_enrichment_tasks(
+        maker, "run-web-001", "worker-a", task_keys=retriable.task_keys
+    ))[0]
+    with Session(engine) as session, session.begin():
+        task = session.get(ResearchWebEnrichmentTask, lease.task_key)
+        task.status = "partially_completed"
+        task.field_statuses_json = {"ip_location_text": {"status": "not_tested", "reason": "empty"}}
+        task.completed_at = datetime.now(UTC)
+
+    retry = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2102],
+        tid=1001,
+        only_missing_fields=True,
+        max_attempts=2,
+    )
+    retry_lease = (await lease_web_enrichment_tasks(
+        maker, "run-web-001", "worker-b", task_keys=retry.task_keys
+    ))[0]
+    assert retry_lease.lease_generation == lease.lease_generation + 1
+    with Session(engine) as session, session.begin():
+        task = session.get(ResearchWebEnrichmentTask, retry_lease.task_key)
+        task.status = "partially_completed"
+        task.attempts = task.max_attempts
+    exhausted = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2102],
+        tid=1001,
+        only_missing_fields=True,
+        max_attempts=2,
+    )
+    assert exhausted.planned_targets[0].eligibility_status == "failed_final"
+
+
+@pytest.mark.asyncio
+async def test_growth_and_location_missing_predicates_handle_zero_and_blank_values(research_db):
+    engine, maker = research_db
+    with Session(engine) as session, session.begin():
+        post = session.get(ResearchPost, 2101)
+        post.global_growth_level = 0
+        post.global_growth_icon_url = "  "
+        post.ip_location_text = " \t"
+        post.agree_count = 0
+        post.missing_reasons_json = {}
+
+    growth = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_level"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+        pair_growth_fields=True,
+    )
+    location = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+    known_zero_count = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["agree_count"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+
+    assert growth.planned_targets[0].requested_fields == (
+        "global_growth_icon_url",
+        "global_growth_level",
+    )
+    assert location.planned_targets[0].requested_fields == ("ip_location_text",)
+    assert known_zero_count.planned_count == 0
+
+
+@pytest.mark.asyncio
+async def test_either_growth_value_satisfies_the_growth_pair_without_missing_reason(research_db):
+    engine, maker = research_db
+    with Session(engine) as session, session.begin():
+        post = session.get(ResearchPost, 2101)
+        post.global_growth_level = 0
+        post.global_growth_icon_url = "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp"
+        post.missing_reasons_json = {}
+
+    icon_known = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_level"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+        pair_growth_fields=True,
+    )
+    assert icon_known.planned_count == 0
+
+    with Session(engine) as session, session.begin():
+        post = session.get(ResearchPost, 2101)
+        post.global_growth_level = 5
+        post.global_growth_icon_url = " "
+
+    numeric_known = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_icon_url"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+        pair_growth_fields=True,
+    )
+    assert numeric_known.planned_count == 0
+
+
+@pytest.mark.asyncio
+async def test_leasing_keeps_same_thread_post_targets_adjacent_for_page_reuse(research_db):
+    engine, maker = research_db
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2102, 2101],
+        tid=1001,
+    )
+    with Session(engine) as session, session.begin():
+        first = session.scalar(
+            select(ResearchWebEnrichmentTask).where(
+                ResearchWebEnrichmentTask.task_key == summary.task_keys[0]
+            )
+        )
+        second = session.scalar(
+            select(ResearchWebEnrichmentTask).where(
+                ResearchWebEnrichmentTask.task_key == summary.task_keys[1]
+            )
+        )
+        first.task_key = "z-same-thread-post-task"
+        second.task_key = "a-same-thread-post-task"
+
+    leases = await lease_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        "page-reuse-worker",
+        limit=2,
+    )
+    assert [lease.target_id for lease in leases] == [2101, 2102]
 
 
 @pytest.mark.asyncio

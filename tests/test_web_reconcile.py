@@ -12,6 +12,7 @@ from src.core.models import ResearchRun, ResearchTaskScope
 from src.research.models import (
     RESEARCH_TABLES,
     ResearchComment,
+    ResearchContentObservation,
     ResearchFieldObservation,
     ResearchPost,
     ResearchThread,
@@ -20,6 +21,7 @@ from src.research.models import (
     ResearchWebEnrichmentTask,
 )
 from src.research.persistence import _content_is_bawu, _upsert_content_rows
+from src.research.web_fallback import service
 from src.research.web_fallback.dom import extract_dom_candidates
 from src.research.web_fallback.identity import (
     ObservationCandidate,
@@ -812,11 +814,302 @@ async def test_field_outcomes_preserve_not_tested_reason_without_marking_unsuppo
     assert result.status == "partially_completed"
     with Session(engine) as session:
         task = session.get(ResearchWebEnrichmentTask, lease.task_key)
+        row = session.get(ResearchPost, 2101)
         assert task.field_statuses_json["global_growth_level"] == {
             "status": "not_tested",
             "reason": "numeric_level_not_exposed_in_page",
         }
+        web_check = row.field_sources_json["global_growth_level"]["web_check"]
+        assert web_check["status"] == "not_tested"
+        assert web_check["reason"] == "numeric_level_not_exposed_in_page"
+        assert web_check["task_key"] == lease.task_key
+        assert datetime.fromisoformat(web_check["checked_at"]).tzinfo is not None
+        assert row.global_growth_level is None
         assert session.scalars(select(ResearchFieldObservation)).all() == []
+
+
+@pytest.mark.asyncio
+async def test_growth_icon_satisfies_pair_without_filling_unknown_numeric_level(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_post(
+        maker,
+        2101,
+        ["global_growth_level", "global_growth_icon_url"],
+    )
+    icon_url = "https://tieba-ares.cdn.bcebos.com/synthetic/growth.webp"
+    candidate = _candidate(
+        lease, "global_growth_icon_url", icon_url, source_kind="web_network"
+    )
+    candidate = replace(
+        candidate,
+        source_url=f"https://tieba.baidu.com/c/f/pb/page_pc?kz={lease.tid}&fid={lease.fid}",
+        source_path="page_pc.post_list[0].author.growth_icon_url",
+    )
+    result = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [candidate],
+        field_outcomes={
+            "global_growth_level": {
+                "status": "absent_on_page",
+                "reason": "global_growth_level_zero_is_unknown",
+            }
+        },
+    )
+
+    assert result.status == "completed"
+    with Session(engine) as session:
+        row = session.get(ResearchPost, 2101)
+        task = session.get(ResearchWebEnrichmentTask, lease.task_key)
+        assert row.global_growth_icon_url == icon_url
+        assert row.global_growth_level is None
+        assert task.field_statuses_json["global_growth_level"] == {
+            "status": "absent_on_page",
+            "reason": "global_growth_level_zero_is_unknown",
+        }
+
+
+@pytest.mark.asyncio
+async def test_partial_reply_scope_accepts_only_matching_content_snapshot(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
+    observed = datetime(2026, 1, 1, tzinfo=UTC)
+    with Session(engine) as session, session.begin():
+        scope = session.get(ResearchTaskScope, ("run-reconcile-001", "thread_replies:1001"))
+        scope.status = "pending"
+        session.add(
+            ResearchContentObservation(
+                owner_type="post",
+                owner_id=2101,
+                tid=1001,
+                source_api="aiotieba.get_posts",
+                observed_at=observed,
+            )
+        )
+
+    applied = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [_candidate(lease, "author_nickname", "partial-scope-name")],
+    )
+    assert applied.applied_fields == ("author_nickname",)
+    with Session(engine) as session:
+        assert session.get(ResearchPost, 2101).author_nickname == "partial-scope-name"
+
+
+@pytest.mark.asyncio
+async def test_partial_comment_scope_requires_exact_comment_snapshot(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_comment(maker, 3101, ["author_nickname"])
+    with Session(engine) as session, session.begin():
+        scope = session.get(ResearchTaskScope, ("run-reconcile-001", "post_comments:1001:2101"))
+        scope.status = "pending"
+        session.add(
+            ResearchContentObservation(
+                owner_type="comment",
+                owner_id=3101,
+                tid=1001,
+                source_api="aiotieba.get_comments",
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+
+    applied = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [_candidate(lease, "author_nickname", "partial-comment-name", source_kind="web_network")],
+    )
+    assert applied.applied_fields == ("author_nickname",)
+    with Session(engine) as session:
+        assert session.get(ResearchComment, 3101).author_nickname == "partial-comment-name"
+
+
+@pytest.mark.asyncio
+async def test_partial_scope_rejects_mismatched_content_snapshot(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
+    with Session(engine) as session, session.begin():
+        scope = session.get(ResearchTaskScope, ("run-reconcile-001", "thread_replies:1001"))
+        scope.status = "pending"
+        session.add(
+            ResearchContentObservation(
+                owner_type="post",
+                owner_id=2101,
+                tid=1001,
+                source_api="aiotieba.get_posts",
+                observed_at=datetime(2026, 1, 2, tzinfo=UTC),
+            )
+        )
+
+    result = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [_candidate(lease, "author_nickname", "must-not-apply")],
+    )
+    assert result.status == "failed_final"
+    assert result.reason_code == "content_snapshot_marker_mismatch"
+    with Session(engine) as session:
+        assert session.get(ResearchPost, 2101).author_nickname is None
+        assert session.scalars(select(ResearchFieldObservation)).all() == []
+
+
+@pytest.mark.asyncio
+async def test_thread_list_metadata_fallback_requires_page_pc_creator_proof(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_thread(maker, ["global_growth_level"])
+    with Session(engine) as session, session.begin():
+        scope = session.get(ResearchTaskScope, ("run-reconcile-001", "thread_replies:1001"))
+        scope.status = "pending"
+        thread = session.get(ResearchThread, 1001)
+        thread.source_api = "aiotieba.get_threads"
+
+    methods = (
+        "response_forum_id",
+        "response_thread_id",
+        "thread_post_id_matches_first_floor_id",
+        "response_author_id",
+    )
+    candidate = _candidate(lease, "global_growth_level", 8, source_kind="web_network")
+    identity = _identity(lease, source_kind="web_network")
+    identity.match_methods = methods
+    candidate = replace(
+        candidate,
+        source_url=f"https://tieba.baidu.com/c/f/pb/page_pc?kz={lease.tid}&fid={lease.fid}",
+        source_path="page_pc.thread.author.user_growth.level_id",
+        temporal_scope="content_observation",
+        identity=identity,
+    )
+    result = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [candidate],
+        identity_verified=True,
+        identity_methods=methods,
+    )
+
+    assert result.applied_fields == ("global_growth_level",)
+    with Session(engine) as session:
+        assert session.get(ResearchThread, 1001).global_growth_level == 8
+
+
+@pytest.mark.asyncio
+async def test_thread_list_metadata_fallback_rejects_unproven_page_identity(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_thread(maker, ["global_growth_level"])
+    with Session(engine) as session, session.begin():
+        scope = session.get(ResearchTaskScope, ("run-reconcile-001", "thread_replies:1001"))
+        scope.status = "pending"
+        thread = session.get(ResearchThread, 1001)
+        thread.source_api = "aiotieba.get_threads"
+
+    result = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [],
+        field_outcomes={"global_growth_level": {"status": "absent_on_page", "reason": "no_icon"}},
+        identity_verified=True,
+        identity_methods=("page_tid", "response_author_id"),
+    )
+
+    assert result.status == "identity_unverified"
+    assert result.reason_code == "thread_list_page_pc_proof_missing"
+    with Session(engine) as session:
+        assert session.get(ResearchThread, 1001).global_growth_level is None
+
+
+@pytest.mark.asyncio
+async def test_thread_list_metadata_fallback_rejects_counter_fields(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_thread(maker, ["agree_count"])
+    with Session(engine) as session, session.begin():
+        scope = session.get(ResearchTaskScope, ("run-reconcile-001", "thread_replies:1001"))
+        scope.status = "pending"
+        thread = session.get(ResearchThread, 1001)
+        thread.source_api = "aiotieba.get_threads"
+
+    methods = (
+        "response_forum_id",
+        "response_thread_id",
+        "thread_post_id_matches_first_floor_id",
+        "response_author_id",
+    )
+    candidate = _candidate(lease, "agree_count", 9, source_kind="web_network")
+    identity = _identity(lease, source_kind="web_network")
+    identity.match_methods = methods
+    candidate = replace(
+        candidate,
+        source_url=f"https://tieba.baidu.com/c/f/pb/page_pc?kz={lease.tid}&fid={lease.fid}",
+        source_path="page_pc.thread.agree.agree_num",
+        temporal_scope="content_observation",
+        identity=identity,
+    )
+
+    result = await complete_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        [candidate],
+        identity_verified=True,
+        identity_methods=methods,
+    )
+
+    assert result.status == "identity_unverified"
+    assert result.reason_code == "thread_list_metadata_field_not_allowed"
+    with Session(engine) as session:
+        assert session.get(ResearchThread, 1001).agree_count is None
+
+
+@pytest.mark.asyncio
+async def test_partial_predecessor_is_resolved_when_successor_fills_remaining_fields(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, initial_lease = await _lease_post(
+        maker,
+        2101,
+        ["global_growth_level", "global_growth_icon_url", "ip_location_text"],
+    )
+    first = await complete_web_enrichment_task(
+        maker,
+        initial_lease.task_key,
+        initial_lease.lease_token,
+        [_candidate(initial_lease, "global_growth_level", 6)],
+        field_outcomes={
+            "ip_location_text": {
+                "status": "not_tested",
+                "reason": "ip_location_not_observed",
+            }
+        },
+    )
+    assert first.status == "partially_completed"
+
+    retry_summary = await service._enqueue_remaining_fields(maker, initial_lease)
+    assert retry_summary.planned_targets[0].requested_fields == ("ip_location_text",)
+    successor_lease = (
+        await lease_web_enrichment_tasks(
+            maker,
+            "run-reconcile-001",
+            "successor-worker",
+            task_keys=retry_summary.task_keys,
+        )
+    )[0]
+    second = await complete_web_enrichment_task(
+        maker,
+        successor_lease.task_key,
+        successor_lease.lease_token,
+        [_candidate(successor_lease, "ip_location_text", "浙江")],
+    )
+
+    assert second.status == "completed"
+    with Session(engine) as session:
+        predecessor = session.get(ResearchWebEnrichmentTask, initial_lease.task_key)
+        assert predecessor.status == "partially_completed"
+        assert predecessor.field_statuses_json["ip_location_text"]["status"] == "not_tested"
+    assert await service._count_unresolved_web_tasks(maker, ("run-reconcile-001",)) == 0
 
 
 @pytest.mark.asyncio

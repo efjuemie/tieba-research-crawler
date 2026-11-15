@@ -163,8 +163,9 @@ enabled = false
 # 即最多扫描前 n 页 + 后 n 页
 depth = 3
 
-# 仅在显式 field-backfill / web-audit 命令中使用；所有请求仍共用 rate_limit.global_rps。
+# 自动网页补采和显式 field-backfill / web-audit 命令共用这些设置。
 [web_fallback]
+browser_profile = "data/web-fallback-profile"
 max_pages = 1
-max_expansions = 1
-timeout_seconds = 30.0
+max_expansions = 10
+timeout_seconds = 90.0

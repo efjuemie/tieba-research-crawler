@@ -209,6 +209,48 @@ def test_page_pc_thread_growth_url_uses_only_structured_growth_icon():
     assert candidate.identity.author_user_id == AUTHOR_ID
 
 
+def test_page_pc_thread_extracts_growth_level_and_ip_from_verified_thread_author():
+    payload = _payload()
+    payload["thread"]["author"].update(
+        user_growth={"level_id": 6},
+        ip_address=" 浙江 ",
+    )
+    target = _thread_target(requested_fields=("global_growth_level", "ip_location_text"))
+
+    result = _extract(extract_page_pc_thread_counts, payload, target)
+    candidates = {candidate.field_name: candidate for candidate in result.candidates}
+
+    assert candidates["global_growth_level"].normalized_value == 6
+    assert candidates["global_growth_level"].source_path == (
+        "page_pc.thread.author.user_growth.level_id"
+    )
+    assert candidates["ip_location_text"].normalized_value == "浙江"
+    assert candidates["ip_location_text"].source_path == "page_pc.thread.author.ip_address"
+    assert all(candidate.identity.author_user_id == AUTHOR_ID for candidate in candidates.values())
+
+
+def test_page_pc_thread_unknown_growth_zero_and_bare_ip_are_not_candidates():
+    payload = _payload()
+    payload["thread"]["author"].update(
+        user_growth={"level_id": 0},
+        ip_address="192.0.2.8",
+    )
+    target = _thread_target(requested_fields=("global_growth_level", "ip_location_text"))
+
+    result = _extract(extract_page_pc_thread_counts, payload, target)
+
+    assert "global_growth_level" not in {candidate.field_name for candidate in result.candidates}
+    assert result.field_outcomes["global_growth_level"] == {
+        "status": "absent_on_page",
+        "reason": "global_growth_level_zero_is_unknown",
+    }
+    assert "ip_location_text" not in {candidate.field_name for candidate in result.candidates}
+    assert result.field_outcomes["ip_location_text"] == {
+        "status": "needs_evidence",
+        "reason": "bare_ip_not_region_label",
+    }
+
+
 @pytest.mark.parametrize(
     ("path", "replacement", "reason"),
     [
@@ -375,6 +417,13 @@ def test_page_pc_comment_marks_missing_reply_prefix_and_unknown_growth_zero():
     assert result.status == "ok"
     assert result.identity_verified is True
     assert result.candidates == ()
+    assert result.identity_evidence is not None
+    assert result.identity_evidence.cid == _comment_target().cid
+    assert result.identity_evidence.author_user_id == _comment_target().author_user_id
+    assert "response_cid" in result.identity_evidence.match_methods
+    assert "response_author_id" in result.identity_evidence.match_methods
+    assert "response_forum_id" in result.identity_evidence.match_methods
+    assert "response_sub_post_list_pid" in result.identity_evidence.match_methods
     assert result.field_outcomes["global_growth_level"] == {
         "status": "absent_on_page",
         "reason": "global_growth_level_zero_is_unknown",
@@ -385,6 +434,22 @@ def test_page_pc_comment_marks_missing_reply_prefix_and_unknown_growth_zero():
             "status": "absent_on_page",
             "reason": "reply_prefix_not_present",
         }
+
+
+def test_page_pc_comment_marks_empty_author_ip_as_absent():
+    payload = _payload()
+    payload["user_list"][0]["ip_address"] = "  "
+    target = _comment_target(requested_fields=("ip_location_text",))
+
+    result = _extract(extract_page_pc_comment, payload, target)
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.candidates == ()
+    assert result.field_outcomes["ip_location_text"] == {
+        "status": "absent_on_page",
+        "reason": "ip_location_empty_in_response",
+    }
 
 
 def test_page_pc_comment_rejects_reply_candidates_when_comment_author_uid_mismatches():

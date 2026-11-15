@@ -320,6 +320,8 @@ async def test_field_backfill_dry_run_has_no_provider_or_task_writes(monkeypatch
             "limit": 5,
             "dry_run": True,
             "max_attempts": 3,
+                "only_missing_fields": True,
+                "pair_growth_fields": True,
         }
     ]
 
@@ -516,6 +518,122 @@ async def test_manual_login_releases_lease_before_confirmation_and_resumes_exact
     assert result.completed_count == 1
     assert result.collected_count == 2
     assert result.stopped_reason is None
+
+
+@pytest.mark.asyncio
+async def test_live_worker_reuses_one_headed_provider_to_drain_multiple_runs(monkeypatch):
+    stop_event = asyncio.Event()
+    provider = _FakeProvider([])
+    provider_args = []
+    lease_calls = []
+    process_calls = []
+    available = [
+        SimpleNamespace(run_id="current-run", task_key="current-task"),
+        SimpleNamespace(run_id="old-run", task_key="old-task"),
+    ]
+
+    def make_provider(**kwargs):
+        provider_args.append(kwargs)
+        return provider
+
+    async def lease(_sessions, run_ids, _worker_id):
+        lease_calls.append(tuple(run_ids))
+        for index, lease in enumerate(available):
+            if lease.run_id in run_ids:
+                return available.pop(index)
+        return None
+
+    async def process(_sessions, current_provider, lease):
+        process_calls.append((current_provider, lease.run_id, lease.task_key))
+        if lease.run_id == "current-run":
+            stop_event.set()
+        return "completed", SimpleNamespace(status="ok", reason=None, diagnostics={})
+
+    async def no_unresolved(_sessions, _run_ids):
+        return 0
+
+    async def no_retry_delay(_sessions, _run_ids):
+        return None
+
+    monkeypatch.setattr(service, "_lease_one_web_task", lease)
+    monkeypatch.setattr(service, "_process_durable_web_lease", process)
+    monkeypatch.setattr(service, "_count_unresolved_web_tasks", no_unresolved)
+    monkeypatch.setattr(service, "_next_retry_delay", no_retry_delay)
+
+    summary = await service.run_live_web_fallback_worker(
+        object(),
+        lambda: ("current-run", "old-run"),
+        stop_event=stop_event,
+        browser_profile="/private/synthetic-profile",
+        request_budget=_FakeBudget(),
+        browser_config=SimpleNamespace(max_pages=1, max_expansions=1, timeout_seconds=30),
+        provider_factory=make_provider,
+    )
+
+    assert provider_args[0]["headed"] is True
+    assert provider_args[0]["keep_login_page"] is True
+    assert [call[1:] for call in process_calls] == [
+        ("current-run", "current-task"),
+        ("old-run", "old-task"),
+    ]
+    assert all(call[0] is provider for call in process_calls)
+    assert lease_calls[-1] == ("current-run", "old-run")
+    assert summary.run_ids == ("current-run", "old-run")
+    assert summary.collected_count == 2
+    assert summary.completed_count == 2
+    assert summary.unresolved_count == 0
+    assert summary.stopped_reason == "stop_requested_drained"
+    assert provider.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_login_or_stop_cancellation_cleans_up_both_waiters():
+    confirmation_started = asyncio.Event()
+    confirmation_cancelled = asyncio.Event()
+
+    class BlockingStopEvent:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        def is_set(self):
+            return False
+
+        async def wait(self):
+            self.started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+
+    stop_event = BlockingStopEvent()
+
+    async def confirm(_provider, _timeout):
+        confirmation_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            confirmation_cancelled.set()
+            raise
+
+    task = asyncio.create_task(
+        service._confirm_login_or_stop(
+            SimpleNamespace(),
+            stop_event,
+            confirmation=confirm,
+        )
+    )
+    await asyncio.wait_for(
+        asyncio.gather(confirmation_started.wait(), stop_event.started.wait()),
+        timeout=1,
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert confirmation_cancelled.is_set()
+    assert stop_event.cancelled.is_set()
 
 
 @pytest.mark.asyncio

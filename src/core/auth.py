@@ -38,26 +38,48 @@ class GateAwareSemaphore:
         self._next_request_at = 0.0
         self._admission_lock = asyncio.Lock()
         self._bypass_auth = contextvars.ContextVar(f"research_auth_bypass_{id(self)}", default=False)
+        self._api_stop_event = contextvars.ContextVar(f"research_api_stop_event_{id(self)}", default=None)
 
     async def acquire(self) -> bool:
+        stop_event = self._api_stop_event.get()
         while True:
-            await self._wait_for_request_slot()
-            await self._semaphore.acquire()
+            await self._await_or_api_stop(self._wait_for_request_slot(), stop_event)
+            if stop_event is not None and stop_event.is_set():
+                raise asyncio.CancelledError
+
+            capacity_wait = asyncio.create_task(self._semaphore.acquire())
+            try:
+                await self._await_or_api_stop(capacity_wait, stop_event)
+            except BaseException:
+                if self._task_succeeded(capacity_wait):
+                    self._semaphore.release()
+                raise
 
             granted = False
             remaining = 0.0
             try:
+                if stop_event is not None and stop_event.is_set():
+                    raise asyncio.CancelledError
                 if self._minimum_interval_seconds == 0:
-                    gate_is_open = await self._active_gate_is_open()
+                    gate_is_open = await self._await_or_api_stop(self._active_gate_is_open(), stop_event)
                     granted = gate_is_open
                 else:
-                    async with self._admission_lock:
-                        gate_is_open = await self._active_gate_is_open()
-                        now = asyncio.get_running_loop().time()
-                        remaining = self._next_request_at - now
-                        if gate_is_open and remaining <= 0:
-                            self._next_request_at = now + self._minimum_interval_seconds
-                            granted = True
+                    async def check_admission() -> tuple[bool, float]:
+                        async with self._admission_lock:
+                            gate_is_open = await self._await_or_api_stop(
+                                self._active_gate_is_open(), stop_event
+                            )
+                            now = asyncio.get_running_loop().time()
+                            wait_seconds = self._next_request_at - now
+                            is_granted = gate_is_open and wait_seconds <= 0
+                            if is_granted:
+                                self._next_request_at = now + self._minimum_interval_seconds
+                            return is_granted, wait_seconds
+
+                    granted, remaining = await self._await_or_api_stop(check_admission(), stop_event)
+                if stop_event is not None and stop_event.is_set():
+                    granted = False
+                    raise asyncio.CancelledError
                 if granted:
                     return True
             finally:
@@ -65,7 +87,48 @@ class GateAwareSemaphore:
                     self._semaphore.release()
 
             if remaining > 0:
-                await asyncio.sleep(remaining)
+                await self._await_or_api_stop(asyncio.sleep(remaining), stop_event)
+
+    @staticmethod
+    def _task_succeeded(task: asyncio.Future[object]) -> bool:
+        if not task.done() or task.cancelled():
+            return False
+        try:
+            return task.exception() is None and bool(task.result())
+        except BaseException:
+            return False
+
+    @staticmethod
+    async def _await_or_api_stop(awaitable: Awaitable[object], stop_event: asyncio.Event | None) -> object:
+        if stop_event is None:
+            return await awaitable
+        if stop_event.is_set():
+            if asyncio.iscoroutine(awaitable):
+                awaitable.close()
+            elif isinstance(awaitable, asyncio.Future):
+                awaitable.cancel()
+                await asyncio.gather(awaitable, return_exceptions=True)
+            raise asyncio.CancelledError
+
+        operation = asyncio.ensure_future(awaitable)
+        stopped = asyncio.create_task(stop_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {operation, stopped},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stopped in done and operation not in done:
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+                raise asyncio.CancelledError
+            return await operation
+        finally:
+            if not operation.done():
+                operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            if not stopped.done():
+                stopped.cancel()
+            await asyncio.gather(stopped, return_exceptions=True)
 
     async def _active_gate_is_open(self) -> bool:
         if self._bypass_auth.get():
@@ -97,6 +160,14 @@ class GateAwareSemaphore:
 
     async def __aexit__(self, *_exc_info: object) -> None:
         self.release()
+
+    @asynccontextmanager
+    async def api_stop_guard(self, stop_event: asyncio.Event) -> AsyncGenerator[None, None]:
+        token = self._api_stop_event.set(stop_event)
+        try:
+            yield
+        finally:
+            self._api_stop_event.reset(token)
 
     @asynccontextmanager
     async def bypass_auth_gate(self) -> AsyncGenerator[None, None]:

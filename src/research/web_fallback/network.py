@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, urlparse
 from .identity import (
     DuplicateJSONKeyError,
     IdentityError,
+    IdentityEvidence,
     ImmutableRequestContext,
     ObservationCandidate,
     Target,
@@ -35,6 +36,7 @@ class NetworkExtractionResult:
     identity_verified: bool
     candidates: tuple[ObservationCandidate, ...]
     field_outcomes: dict[str, dict[str, str]] = field(default_factory=dict)
+    identity_evidence: IdentityEvidence | None = None
 
 
 def extract_page_pc_thread_counts(
@@ -133,7 +135,63 @@ def extract_page_pc_thread_counts(
         outcomes.pop("global_growth_icon_url", None)
     elif growth_outcome is not None:
         outcomes["global_growth_icon_url"] = growth_outcome
-    return NetworkExtractionResult("ok", None, True, tuple(candidates), outcomes)
+    if "global_growth_level" in target.requested_fields:
+        growth = author.get("user_growth")
+        if isinstance(growth, dict) and "level_id" in growth:
+            level = _nonnegative_integer(growth["level_id"])
+            if level == 0:
+                outcomes["global_growth_level"] = {
+                    "status": "absent_on_page",
+                    "reason": "global_growth_level_zero_is_unknown",
+                }
+            elif level is None:
+                outcomes["global_growth_level"] = {
+                    "status": "needs_evidence",
+                    "reason": "invalid_global_growth_level",
+                }
+            else:
+                outcomes.pop("global_growth_level", None)
+                candidates.append(
+                    _page_pc_candidate(
+                        target,
+                        "global_growth_level",
+                        growth["level_id"],
+                        level,
+                        "page_pc.thread.author.user_growth.level_id",
+                        request_context,
+                        identity,
+                    )
+                )
+    if "ip_location_text" in target.requested_fields:
+        region = author.get("ip_address")
+        if isinstance(region, str):
+            normalized_region = region.strip()
+            if normalized_region and not _is_literal_ip(normalized_region):
+                outcomes.pop("ip_location_text", None)
+                candidates.append(
+                    _page_pc_candidate(
+                        target,
+                        "ip_location_text",
+                        region,
+                        normalized_region,
+                        "page_pc.thread.author.ip_address",
+                        request_context,
+                        identity,
+                    )
+                )
+            elif normalized_region:
+                outcomes["ip_location_text"] = {
+                    "status": "needs_evidence",
+                    "reason": "bare_ip_not_region_label",
+                }
+            else:
+                outcomes["ip_location_text"] = {
+                    "status": "absent_on_page",
+                    "reason": "ip_location_empty_in_response",
+                }
+    return NetworkExtractionResult(
+        "ok", None, True, tuple(candidates), outcomes, identity_evidence=identity
+    )
 
 
 def extract_page_pc_post(
@@ -331,7 +389,9 @@ def extract_page_pc_post(
         outcomes["agree_count"] = agree_outcomes["agree_count"]
     for candidate in candidates:
         outcomes.pop(candidate.field_name, None)
-    return NetworkExtractionResult("ok", None, True, tuple(candidates), outcomes)
+    return NetworkExtractionResult(
+        "ok", None, True, tuple(candidates), outcomes, identity_evidence=identity
+    )
 
 
 def extract_page_pc_comment(
@@ -546,24 +606,31 @@ def extract_page_pc_comment(
     }
     candidates = []
     ip_address = user.get("ip_address")
-    if (
-        "ip_location_text" in target.requested_fields
-        and isinstance(ip_address, str)
-        and ip_address.strip()
-        and not _is_literal_ip(ip_address.strip())
-    ):
-        outcomes.pop("ip_location_text", None)
-        candidates.append(
-            _page_pc_candidate(
-                target,
-                "ip_location_text",
-                ip_address,
-                ip_address,
-                f"page_pc.user_list[{user_index}].ip_address",
-                request_context,
-                identity,
+    if "ip_location_text" in outcomes and isinstance(ip_address, str):
+        normalized_ip_address = ip_address.strip()
+        if not normalized_ip_address:
+            outcomes["ip_location_text"] = {
+                "status": "absent_on_page",
+                "reason": "ip_location_empty_in_response",
+            }
+        elif _is_literal_ip(normalized_ip_address):
+            outcomes["ip_location_text"] = {
+                "status": "needs_evidence",
+                "reason": "bare_ip_not_region_label",
+            }
+        else:
+            outcomes.pop("ip_location_text", None)
+            candidates.append(
+                _page_pc_candidate(
+                    target,
+                    "ip_location_text",
+                    ip_address,
+                    normalized_ip_address,
+                    f"page_pc.user_list[{user_index}].ip_address",
+                    request_context,
+                    identity,
+                )
             )
-        )
     growth = user.get("user_growth")
     if "global_growth_level" in target.requested_fields and isinstance(growth, dict) and "level_id" in growth:
         level = _nonnegative_integer(growth["level_id"])
@@ -684,7 +751,9 @@ def extract_page_pc_comment(
             outcomes[field_name] = count_outcomes[field_name]
     for candidate in candidates:
         outcomes.pop(candidate.field_name, None)
-    return NetworkExtractionResult("ok", None, True, tuple(candidates), outcomes)
+    return NetworkExtractionResult(
+        "ok", None, True, tuple(candidates), outcomes, identity_evidence=identity
+    )
 
 
 def _page_pc_payload(target, response_text, request_context, target_type, response_status):
@@ -907,14 +976,21 @@ def extract_nested_floor(
         return failed("identity_unverified", reason)
 
     index, item = matching_items[0]
-    item_fid = _optional_id(item, "fid")
-    if item.get("fid") is not None and item_fid is None:
-        return failed("identity_unverified", "invalid_response_fid")
-    if target.fid is not None and item_fid is not None and item_fid != target.fid:
-        return failed("identity_unverified", "response_fid_mismatch")
-    if request_context.request_fid is not None and target.fid is not None and request_context.request_fid != target.fid:
+    response_fid, alias_reason = _nested_floor_response_identity(target, payload, data, item)
+    if alias_reason is not None:
+        return failed("identity_unverified", alias_reason)
+
+    if (
+        request_context.request_fid is not None
+        and target.fid is not None
+        and request_context.request_fid != target.fid
+    ):
         return failed("identity_unverified", "request_fid_mismatch")
-    if item_fid is not None and request_context.request_fid is not None and item_fid != request_context.request_fid:
+    if (
+        response_fid is not None
+        and request_context.request_fid is not None
+        and response_fid != request_context.request_fid
+    ):
         return failed("identity_unverified", "request_response_fid_mismatch")
 
     author = item.get("author")
@@ -932,12 +1008,18 @@ def extract_nested_floor(
     if target.author_user_id is None or author_id != target.author_user_id:
         return failed("identity_unverified", "response_author_id_mismatch")
 
-    identity_methods = ["page_tid", "request_tid", "request_parent_post_pid", "response_cid", "response_author_id"]
+    identity_methods = [
+        "page_tid",
+        "request_tid",
+        "request_parent_post_pid",
+        "response_cid",
+        "response_author_id",
+    ]
     if request_context.request_fid is not None:
         identity_methods.append("request_fid")
-    if item_fid is not None:
+    if response_fid is not None:
         identity_methods.append("response_fid")
-    if target.fid is not None and request_context.request_fid is None and item_fid is None:
+    if target.fid is not None and request_context.request_fid is None and response_fid is None:
         identity_methods.append("known_api_tid_fid_binding")
     identity = make_identity_evidence(target, tuple(identity_methods), request_context)
     observed_at = observed_at or datetime.now(UTC)
@@ -1041,7 +1123,58 @@ def extract_nested_floor(
             )
 
     _add_forum_level_candidates(target, item, base, add)
-    return NetworkExtractionResult("ok", None, True, tuple(candidates), field_outcomes)
+    return NetworkExtractionResult(
+        "ok", None, True, tuple(candidates), field_outcomes, identity_evidence=identity
+    )
+
+
+def _nested_floor_response_identity(target: Target, *sources: Any) -> tuple[str | None, str | None]:
+    response_fid = None
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("tid", "thread_id"):
+            if key not in source:
+                continue
+            try:
+                if parse_positive_id(source[key]) != target.tid:
+                    return None, "response_tid_mismatch"
+            except IdentityError:
+                return None, "invalid_response_tid"
+        for key in ("fid", "forum_id"):
+            if key not in source:
+                continue
+            try:
+                value = parse_positive_id(source[key])
+            except IdentityError:
+                return None, "invalid_response_fid"
+            if (
+                (target.fid is not None and value != target.fid)
+                or (response_fid is not None and value != response_fid)
+            ):
+                return None, "response_fid_mismatch"
+            response_fid = value
+        for key in ("parent_id", "parent_post_id", "parent_post_pid"):
+            if key not in source:
+                continue
+            try:
+                value = parse_positive_id(source[key])
+            except IdentityError:
+                return None, "invalid_response_parent_pid"
+            if value != target.parent_post_pid:
+                return None, "response_parent_pid_mismatch"
+        # pid/post_id payloads vary between child and parent IDs; reject unknown values
+        # and use the validated request context as the parent proof.
+        for key in ("pid", "post_id"):
+            if key not in source:
+                continue
+            try:
+                value = parse_positive_id(source[key])
+            except IdentityError:
+                return None, "invalid_response_parent_identity"
+            if value not in {target.cid, target.parent_post_pid}:
+                return None, "response_parent_identity_mismatch"
+    return response_fid, None
 
 
 def _add_forum_level_candidates(target: Target, item: dict[str, Any], base: str, add) -> None:
@@ -1149,15 +1282,6 @@ def _forum_id_from_schema(schema: str) -> str | None:
         return None
     try:
         return parse_positive_id(params["forumId"])
-    except IdentityError:
-        return None
-
-
-def _optional_id(value: dict[str, Any], key: str) -> str | None:
-    if key not in value or value[key] is None:
-        return None
-    try:
-        return parse_positive_id(value[key])
     except IdentityError:
         return None
 

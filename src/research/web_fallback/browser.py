@@ -6,12 +6,17 @@ import asyncio
 import contextvars
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
-from .dom import DOMExtractionResult, extract_dom_candidates, target_dom_structure_ready
+from .dom import (
+    DOMExtractionResult,
+    extract_comment_author_growth,
+    extract_dom_candidates,
+    target_dom_structure_ready,
+)
 from .identity import ImmutableRequestContext, ObservationCandidate, Target, make_request_context
 from .network import (
     NESTED_FLOOR_PATH,
@@ -25,6 +30,73 @@ from .network import (
 )
 
 _CALLBACK_CLEANUP_TIMEOUT_SECONDS = 0.05
+_COMMENT_GROWTH_HYDRATION_WAIT_SECONDS = 2.0
+_COMMENT_GROWTH_HYDRATION_POLL_SECONDS = 0.05
+_MAX_COMMENT_GROWTH_HOVERS = 3
+
+_COMMENT_GROWTH_HOVER_POINTS_SCRIPT = r"""({parentPid, portrait, limit}) => {
+  const parent = Array.from(document.querySelectorAll('.pb-comment-item[data-id]'))
+    .find((node) => node.getAttribute('data-id') === String(parentPid));
+  if (!parent) return [];
+  const contents = Array.from(parent.children).filter((node) => node.classList.contains('comment-content'));
+  if (contents.length !== 1) return [];
+  let wrappers = Array.from(contents[0].children).filter((node) => node.classList.contains('lzl-wrapper'));
+  if (!wrappers.length) {
+    wrappers = Array.from(parent.children).filter((node) => node.classList.contains('lzl-wrapper'));
+  }
+  if (wrappers.length !== 1) return [];
+  const owners = Array.from(wrappers[0].children).filter((node) => node.classList.contains('pb-lzl-item'));
+  const boundary = '.pb-comment-item, .pb-lzl-item';
+  const ownedBy = (node, owner) => {
+    let current = node.parentElement;
+    while (current && current !== owner) {
+      if (current.matches(boundary)) return false;
+      current = current.parentElement;
+    }
+    return current === owner;
+  };
+  const points = [];
+  for (const owner of owners) {
+    const headers = Array.from(owner.querySelectorAll('.head-line.user-info'))
+      .filter((header) => ownedBy(header, owner));
+    if (headers.length !== 1) continue;
+    for (const header of headers) {
+      const nameInfos = Array.from(header.querySelectorAll('.name-info'));
+      if (nameInfos.length !== 1) continue;
+      const links = Array.from(nameInfos[0].querySelectorAll('a.head-name[href]'));
+      if (links.length !== 1) continue;
+      let portraitId = null;
+      try {
+        const profile = new URL(links[0].href, location.href);
+        const ids = profile.searchParams.getAll('id');
+        if (profile.protocol !== 'https:' || profile.hostname.toLowerCase() !== 'tieba.baidu.com'
+            || profile.pathname.replace(/\/$/, '') !== '/home/main' || ids.length !== 1
+            || !ids[0] || /^[0-9]+$/.test(ids[0])) continue;
+        portraitId = ids[0];
+      } catch (_) {
+        continue;
+      }
+      if (portraitId !== portrait) continue;
+      const icons = Array.from(header.querySelectorAll('.icon_tshows'))
+        .filter((icon) => ownedBy(icon, header));
+      for (const icon of icons) {
+        const refs = icon.classList.contains('tooltip__reference')
+          ? [icon]
+          : Array.from(icon.querySelectorAll('.tooltip__reference'))
+            .filter((ref) => ownedBy(ref, header));
+        for (const ref of refs) {
+          if (ref.closest('.icon_tshows') !== icon) continue;
+          const rect = ref.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            points.push({x: rect.left + rect.width / 2, y: rect.top + rect.height / 2});
+            if (points.length >= limit) return points;
+          }
+        }
+      }
+    }
+  }
+  return points;
+}"""
 
 
 @dataclass(frozen=True)
@@ -35,6 +107,17 @@ class BrowserRunResult:
     diagnostics: dict[str, Any]
     field_outcomes: dict[str, dict[str, str]] = field(default_factory=dict)
     identity_verified: bool = False
+    identity_methods: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedPostPage:
+    page: Any
+    tid: str
+    page_url: str
+    request_context: ImmutableRequestContext
+    response_text: str
+    response_status: int
 
 
 class BrowserProviderConfigurationError(RuntimeError):
@@ -93,6 +176,7 @@ class PlaywrightWebFallbackProvider:
         self._target_semaphore = asyncio.Semaphore(1)
         self._closed = False
         self._manual_login_page = None
+        self._cached_post_page: _CachedPostPage | None = None
         self._active_collect_task: asyncio.Task | None = None
         self._close_task: asyncio.Task | None = None
         self._close_deferred = False
@@ -116,6 +200,9 @@ class PlaywrightWebFallbackProvider:
             "page_pc_requests": 0,
             "user_card_requests": 0,
             "pages": 0,
+            "page_cache_hits": 0,
+            "post_owner_scrolls": 0,
+            "growth_hover_attempts": 0,
             "expansions": 0,
             "user_card_status": "NOT_TESTED",
             "user_card_reason": None,
@@ -167,15 +254,26 @@ class PlaywrightWebFallbackProvider:
     async def _collect(self, target: Target, state: dict[str, Any], deadline: float) -> BrowserRunResult:
         loop = asyncio.get_running_loop()
         context = await self._ensure_context()
-        page = await context.new_page()
+        cached_page = self._cached_post_page
+        reuse_page = (
+            target.target_type == "post"
+            and cached_page is not None
+            and cached_page.tid == target.tid
+        )
+        if cached_page is not None and not reuse_page:
+            self._cached_post_page = None
+            await _await_cleanup(asyncio.create_task(cached_page.page.close()))
+        page = cached_page.page if reuse_page else await context.new_page()
         request_contexts: dict[Any, ImmutableRequestContext] = {}
         request_page_numbers: dict[Any, int] = {}
+        request_page_urls: dict[Any, str] = {}
         page_network_results: dict[int, list[NetworkExtractionResult]] = {}
         capture_tasks: dict[Any, asyncio.Task] = {}
         response_tasks: set[asyncio.Task] = set()
         callback_tasks: set[asyncio.Task] = set()
         network_results: list[NetworkExtractionResult] = []
         identity_mismatch = False
+        post_page_snapshot: _CachedPostPage | None = None
 
         async def capture_response(response) -> None:
             key = _request_key(response.request)
@@ -186,9 +284,10 @@ class PlaywrightWebFallbackProvider:
             await task
 
         async def read_and_parse_response(response, key: int) -> None:
-            nonlocal identity_mismatch
+            nonlocal identity_mismatch, post_page_snapshot
             context_snapshot = request_contexts.pop(key, None)
             response_page_number = request_page_numbers.pop(key, None)
+            response_page_url = request_page_urls.pop(key, None)
             if context_snapshot is None:
                 identity_mismatch = True
                 state["network_request_context_unavailable"] = True
@@ -218,6 +317,20 @@ class PlaywrightWebFallbackProvider:
                 response_status=response.status,
             )
             network_results.append(result)
+            if (
+                path == PAGE_PC_PATH
+                and target.target_type == "post"
+                and result.identity_verified
+                and context_snapshot.target.target_type == "post"
+            ):
+                post_page_snapshot = _CachedPostPage(
+                    page=page,
+                    tid=target.tid,
+                    page_url=response_page_url or page.url,
+                    request_context=context_snapshot,
+                    response_text=response_text,
+                    response_status=response.status,
+                )
             if response_page_number is not None:
                 page_network_results.setdefault(response_page_number, []).append(result)
             if result.status == "identity_unverified" and result.reason not in {
@@ -254,6 +367,7 @@ class PlaywrightWebFallbackProvider:
                     ),
                 )
                 request_page_numbers[_request_key(request)] = state["pages"]
+                request_page_urls[_request_key(request)] = page.url
 
         def schedule_blocked(reason: str) -> None:
             if state["block_callback_notified"]:
@@ -303,10 +417,45 @@ class PlaywrightWebFallbackProvider:
         page.on("request", on_request)
         page.on("response", on_response)
         dom_result: DOMExtractionResult | None = None
+        cache_ready = False
         try:
-            for page_number in range(1, self._max_pages + 1):
+            if reuse_page and cached_page is not None:
+                cached_context = replace(
+                    cached_page.request_context,
+                    target=target,
+                    context_id=f"{cached_page.request_context.context_id}:cached:{uuid.uuid4().hex}",
+                )
+                cached_result = extract_page_pc_post(
+                    target,
+                    cached_page.response_text,
+                    cached_context,
+                    response_status=cached_page.response_status,
+                )
+                if cached_result.status == "ok" and cached_result.identity_verified:
+                    network_results.append(cached_result)
+                    post_page_snapshot = _CachedPostPage(
+                        page=page,
+                        tid=target.tid,
+                        page_url=cached_page.page_url,
+                        request_context=cached_context,
+                        response_text=cached_page.response_text,
+                        response_status=cached_page.response_status,
+                    )
+                    state["page_cache_hits"] = 1
+                    dom_result = await _extract_post_dom_with_scroll(
+                        page, target, deadline, state
+                    )
+                    if dom_result.identity_verified:
+                        dom_result = await _hover_growth_and_extract_dom(
+                            page, target, dom_result, network_results, deadline, state
+                        )
+                    cache_ready = True
+                else:
+                    self._cached_post_page = None
+
+            for page_number in (() if cache_ready else range(1, self._max_pages + 1)):
                 state["pages"] += 1
-                page_url = f"https://tieba.baidu.com/p/{target.tid}?{urlencode({'pn': page_number})}"
+                page_url = _target_page_url(target, page_number)
                 async with self._budget(state):
                     response = await page.goto(
                         page_url,
@@ -347,7 +496,15 @@ class PlaywrightWebFallbackProvider:
                 if readiness == "timeout":
                     return BrowserRunResult("timeout", "browser_task_timeout", (), dict(state))
                 if readiness in {"network_ready", "network_invalid"}:
-                    dom_result = extract_dom_candidates(target, page.url, await page.content())
+                    dom_result = (
+                        await _extract_post_dom_with_scroll(page, target, deadline, state)
+                        if target.target_type == "post" and readiness == "network_ready"
+                        else _extract_dom_or_empty(target, page.url, await page.content())
+                    )
+                    if dom_result.identity_verified:
+                        dom_result = await _hover_growth_and_extract_dom(
+                            page, target, dom_result, network_results, deadline, state
+                        )
                     break
                 if readiness != "ready":
                     if target.target_type in {"thread", "post"}:
@@ -355,13 +512,35 @@ class PlaywrightWebFallbackProvider:
                     continue
 
                 if target.target_type in {"thread", "post"}:
-                    dom_result = extract_dom_candidates(target, page.url, await page.content())
+                    dom_result = _extract_dom_or_empty(target, page.url, await page.content())
+                    if dom_result.identity_verified:
+                        dom_result = await _hover_growth_and_extract_dom(
+                            page, target, dom_result, network_results, deadline, state
+                        )
                     if dom_result.identity_verified:
                         break
                     if dom_result.reason not in {"post_data_id_missing", "first_floor_owner_missing"}:
                         break
                 elif target.target_type == "comment":
                     await self._expand_comment_owner(page, target, state, capture_response, deadline)
+                    dom_result = _extract_dom_or_empty(target, page.url, await page.content())
+                    if dom_result.identity_verified:
+                        dom_result = await _hover_growth_and_extract_dom(
+                            page, target, dom_result, network_results, deadline, state
+                        )
+                    comment_growth_result = None
+                    if not state.get("identity_failure") and not state["blocked_reason"]:
+                        comment_growth_result = await _extract_comment_author_growth(
+                            page, target, network_results, dom_result, deadline, state
+                        )
+                    if comment_growth_result is not None:
+                        if (
+                            comment_growth_result.status == "identity_unverified"
+                            and _comment_growth_identity_conflict(comment_growth_result)
+                        ):
+                            state["identity_failure"] = comment_growth_result.reason
+                        elif comment_growth_result.identity_verified:
+                            dom_result = _merge_dom_results(dom_result, comment_growth_result)
                     if state["nested_floor_requests"] or state["blocked_reason"] or state.get("identity_failure"):
                         break
 
@@ -402,6 +581,9 @@ class PlaywrightWebFallbackProvider:
             identity_verified = any(result.identity_verified for result in network_results) or (
                 dom_result is not None and dom_result.identity_verified
             )
+            identity_methods = _identity_methods(target, network_results, dom_result)
+            if target.target_type == "post" and identity_verified and post_page_snapshot is not None:
+                self._cached_post_page = post_page_snapshot
             if candidates:
                 return BrowserRunResult(
                     "ok",
@@ -410,6 +592,7 @@ class PlaywrightWebFallbackProvider:
                     dict(state),
                     _field_outcomes(target, network_results, dom_result),
                     identity_verified,
+                    identity_methods,
                 )
             if identity_verified:
                 return BrowserRunResult(
@@ -419,6 +602,7 @@ class PlaywrightWebFallbackProvider:
                     dict(state),
                     _field_outcomes(target, network_results, dom_result),
                     True,
+                    identity_methods,
                 )
             if (
                 target.target_type == "post"
@@ -484,7 +668,16 @@ class PlaywrightWebFallbackProvider:
             finally:
                 if keep_page:
                     self._manual_login_page = page
+                elif (
+                    self._cached_post_page is not None
+                    and self._cached_post_page.page is page
+                    and not self._closed
+                    and state.get("blocked_reason") != "http_429"
+                ):
+                    pass
                 else:
+                    if self._cached_post_page is not None and self._cached_post_page.page is page:
+                        self._cached_post_page = None
                     await _await_cleanup(asyncio.create_task(page.close()))
 
     async def _wait_for_target(
@@ -599,7 +792,7 @@ class PlaywrightWebFallbackProvider:
                 from playwright.async_api import async_playwright
             except ImportError:
                 raise BrowserProviderConfigurationError(
-                    "Playwright is not installed. Run `uv sync --group login`, then "
+                    "Playwright is not installed. Run `uv sync`, then "
                     "`uv run playwright install chromium`."
                 ) from None
             factory = async_playwright
@@ -616,10 +809,18 @@ class PlaywrightWebFallbackProvider:
 
     @asynccontextmanager
     async def _budget(self, state: dict[str, Any] | None = None):
-        async with self.budget:
-            if state is not None:
-                state["budgeted_actions"] += 1
-            yield
+        bypass_auth_gate = getattr(self.budget, "bypass_auth_gate", None)
+        if callable(bypass_auth_gate):
+            async with bypass_auth_gate():
+                async with self.budget:
+                    if state is not None:
+                        state["budgeted_actions"] += 1
+                    yield
+        else:
+            async with self.budget:
+                if state is not None:
+                    state["budgeted_actions"] += 1
+                yield
 
     def _remaining_ms(self, deadline: float | None = None) -> int:
         if deadline is None:
@@ -653,6 +854,10 @@ class PlaywrightWebFallbackProvider:
             active_task.cancel()
             await asyncio.gather(active_task, return_exceptions=True)
         await self.close_manual_login_page()
+        cached_page = self._cached_post_page
+        self._cached_post_page = None
+        if cached_page is not None:
+            await _await_cleanup(asyncio.create_task(cached_page.page.close()))
         if self._owned_context and self._context is not None:
             await self._context.close()
         self._context = self._external_context
@@ -687,6 +892,346 @@ def _field_outcomes(target, network_results, dom_result):
                 {"status": "not_tested", "reason": "not_observed_in_bounded_page"},
             )
     return outcomes
+
+
+async def _extract_post_dom_with_scroll(page, target: Target, deadline: float, state: dict[str, Any]):
+    """Give a virtualized post owner a bounded chance to render before DOM extraction."""
+    result: DOMExtractionResult | None = None
+    loop = asyncio.get_running_loop()
+    hydration_deadline = min(deadline - 0.1, loop.time() + 1.0)
+    for attempt in range(21):
+        html_text = await page.content()
+        result = _extract_dom_or_empty(target, page.url, html_text)
+        if result.identity_verified or result.reason != "post_data_id_missing":
+            if result.reason != "dom_content_empty":
+                return result
+        remaining = hydration_deadline - loop.time()
+        if attempt == 20 or remaining <= 0.01:
+            break
+
+        selector = f'.pb-comment-item[data-id="{target.pid}"]'
+        try:
+            locator = page.locator(selector)
+            if await locator.count() == 1:
+                scroll_into_view = getattr(locator, "scroll_into_view_if_needed", None)
+                if callable(scroll_into_view):
+                    await scroll_into_view(timeout=max(1, min(1000, int(remaining * 1000))))
+        except Exception:
+            # Vue may detach the exact owner between the locator check and scroll.
+            pass
+
+        evaluate = getattr(page, "evaluate", None)
+        if not callable(evaluate):
+            break
+        try:
+            await evaluate("() => window.scrollBy(0, Math.max(window.innerHeight * 0.8, 600))")
+        except Exception:
+            break
+        state["post_owner_scrolls"] += 1
+        await asyncio.sleep(min(0.05, max(0, hydration_deadline - loop.time())))
+    return result or _extract_dom_or_empty(target, page.url, "")
+
+
+def _extract_dom_or_empty(target: Target, page_url: str, html_text: str) -> DOMExtractionResult:
+    if not html_text.strip():
+        return DOMExtractionResult("not_tested", "dom_content_empty", False, ())
+    return extract_dom_candidates(target, page_url, html_text)
+
+
+async def _extract_comment_author_growth(
+    page,
+    target: Target,
+    network_results,
+    dom_result: DOMExtractionResult | None,
+    deadline: float,
+    state: dict[str, Any],
+) -> DOMExtractionResult | None:
+    growth_fields = {"global_growth_level", "global_growth_icon_url"}
+    if target.target_type != "comment" or not set(target.requested_fields) & growth_fields:
+        return None
+    if dom_result is not None and dom_result.identity_verified:
+        return None
+    if any(
+        candidate.field_name in growth_fields
+        for result in network_results
+        for candidate in result.candidates
+    ):
+        return None
+
+    network_identities = [
+        result.identity_evidence
+        for result in network_results
+        if result.status == "ok"
+        and result.identity_verified
+        and result.identity_evidence is not None
+    ]
+    if not network_identities:
+        return None
+    network_identity = network_identities[-1]
+
+    loop = asyncio.get_running_loop()
+    hydration_deadline = min(deadline, loop.time() + _COMMENT_GROWTH_HYDRATION_WAIT_SECONDS)
+    last_result = None
+    while True:
+        try:
+            html_text = await page.content()
+        except Exception:
+            html_text = ""
+        result = (
+            extract_comment_author_growth(
+                target,
+                page.url,
+                html_text,
+                network_identity,
+            )
+            if html_text.strip()
+            else DOMExtractionResult("not_tested", "dom_content_empty", False, ())
+        )
+        last_result = result
+        if _comment_growth_identity_conflict(result):
+            return result
+        if result.identity_verified and result.reason != "author_profile_header_not_observed":
+            if any(candidate.field_name in growth_fields for candidate in result.candidates):
+                return result
+            if _comment_growth_needs_hover(result):
+                result = await _hover_comment_author_growth(
+                    page,
+                    target,
+                    network_identity,
+                    result,
+                    deadline,
+                    state,
+                )
+                if _comment_growth_identity_conflict(result):
+                    return result
+            return result
+
+        remaining = hydration_deadline - loop.time()
+        if remaining <= 0:
+            return last_result
+        state["comment_growth_hydration_waits"] = (
+            state.get("comment_growth_hydration_waits", 0) + 1
+        )
+        await asyncio.sleep(min(_COMMENT_GROWTH_HYDRATION_POLL_SECONDS, remaining))
+
+
+def _comment_growth_identity_conflict(result: DOMExtractionResult) -> bool:
+    if result.status != "identity_unverified":
+        return False
+    transient_dom_reasons = {
+        "parent_post_data_id_missing",
+        "comment_content_not_unique",
+        "comment_wrapper_not_unique",
+        "comment_owner_not_present",
+        "thread_context_not_exposed",
+    }
+    return result.reason not in transient_dom_reasons
+
+
+def _comment_growth_needs_hover(result: DOMExtractionResult) -> bool:
+    hover_reasons = {
+        "icon_semantics_unverified",
+        "numeric_level_not_exposed_in_page",
+        "growth_icon_image_not_found",
+    }
+    return any(
+        outcome.get("status") == "needs_evidence"
+        and outcome.get("reason") in hover_reasons
+        for outcome in result.field_outcomes.values()
+    )
+
+
+async def _hover_comment_author_growth(
+    page,
+    target: Target,
+    network_identity,
+    current: DOMExtractionResult,
+    deadline: float,
+    state: dict[str, Any],
+) -> DOMExtractionResult:
+    loop = asyncio.get_running_loop()
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        return current
+    evaluate = getattr(page, "evaluate", None)
+    mouse = getattr(page, "mouse", None)
+    move = getattr(mouse, "move", None)
+    if not callable(evaluate) or not callable(move):
+        return current
+
+    try:
+        async with asyncio.timeout(min(1.0, remaining)):
+            points = await evaluate(
+                _COMMENT_GROWTH_HOVER_POINTS_SCRIPT,
+                {
+                    "parentPid": target.parent_post_pid,
+                    "portrait": target.author_portrait,
+                    "limit": _MAX_COMMENT_GROWTH_HOVERS,
+                },
+            )
+    except Exception:
+        return current
+    if not isinstance(points, (list, tuple)):
+        return current
+
+    result = current
+    for point in points[:_MAX_COMMENT_GROWTH_HOVERS]:
+        if not isinstance(point, dict):
+            continue
+        x, y = point.get("x"), point.get("y")
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            continue
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            async with asyncio.timeout(min(1.0, remaining)):
+                await move(x, y)
+                state["growth_hover_attempts"] += 1
+                await asyncio.sleep(min(0.1, max(0, deadline - loop.time())))
+                html_text = await page.content()
+        except Exception:
+            continue
+        updated = extract_comment_author_growth(
+            target,
+            page.url,
+            html_text,
+            network_identity,
+        )
+        if _comment_growth_identity_conflict(updated):
+            return updated
+        if updated.identity_verified:
+            result = updated
+            if any(
+                candidate.field_name in {"global_growth_level", "global_growth_icon_url"}
+                for candidate in updated.candidates
+            ):
+                return updated
+    return result
+
+
+def _merge_dom_results(
+    current: DOMExtractionResult | None,
+    auxiliary: DOMExtractionResult,
+) -> DOMExtractionResult:
+    results = [
+        result
+        for result in (current, auxiliary)
+        if result is not None and result.identity_verified
+    ]
+    candidates = []
+    outcomes = {}
+    for result in results:
+        candidates.extend(result.candidates)
+        outcomes.update(result.field_outcomes)
+    candidate_fields = {candidate.field_name for candidate in candidates}
+    for field_name in candidate_fields:
+        outcomes.pop(field_name, None)
+    return DOMExtractionResult("ok", None, bool(results), tuple(candidates), outcomes)
+
+
+async def _hover_growth_and_extract_dom(
+    page,
+    target: Target,
+    current: DOMExtractionResult,
+    network_results,
+    deadline: float,
+    state: dict[str, Any],
+) -> DOMExtractionResult:
+    growth_fields = {"global_growth_level", "global_growth_icon_url"}
+    if not set(target.requested_fields) & growth_fields:
+        return current
+    if any(candidate.field_name in growth_fields for result in network_results for candidate in result.candidates):
+        return current
+    if any(candidate.field_name in growth_fields for candidate in current.candidates):
+        return current
+
+    try:
+        if target.target_type == "post":
+            owner = page.locator(f'.pb-comment-item[data-id="{target.pid}"]')
+        elif target.target_type == "comment":
+            parent = page.locator(f'.pb-comment-item[data-id="{target.parent_post_pid}"]')
+            if await parent.count() != 1:
+                return current
+            owner = parent.locator(
+                f':scope .pb-lzl-item[data-cid="{target.cid}"], '
+                f':scope .pb-lzl-item[data-comment-id="{target.cid}"], '
+                f':scope .pb-lzl-item[data-id="{target.cid}"], '
+                f':scope .pb-lzl-item[cid="{target.cid}"]'
+            )
+        else:
+            owner = page.locator(
+                f'.image-text:has(.pb-content-wrap [tid="{target.tid}"][fid="{target.fid}"])'
+            )
+        if await owner.count() != 1:
+            return current
+        headers = owner.locator(":scope > .head-line.user-info")
+        if await headers.count() != 1:
+            return current
+        references = headers.locator(
+            ".icon_tshows.tooltip__reference, .icon_tshows .tooltip__reference"
+        )
+        reference_count = min(3, await references.count())
+    except Exception:
+        return current
+
+    result = current
+    for index in range(reference_count):
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        try:
+            await references.nth(index).hover(timeout=max(1, min(1000, int(remaining * 1000))))
+            state["growth_hover_attempts"] += 1
+            await asyncio.sleep(min(0.1, max(0, deadline - asyncio.get_running_loop().time())))
+            updated = _extract_dom_or_empty(target, page.url, await page.content())
+        except Exception:
+            continue
+        if updated.identity_verified:
+            result = updated
+            if any(candidate.field_name in growth_fields for candidate in updated.candidates):
+                return updated
+    return result
+
+
+def _identity_methods(target, network_results, dom_result) -> tuple[str, ...]:
+    methods = {
+        method
+        for result in network_results
+        for candidate in result.candidates
+        for method in candidate.identity.match_methods
+    }
+    if (
+        target.target_type == "thread"
+        and any(result.status == "ok" and result.identity_verified for result in network_results)
+    ):
+        # extract_page_pc_thread_counts returns ok only after its exact TID/FID,
+        # creator, and first-floor author checks have all passed.
+        methods.update(
+            {
+                "response_forum_id",
+                "response_thread_id",
+                "thread_post_id_matches_first_floor_id",
+                "response_author_id",
+            }
+        )
+    if dom_result is not None:
+        methods.update(
+            method
+            for candidate in dom_result.candidates
+            for method in candidate.identity.match_methods
+        )
+    return tuple(sorted(methods))
+
+
+def _target_page_url(target: Target, page_number: int) -> str:
+    if target.target_type == "post":
+        query = {"pid": target.pid}
+    elif target.target_type == "comment":
+        query = {"pid": target.parent_post_pid}
+    else:
+        query = {"pn": page_number}
+    return f"https://tieba.baidu.com/p/{target.tid}?{urlencode(query)}"
 
 
 def _merge_candidates(network_results, dom_result):
