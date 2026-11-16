@@ -35,7 +35,15 @@ from ..core.metrics import (
     TASK_DURATION,
     WORKER_ERRORS,
 )
-from ..core.models import research_comments_task_key, research_posts_task_key, research_thread_list_task_key
+from ..core.models import (
+    REPLY_BACKFILL_CONTRACT_VERSION,
+    REPLY_BACKFILL_RN,
+    REPLY_BACKFILL_SORT_TYPE,
+    REPLY_BACKFILL_SOURCE_API,
+    research_comments_task_key,
+    research_posts_task_key,
+    research_thread_list_task_key,
+)
 from .tasks import (
     DeepScanTask,
     FullScanCommentsTask,
@@ -264,6 +272,7 @@ class TaskHandler(ABC):
             ThreadsDTO: 主题贴列表数据。
         """
         expected_fid = kwargs.pop("_expected_fid", None)
+        require_research_method = kwargs.pop("_require_research_method", False)
         requested_page = kwargs.get("pn", 1)
         fetched = await self._request_api(
             "threads",
@@ -271,6 +280,7 @@ class TaskHandler(ABC):
             "get_threads_dto",
             (fname,),
             kwargs,
+            require_research_method=require_research_method,
         )
         page = self._dto(fetched.response)
         self._validate_page_number("thread list", requested_page, page.page.current_page)
@@ -351,10 +361,14 @@ class TaskHandler(ABC):
         dto_method: str,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
+        *,
+        require_research_method: bool = False,
     ) -> FetchedPage:
         client, limiter = self._get_client_and_limiter(api_type)
         config = self.container.config
         research_enabled = config.research_enabled
+        if require_research_method and not hasattr(client, research_method):
+            raise PageIntegrityError(f"API client does not provide the required {research_method} method.")
         method_name = research_method if research_enabled and hasattr(client, research_method) else dto_method
         method = getattr(client, method_name)
         attempt_limit = getattr(self.container.config, "research_max_api_retries", 3) if research_enabled else 1
@@ -847,6 +861,42 @@ class ThreadsTaskHandler(TaskHandler):
     获取主题贴列表并分别处理新旧主题贴。
     """
 
+    @staticmethod
+    def _validate_reply_history_page(response: Any, *, pn: int, fid: int) -> None:
+        from ..research.client import ResearchPage
+
+        if not isinstance(response, ResearchPage) or response.source_api != REPLY_BACKFILL_SOURCE_API:
+            raise PageIntegrityError("REPLY history requires a ResearchPage from aiotieba.get_threads.")
+        raw, dto = response.raw, response.dto
+        raw_page, dto_page = getattr(raw, "page", None), getattr(dto, "page", None)
+        raw_forum, dto_forum = getattr(raw, "forum", None), getattr(dto, "forum", None)
+        raw_threads, dto_threads = getattr(raw, "objs", None), getattr(dto, "objs", None)
+        if any(value is None for value in (raw_page, dto_page, raw_forum, dto_forum, raw_threads, dto_threads)):
+            raise PageIntegrityError("REPLY history response is missing raw or DTO identity fields.")
+        if (
+            _positive_int_id(getattr(raw_page, "current_page", None)) != pn
+            or _positive_int_id(getattr(dto_page, "current_page", None)) != pn
+        ):
+            raise PageIntegrityError(f"REPLY history raw/DTO page identity mismatch for requested page {pn}.")
+        if (
+            _positive_int_id(getattr(raw_forum, "fid", None)) != fid
+            or _positive_int_id(getattr(dto_forum, "fid", None)) != fid
+        ):
+            raise PageIntegrityError(f"REPLY history raw/DTO forum identity mismatch for fid {fid}.")
+        raw_tids: set[int] = set()
+        dto_tids: set[int] = set()
+        for threads, target in ((raw_threads, raw_tids), (dto_threads, dto_tids)):
+            for thread in threads:
+                tid = _positive_int_id(getattr(thread, "tid", None))
+                item_fid = _positive_int_id(getattr(thread, "fid", None))
+                if tid is None or item_fid != fid:
+                    raise PageIntegrityError(f"REPLY history item identity mismatch for fid {fid} page {pn}.")
+                target.add(tid)
+        if raw_tids != dto_tids:
+            raise PageIntegrityError(f"REPLY history raw/DTO TID sets differ for fid {fid} page {pn}.")
+        if getattr(raw_page, "has_more", None) != getattr(dto_page, "has_more", None):
+            raise PageIntegrityError(f"REPLY history raw/DTO has_more values differ for fid {fid} page {pn}.")
+
     async def handle(self, task_content: ScanThreadsTask) -> ThreadPageResult:
         """Fetch one page; the backfill scheduler owns page continuation."""
         if self._stop_requested():
@@ -863,7 +913,27 @@ class ThreadsTaskHandler(TaskHandler):
         fname = task_content.fname
         pn = task_content.pn
         is_good = task_content.is_good
-        sort = ThreadSortType.CREATE if task_content.backfill else ThreadSortType.REPLY
+        sort_mode = task_content.sort_mode or ("create" if task_content.backfill else "reply")
+        reply_history = task_content.backfill and sort_mode == "reply"
+        if reply_history:
+            if not self.research_enabled:
+                raise PageIntegrityError("REPLY history requires research.enabled=true.")
+            if task_content.rn != REPLY_BACKFILL_RN or is_good:
+                raise PageIntegrityError("REPLY history requires rn=100 and the normal forum list.")
+            expected_contract = {
+                "list_contract_version": REPLY_BACKFILL_CONTRACT_VERSION,
+                "list_sort_mode": "reply",
+                "source_api": REPLY_BACKFILL_SOURCE_API,
+                "rn": REPLY_BACKFILL_RN,
+                "sort_type": REPLY_BACKFILL_SORT_TYPE,
+                "is_good": False,
+            }
+            for key, value in expected_contract.items():
+                if key in (task_content.continuation_json or {}) and task_content.continuation_json[key] != value:
+                    raise PageIntegrityError(f"REPLY history checkpoint contract mismatch for {key}.")
+        else:
+            expected_contract = {}
+        sort = ThreadSortType.CREATE if sort_mode == "create" else ThreadSortType.REPLY
         fetched_page = await self.get_threads(
             fname,
             pn=pn,
@@ -871,20 +941,31 @@ class ThreadsTaskHandler(TaskHandler):
             sort=sort,
             is_good=is_good,
             _expected_fid=task_content.fid,
+            _require_research_method=reply_history,
         )
+        if reply_history:
+            self._validate_reply_history_page(fetched_page.response, pn=pn, fid=task_content.fid)
         threads_data = self._dto(fetched_page.response)
-        if threads_data.page.total_page < 0 or threads_data.page.total_count < 0:
-            raise PageIntegrityError(f"Thread list returned negative page metadata for {fname} pn={pn}.")
-        if not threads_data.objs and (
-            threads_data.page.has_more
-            or threads_data.page.total_count > 0
-            or threads_data.page.total_page < 1
-        ):
-            raise PageIntegrityError(f"Thread list returned an unconfirmed empty page for {fname} pn={pn}.")
-        if threads_data.page.has_more and threads_data.page.total_page > 0 and pn >= threads_data.page.total_page:
-            raise PageIntegrityError(f"Thread list has_more exceeds total_page for {fname} pn={pn}.")
-        if not threads_data.page.has_more and threads_data.page.total_page > 0 and pn < threads_data.page.total_page:
-            raise PageIntegrityError(f"Thread list ended before total_page for {fname} pn={pn}.")
+        if reply_history:
+            if not threads_data.objs and threads_data.page.has_more:
+                raise PageIntegrityError(f"REPLY history returned an empty page with has_more for {fname} pn={pn}.")
+        else:
+            if threads_data.page.total_page < 0 or threads_data.page.total_count < 0:
+                raise PageIntegrityError(f"Thread list returned negative page metadata for {fname} pn={pn}.")
+            if not threads_data.objs and (
+                threads_data.page.has_more
+                or threads_data.page.total_count > 0
+                or threads_data.page.total_page < 1
+            ):
+                raise PageIntegrityError(f"Thread list returned an unconfirmed empty page for {fname} pn={pn}.")
+            if threads_data.page.has_more and threads_data.page.total_page > 0 and pn >= threads_data.page.total_page:
+                raise PageIntegrityError(f"Thread list has_more exceeds total_page for {fname} pn={pn}.")
+            if (
+                not threads_data.page.has_more
+                and threads_data.page.total_page > 0
+                and pn < threads_data.page.total_page
+            ):
+                raise PageIntegrityError(f"Thread list ended before total_page for {fname} pn={pn}.")
 
         identity_constraints: dict[int, dict[str, int | None]] = {}
         unique_threads = self._dedupe_thread_list_items(
@@ -909,7 +990,7 @@ class ThreadsTaskHandler(TaskHandler):
         non_top_create_times = tuple(thread.create_time for thread in non_top_threads)
         non_top_tids = tuple(thread.tid for thread in non_top_threads)
         cursor = task_content.continuation_json or {}
-        if task_content.backfill and any(
+        if task_content.backfill and sort_mode == "create" and any(
             earlier < later
             for earlier, later in zip(non_top_create_times, non_top_create_times[1:], strict=False)
         ):
@@ -921,7 +1002,7 @@ class ThreadsTaskHandler(TaskHandler):
             )
         if task_content.backfill:
             last_create_time = cursor.get("last_create_time")
-            if non_top_create_times and last_create_time:
+            if sort_mode == "create" and non_top_create_times and last_create_time:
                 from datetime import datetime
 
                 previous_oldest = datetime.fromisoformat(str(last_create_time))
@@ -938,7 +1019,8 @@ class ThreadsTaskHandler(TaskHandler):
             fingerprints = cursor.get("recent_page_fingerprints", [])
             if threads_data.page.has_more and all_tids and all_tids in fingerprints:
                 self.log.warning(
-                    "CREATE page fingerprint repeated for {} is_good={} pn={}; continuing by page number.",
+                    "{} page fingerprint repeated for {} is_good={} pn={}; continuing by page number.",
+                    sort_mode.upper(),
                     fname,
                     is_good,
                     pn,
@@ -946,7 +1028,11 @@ class ThreadsTaskHandler(TaskHandler):
             replay = cursor.get("_resume_replay_page") == pn
             page_seen = {int(tid) for tid in cursor.get("_resume_page_seen_tids", [])} if replay else set()
             page_seen.update(non_top_tids)
-            duplicate_ratio = len(duplicate_tids) / len(non_top_tids) if non_top_tids and not replay else None
+            duplicate_ratio = (
+                len(duplicate_tids) / len(non_top_tids)
+                if non_top_tids and (not replay or reply_history)
+                else None
+            )
             duplicate_streak = int(cursor.get("_flow_duplicate_streak", 0))
             if not replay:
                 duplicate_streak = duplicate_streak + 1 if duplicate_ratio is not None and duplicate_ratio >= 0.9 else 0
@@ -955,12 +1041,19 @@ class ThreadsTaskHandler(TaskHandler):
                 if not replay and duplicate_streak >= 3
                 else None
             )
+            untrusted_terminal_reason = None
+            if reply_history and not threads_data.page.has_more:
+                if threads_data.objs and not non_top_tids:
+                    untrusted_terminal_reason = "terminal_page_without_non_top_threads"
+                elif duplicate_ratio is not None and duplicate_ratio >= 0.9:
+                    untrusted_terminal_reason = "terminal_page_at_least_90_percent_seen"
         else:
             duplicate_tids = set()
             page_seen = set(non_top_tids)
             duplicate_ratio = None
             duplicate_streak = 0
             duplicate_pause_reason = None
+            untrusted_terminal_reason = None
 
         continuation_json = self._thread_list_continuation(
             cursor,
@@ -972,8 +1065,11 @@ class ThreadsTaskHandler(TaskHandler):
             duplicate_ratio=duplicate_ratio,
             duplicate_streak=duplicate_streak,
             duplicate_pause_reason=duplicate_pause_reason,
+            untrusted_terminal_reason=untrusted_terminal_reason,
             has_more=threads_data.page.has_more,
+            include_create_time=sort_mode == "create",
         )
+        continuation_json.update(expected_contract)
         await self._persist_research_page(fetched_page.response)
 
         if not threads_data.objs:
@@ -995,20 +1091,21 @@ class ThreadsTaskHandler(TaskHandler):
         await self._enqueue_missing_web_targets(run_id, thread_ids=tuple(all_tids))
 
         if task_content.backfill and run_id and hasattr(self.datastore, "record_research_checkpoint"):
+            task_key = research_thread_list_task_key(task_content.fid, is_good, sort_mode, task_content.rn)
             await self.datastore.record_research_checkpoint(
                 run_id=run_id,
-                task_key=research_thread_list_task_key(task_content.fid, is_good),
+                task_key=task_key,
                 page_number=pn,
                 task_type="thread_list",
                 scope_type="thread_list",
-                sort_mode="create",
+                sort_mode=sort_mode,
                 fid=task_content.fid,
                 fname=fname,
                 is_good=is_good,
                 status="completed",
                 scope_status=(
                     "incomplete"
-                    if duplicate_pause_reason
+                    if duplicate_pause_reason or untrusted_terminal_reason
                     else "running"
                     if threads_data.page.has_more
                     else "completed"
@@ -1024,7 +1121,7 @@ class ThreadsTaskHandler(TaskHandler):
                             else None
                         ),
                 page_item_count=len(all_tids),
-                reason=duplicate_pause_reason,
+                reason=duplicate_pause_reason or untrusted_terminal_reason,
                 continuation_json=continuation_json,
             )
 
@@ -1051,7 +1148,9 @@ class ThreadsTaskHandler(TaskHandler):
         duplicate_ratio: float | None,
         duplicate_streak: int,
         duplicate_pause_reason: str | None,
+        untrusted_terminal_reason: str | None,
         has_more: bool,
+        include_create_time: bool,
     ) -> dict[str, object]:
         previous_tids = list(
             dict.fromkeys([int(tid) for tid in previous.get("recent_non_top_tids", [])] + list(non_top_tids))
@@ -1070,9 +1169,11 @@ class ThreadsTaskHandler(TaskHandler):
             result["page_duplicate_ratio"] = duplicate_ratio
         if duplicate_pause_reason:
             result["high_duplicate_pause_reason"] = duplicate_pause_reason
-        if page_times:
+        if untrusted_terminal_reason:
+            result["untrusted_terminal_reason"] = untrusted_terminal_reason
+        if include_create_time and page_times:
             result["last_create_time"] = page_times[-1].isoformat()
-        elif previous.get("last_create_time"):
+        elif include_create_time and previous.get("last_create_time"):
             result["last_create_time"] = previous["last_create_time"]
         return result
 

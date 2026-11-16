@@ -264,3 +264,51 @@ async def test_empty_research_forums_fail_before_creating_run(mode):
 
     assert datastore.start_calls == 0
     assert not hasattr(container, "research_run_id")
+
+
+@pytest.mark.asyncio
+async def test_reply_backfill_prepares_separate_run_only_with_research_enabled():
+    class FakeDataStore:
+        def __init__(self):
+            self.start_args = None
+
+        async def start_research_run(self, **kwargs):
+            self.start_args = kwargs
+            return "reply-run-synthetic"
+
+    container = SimpleNamespace(
+        config=SimpleNamespace(
+            research_enabled=True,
+            fetch_user_forum_info=False,
+            max_backfill_pages=9,
+        ),
+        forums=[SimpleNamespace(fid=7, fname="synthetic")],
+    )
+    datastore = FakeDataStore()
+
+    run_id = await app_main._prepare_research_run(
+        container,
+        datastore,
+        "backfill",
+        backfill_sort="reply",
+        resume=False,
+        run_id=None,
+    )
+
+    assert run_id == "reply-run-synthetic"
+    assert datastore.start_args["mode"] == "reply_backfill"
+    assert datastore.start_args["forums"] == [(7, "synthetic")]
+    assert container.research_run_id == run_id
+
+    container.config.research_enabled = False
+    datastore.start_args = None
+    with pytest.raises(ValueError, match="requires research.enabled=true"):
+        await app_main._prepare_research_run(
+            container,
+            datastore,
+            "backfill",
+            backfill_sort="reply",
+            resume=False,
+            run_id=None,
+        )
+    assert datastore.start_args is None

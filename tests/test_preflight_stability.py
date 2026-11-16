@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
@@ -10,12 +12,20 @@ from unittest.mock import AsyncMock
 
 import pytest
 from conftest import make_thread, make_threads_response
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 from tiebameow.models.dto import PageInfoDTO
 
-from src.core.datastore import DataStore
-from src.core.models import ResearchRun, research_thread_list_task_key
+from src.core.datastore import DataStore, _research_scope_key
+from src.core.models import (
+    REPLY_BACKFILL_MODE,
+    REPLY_BACKFILL_RN,
+    REPLY_BACKFILL_SORT_TYPE,
+    REPLY_BACKFILL_SOURCE_API,
+    ResearchCheckpoint,
+    ResearchRun,
+    research_thread_list_task_key,
+)
 from src.scraper.router import QueueRouter
 from src.scraper.scheduler import BackfillIncompleteError, Scheduler
 from src.scraper.tasks import ScanThreadsTask
@@ -370,6 +380,142 @@ async def test_resume_reopens_matching_backfill_run(explicit_run_id):
             assert stored_run.status == "running"
             assert run_count == 1
     finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reply_backfill_resume_scope_is_separate_and_validated_before_mutation():
+    engine = create_engine("sqlite:///:memory:")
+    ResearchRun.__table__.create(engine)
+    ResearchCheckpoint.__table__.create(engine)
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = lambda: _AsyncSessionAdapter(engine)
+    forums = [(87, "synthetic-preflight")]
+    create_run_id = await store.start_research_run(
+        mode="backfill",
+        forums=forums,
+        max_backfill_pages=0,
+    )
+    await store.set_research_run_status(create_run_id, "interrupted", "synthetic_preflight")
+
+    try:
+        with pytest.raises(ValueError, match="No resumable research run matches"):
+            await store.start_research_run(
+                mode=REPLY_BACKFILL_MODE,
+                forums=forums,
+                max_backfill_pages=0,
+                resume=True,
+                run_id=create_run_id,
+            )
+
+        with Session(engine) as session:
+            create_run = session.get(ResearchRun, create_run_id)
+            assert create_run is not None
+            assert create_run.mode == "backfill"
+            assert create_run.status == "interrupted"
+
+        reply_run_id = await store.start_research_run(
+            mode=REPLY_BACKFILL_MODE,
+            forums=forums,
+            max_backfill_pages=0,
+        )
+        await store.set_research_run_status(reply_run_id, "interrupted", "synthetic_preflight")
+        assert await store.load_research_run_for_drain(reply_run_id, forums) == "interrupted"
+        with pytest.raises(ValueError, match="mode/list contract"):
+            await store.load_research_run_for_drain(reply_run_id, [(88, "other")])
+
+        with Session(engine) as session:
+            reply_run = session.get(ResearchRun, reply_run_id)
+            create_run = session.get(ResearchRun, create_run_id)
+            assert reply_run is not None
+            assert create_run is not None
+            assert reply_run.mode == REPLY_BACKFILL_MODE
+            assert reply_run.scope_key != create_run.scope_key
+            assert reply_run.status == "interrupted"
+            assert create_run.status == "interrupted"
+    finally:
+        engine.dispose()
+
+
+def test_legacy_backfill_scope_fingerprint_keeps_its_original_payload():
+    forums = [(2, "second"), (1, "first")]
+    legacy_payload = {
+        "forums": [(1, "first"), (2, "second")],
+        "sort_mode": "create",
+        "sampling_scope": "all_accessible_threads_and_replies",
+        "checkpoint_version": 1,
+    }
+    legacy_hash = hashlib.sha256(json.dumps(legacy_payload, separators=(",", ":")).encode()).hexdigest()
+
+    assert _research_scope_key(forums, mode="backfill") == legacy_hash
+
+
+@pytest.mark.asyncio
+async def test_reply_resume_rejects_bad_checkpoint_before_research_run_status_change():
+    engine = create_engine("sqlite:///:memory:")
+    ResearchRun.__table__.create(engine)
+    ResearchCheckpoint.__table__.create(engine)
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = lambda: _AsyncSessionAdapter(engine)
+    forums = [(89, "synthetic-preflight")]
+    run_id = await store.start_research_run(
+        mode=REPLY_BACKFILL_MODE,
+        forums=forums,
+        max_backfill_pages=0,
+    )
+    await store.set_research_run_status(run_id, "interrupted", "synthetic_preflight")
+    now = datetime.now()
+    with Session(engine) as session:
+        session.add(
+            ResearchCheckpoint(
+                run_id=run_id,
+                task_key=research_thread_list_task_key(89, False, "reply", REPLY_BACKFILL_RN),
+                page_number=1,
+                task_type="thread_list",
+                scope_type="thread_list",
+                sort_mode="reply",
+                fid=89,
+                is_good=False,
+                status="failed",
+                scope_status="incomplete",
+                continuation_json={
+                    "list_contract_version": 1,
+                    "list_sort_mode": "reply",
+                    "source_api": REPLY_BACKFILL_SOURCE_API,
+                    "rn": 30,
+                    "sort_type": REPLY_BACKFILL_SORT_TYPE,
+                    "is_good": False,
+                },
+                last_checked=now,
+            )
+        )
+        session.commit()
+
+    status_changes = []
+
+    def record_status_change(target, value, _old_value, _initiator):
+        if target.run_id == run_id:
+            status_changes.append(value)
+
+    event.listen(ResearchRun.status, "set", record_status_change)
+    try:
+        with pytest.raises(ValueError, match="verified API/rn/sort contract"):
+            await store.load_research_run_for_drain(run_id, forums)
+        with pytest.raises(ValueError, match="verified API/rn/sort contract"):
+            await store.start_research_run(
+                mode=REPLY_BACKFILL_MODE,
+                forums=forums,
+                max_backfill_pages=0,
+                resume=True,
+                run_id=run_id,
+            )
+        assert status_changes == []
+        with Session(engine) as session:
+            stored_run = session.get(ResearchRun, run_id)
+            assert stored_run is not None
+            assert stored_run.status == "interrupted"
+    finally:
+        event.remove(ResearchRun.status, "set", record_status_change)
         engine.dispose()
 
 

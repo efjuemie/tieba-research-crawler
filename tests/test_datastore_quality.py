@@ -8,7 +8,17 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from src.core.datastore import DataStore, _first_post_comment_count_expressions
-from src.core.models import ResearchCheckpoint, ResearchRun, ResearchTaskScope
+from src.core.models import (
+    REPLY_BACKFILL_CONTRACT_VERSION,
+    REPLY_BACKFILL_MODE,
+    REPLY_BACKFILL_RN,
+    REPLY_BACKFILL_SORT_TYPE,
+    REPLY_BACKFILL_SOURCE_API,
+    ResearchCheckpoint,
+    ResearchRun,
+    ResearchTaskScope,
+    research_thread_list_task_key,
+)
 from src.research.models import ResearchComment, ResearchPost, ResearchThread
 
 
@@ -543,6 +553,167 @@ def test_failed_replay_retains_its_previously_committed_page_history():
     assert cursor["_flow_duplicate_streak"] == 2
     assert cursor["_resume_replay_page"] == 4
     assert cursor["_resume_page_seen_tids"] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_reply_checkpoint_resume_requires_its_source_and_rn_contract():
+    contract = {
+        "list_contract_version": REPLY_BACKFILL_CONTRACT_VERSION,
+        "list_sort_mode": "reply",
+        "source_api": REPLY_BACKFILL_SOURCE_API,
+        "rn": REPLY_BACKFILL_RN,
+        "sort_type": REPLY_BACKFILL_SORT_TYPE,
+        "is_good": False,
+    }
+    rows = [
+        SimpleNamespace(
+            task_key=research_thread_list_task_key(10, False, "reply", REPLY_BACKFILL_RN),
+            fid=10,
+            is_good=False,
+            sort_mode="reply",
+            page_number=page_number,
+            status="completed",
+            has_more=True,
+            next_page=page_number + 1,
+            scope_status="running",
+            continuation_json={
+                **contract,
+                "page_non_top_tids": page_tids,
+                "flow_duplicate_streak": min(2, page_number - 1),
+            },
+        )
+        for page_number, page_tids in enumerate(([9], [10], [11], [11, 12]), start=1)
+    ]
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = lambda: _CheckpointReadSession(rows)
+
+    states = await store.get_research_list_checkpoint_states(
+        "reply-run",
+        sort_mode="reply",
+        rn=REPLY_BACKFILL_RN,
+        source_api=REPLY_BACKFILL_SOURCE_API,
+    )
+
+    next_page, scope_status, cursor = states[(10, False)]
+    assert (next_page, scope_status) == (4, "running")
+    assert cursor is not None
+    assert cursor["_flow_seen_tids"] == [9, 10, 11, 12]
+    assert cursor["_resume_replay_page"] == 4
+    assert cursor["_flow_duplicate_streak"] == 2
+    with pytest.raises(ValueError, match="verified API/rn=100"):
+        await store.get_research_list_checkpoint_states(
+            "reply-run",
+            sort_mode="reply",
+            rn=30,
+            source_api=REPLY_BACKFILL_SOURCE_API,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("page_numbers", "is_good", "error_match"),
+    [
+        ([1, 3], False, "continuous prefix"),
+        ([1], True, "forum/list identity"),
+    ],
+)
+async def test_reply_checkpoint_resume_rejects_gaps_and_non_normal_stream(page_numbers, is_good, error_match):
+    contract = {
+        "list_contract_version": REPLY_BACKFILL_CONTRACT_VERSION,
+        "list_sort_mode": "reply",
+        "source_api": REPLY_BACKFILL_SOURCE_API,
+        "rn": REPLY_BACKFILL_RN,
+        "sort_type": REPLY_BACKFILL_SORT_TYPE,
+        "is_good": False,
+    }
+    task_key = research_thread_list_task_key(10, False, "reply", REPLY_BACKFILL_RN)
+    rows = [
+        SimpleNamespace(
+            task_key=task_key,
+            fid=10,
+            is_good=is_good,
+            sort_mode="reply",
+            page_number=page_number,
+            status="completed",
+            has_more=True,
+            next_page=page_number + 1,
+            scope_status="running",
+            continuation_json={**contract, "page_non_top_tids": [page_number]},
+        )
+        for page_number in page_numbers
+    ]
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = lambda: _CheckpointReadSession(rows)
+
+    with pytest.raises(ValueError, match=error_match):
+        await store.get_research_list_checkpoint_states(
+            "reply-run",
+            sort_mode="reply",
+            rn=REPLY_BACKFILL_RN,
+            source_api=REPLY_BACKFILL_SOURCE_API,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cursor_changes", "expected_status"),
+    [
+        ({}, "completed"),
+        ({"rn": 30}, "incomplete"),
+        ({"untrusted_terminal_reason": "terminal_page_at_least_90_percent_seen"}, "incomplete"),
+    ],
+)
+async def test_reply_run_reconciliation_requires_verified_terminal_contract(cursor_changes, expected_status):
+    engine = create_engine("sqlite://")
+    for model in (ResearchRun, ResearchCheckpoint, ResearchTaskScope):
+        model.__table__.create(engine)
+    now = datetime.now(UTC)
+    cursor = {
+        "list_contract_version": REPLY_BACKFILL_CONTRACT_VERSION,
+        "list_sort_mode": "reply",
+        "source_api": REPLY_BACKFILL_SOURCE_API,
+        "rn": REPLY_BACKFILL_RN,
+        "sort_type": REPLY_BACKFILL_SORT_TYPE,
+        "is_good": False,
+        **cursor_changes,
+    }
+    with Session(engine) as session:
+        session.add(
+            ResearchRun(
+                run_id="reply-terminal-run",
+                mode=REPLY_BACKFILL_MODE,
+                scope_key="synthetic",
+                forums_json=[[10, "bar"]],
+                status="running",
+                started_at=now,
+                last_checked=now,
+            )
+        )
+        session.add(
+            ResearchCheckpoint(
+                run_id="reply-terminal-run",
+                task_key=research_thread_list_task_key(10, False, "reply", REPLY_BACKFILL_RN),
+                page_number=4,
+                task_type="thread_list",
+                scope_type="thread_list",
+                sort_mode="reply",
+                fid=10,
+                is_good=False,
+                status="completed",
+                scope_status="completed",
+                has_more=False,
+                continuation_json=cursor,
+                last_checked=now,
+            )
+        )
+        session.commit()
+
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = lambda: _AsyncSessionAdapter(engine)
+    try:
+        assert await store.reconcile_research_run_status_after_drain("reply-terminal-run") == expected_status
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.asyncio

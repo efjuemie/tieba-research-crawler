@@ -18,6 +18,7 @@ from prometheus_client import start_http_server
 from tiebameow.utils.logger import init_logger, logger
 
 from src.core import DataStore, initialize_application
+from src.core.models import REPLY_BACKFILL_MODE
 from src.core.monitor import SystemMonitor
 from src.research.web_fallback.live import discover_missing_web_targets, pending_web_run_ids, run_live_web_worker
 from src.scraper import Scheduler, Worker
@@ -420,10 +421,17 @@ async def _prepare_research_run(
     datastore: DataStore,
     mode: Literal["periodic", "backfill", "hybrid"],
     *,
+    backfill_sort: Literal["create", "reply"] = "create",
     resume: bool,
     run_id: str | None,
 ) -> str | None:
     config = container.config
+    if backfill_sort not in {"create", "reply"}:
+        raise ValueError(f"Unsupported backfill list sort: {backfill_sort}")
+    if backfill_sort == "reply" and mode != "backfill":
+        raise ValueError("--backfill-sort reply can only be used with --mode backfill.")
+    if backfill_sort == "reply" and not getattr(config, "research_enabled", False):
+        raise ValueError("--backfill-sort reply requires research.enabled=true.")
     if not getattr(config, "research_enabled", False):
         if resume or run_id is not None:
             raise ValueError("--resume and --run-id require research.enabled=true.")
@@ -436,7 +444,7 @@ async def _prepare_research_run(
         raise ValueError(f"Research {mode} requires at least one initialized forum.")
 
     active_run_id = await datastore.start_research_run(
-        mode=mode,
+        mode=REPLY_BACKFILL_MODE if backfill_sort == "reply" else mode,
         forums=forums,
         max_backfill_pages=config.max_backfill_pages,
         resume=resume,
@@ -851,6 +859,7 @@ async def _await_mode_or_shutdown(mode_task: asyncio.Task, shutdown_event: async
 async def main(
     mode: Literal["periodic", "backfill", "hybrid"] = "periodic",
     *,
+    backfill_sort: Literal["create", "reply"] | None = None,
     resume: bool = False,
     run_id: str | None = None,
 ):
@@ -860,6 +869,9 @@ async def main(
     - backfill: 回溯调度器、API workers 和 WEB fallback worker 并行运行。
     - hybrid: 周期调度器常驻 + 回溯调度器跑一轮 + 多 worker。
     """
+    selected_backfill_sort = backfill_sort or "create"
+    if backfill_sort is not None and mode != "backfill":
+        raise ValueError("--backfill-sort can only be used with --mode backfill.")
     container, router = await initialize_application(mode=mode)
 
     shutdown_event = asyncio.Event()
@@ -941,8 +953,21 @@ async def main(
         logger.info("Starting application in {} mode.", mode)
 
         datastore = DataStore(container)
-        scheduler = Scheduler(router=router, container=container, datastore=datastore)
-        research_run_id = await _prepare_research_run(container, datastore, mode, resume=resume, run_id=run_id)
+        scheduler_options = {"backfill_sort": "reply"} if selected_backfill_sort == "reply" else {}
+        scheduler = Scheduler(
+            router=router,
+            container=container,
+            datastore=datastore,
+            **scheduler_options,
+        )
+        research_run_id = await _prepare_research_run(
+            container,
+            datastore,
+            mode,
+            backfill_sort=selected_backfill_sort,
+            resume=resume,
+            run_id=run_id,
+        )
 
         # 按通道创建 Worker 组
         worker_id = 0
@@ -1168,6 +1193,11 @@ if __name__ == "__main__":
             "or 'hybrid' for both."
         ),
     )
+    parser.add_argument(
+        "--backfill-sort",
+        choices=["create", "reply"],
+        help="backfill list order (default: create); reply uses the experimental API rn=100 stream",
+    )
     parser.add_argument("--resume", action="store_true", help="resume the latest compatible research run")
     parser.add_argument("--run-id", help="resume this exact run with --resume or drain-pending")
     parser.add_argument("--tid", type=positive_int, help="limit drain-pending to this thread ID")
@@ -1189,9 +1219,13 @@ if __name__ == "__main__":
             parser.error("drain-pending resumes the exact run named by --run-id; omit --resume")
         if args.mode is not None:
             parser.error("--mode cannot be combined with drain-pending")
+        if args.backfill_sort is not None:
+            parser.error("--backfill-sort cannot be combined with drain-pending")
     else:
         if args.run_id and not args.resume:
             parser.error("--run-id requires --resume")
+        if args.backfill_sort is not None and args.mode != "backfill":
+            parser.error("--backfill-sort can only be used with --mode backfill")
         if args.tid is not None or args.limit is not None or args.max_seconds is not None:
             parser.error("--tid, --limit, and --max-seconds are only valid with drain-pending")
 
@@ -1206,7 +1240,12 @@ if __name__ == "__main__":
                 max_seconds=args.max_seconds if args.max_seconds is not None else 120,
             )
         else:
-            coroutine = main(args.mode or "periodic", resume=args.resume, run_id=args.run_id)
+            coroutine = main(
+                args.mode or "periodic",
+                backfill_sort=args.backfill_sort,
+                resume=args.resume,
+                run_id=args.run_id,
+            )
         if loop_factory is not None:
             with asyncio.Runner(loop_factory=loop_factory) as runner:
                 runner.run(coroutine)

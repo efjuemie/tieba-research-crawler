@@ -1,6 +1,6 @@
 # 架构与数据边界
 
-本文说明数据结构及已实现的运行机制。统一发布排序和 TID 重复页保护已实现，自动化回归通过；SDK 第 71–75 页列表写入验收通过。该有限验收不代表详情、网页补采或 2021 年以来的列表、正文和回复已完整采集，具体结果见[稳定性验收摘要](PREFLIGHT_STABILITY_SUMMARY.md)。
+本文说明数据结构及已实现的运行机制。默认 CREATE/rn=30 和周期 REPLY/rn=30 保持既有契约；可选 API REPLY/rn=100 历史主题发现入口已实现并通过独立代码审查、离线回归与 8 项合成 PostgreSQL 集成检查。整仓 pytest 为 695 passed、10 skipped、18 warnings；Ruff、compile、CLI 检查通过。合成检查不访问贴吧 API。独立连续 API 列表探针覆盖自然页 1–1004，并在高重复保护处以 incomplete 停止；这没有证明全站历史覆盖，产品入口也没有用于该次真实列表采集。统计与停止证据见[历史主题发现可行性报告](PC_HISTORICAL_DISCOVERY_FEASIBILITY.md)。
 
 ## 请求与数据流
 
@@ -26,10 +26,12 @@ flowchart LR
 
 ### 回溯列表策略
 
-- `backfill` 使用单一“发布”排序列表，不再单独启动精华列表；每个主题仍保存已有的 API `is_good` 标记，不新增字段。按 TID 去重。页内或跨页创建时间乱序会记录 warning 并继续处理，不暂停列表。
-- 重复页保护按同一 run、同一列表流判断：一页中去重后的唯一非置顶 TID，若至少 90% 已在该 run、该流的先前页面出现，则该页满足重复阈值。连续 3 个新页均满足时才暂停该流。恢复时重读的 checkpoint 页面和置顶 TID 不参与该比例；恢复重放不增加或重置已累计的连续命中数。达到第三次命中的页面仍先正常持久化，包括其中尚未见过的新 TID，再暂停该流。该规则只作用于 `backfill`，不作用于 `periodic` 的 REPLY 首页监控；其他明确的请求或分页错误仍按错误状态处理。
+- 默认 `backfill` 使用单一 CREATE/rn=30 “发布”排序列表，不再单独启动精华列表；每个主题仍保存已有的 API `is_good` 标记，不新增字段。按 TID 去重。创建时间乱序会记录 warning 并继续处理，不暂停列表。
+- 显式 `--backfill-sort reply` 开启实验性的 API REPLY/rn=100 历史主题发现流。它要求 research enabled、普通论坛列表及真实 `ResearchPage` 来源 `aiotieba.get_threads`；raw 和 DTO 的页码、论坛 FID、条目 FID、强 TID 集与 `has_more` 必须相符。它使用独立 `reply_backfill` run mode、scope fingerprint 和 `thread_list:<fid>:reply:rn100:<is_good>` checkpoint key；resume 与 drain 都先验证持久 mode/list contract。periodic 首页仍使用 REPLY/rn=30，与历史发现流分开。
+- REPLY 的 `total_page`/`total_count` 只保留为服务端观察值；worker 和 scheduler 都不据此拒绝页号或截断后续页。仅按真实响应的 `has_more` 推进自然页号，并保留请求/响应页码和身份检查。服务端报告的总页数不能证明可达页数或全量覆盖。
+- 重复页保护按同一 run、同一列表流判断：一页中去重后的唯一非置顶 TID，若至少 90% 已在该流先前页面出现，则该页满足重复阈值。连续 3 个新页均满足时才暂停该流。恢复时重读的 checkpoint 页面和置顶 TID 不参与该比例；恢复重放不增加或重置已累计的连续命中数，允许列表漂移并将同页旧、新 TID 做 union。达到第三次命中的页面仍先正常持久化，包括其中尚未见过的新 TID，再以 incomplete 暂停。REPLY 单个 `has_more=false` 高重复页，以及仅含置顶主题的非空终止页，都不是可信终点。完成一次 REPLY run 只表示其列表流观察到终点且既有详情工作已排空，不代表贴吧全站历史全部发现。
 
-两个 Chrome 页面核验确认，贴吧 PC 页“最新”使用 `sort=0`，切换到“发布”后使用 `sort=1` 和 `frs/page_pc`；现有 SDK 的 `ThreadSortType.CREATE` 也使用 `sort=1`，但请求的是另一个 `frs/page` endpoint，客户端实现也不同。一页有限对照中，发布页看到的 10 个 TID 也出现在 SDK 的 `sort=1` 列表中；另一个普通列表样本含 19 条按 API 标记为非置顶且 `is_good=true` 的主题。这些样本支持“发布”排序的请求语义，不证明不同 endpoint 的所有响应完全等价。另一次当前 SDK 第 71–75 页列表写入验收通过：第 71 页的创建时间逆序记为警告，数据正常保存并继续处理后续页面；该隔离验收未运行详情或网页工作器，也不代表所有深页等价。客户端直接复现请求语义，不需要每页都通过 GUI 操作。
+历史 PC 页“发布”与 SDK CREATE 的请求语义及有限列表验收见[历史主题发现可行性报告](PC_HISTORICAL_DISCOVERY_FEASIBILITY.md)。显式 API REPLY 入口复用 API 客户端，不使用 PC 页面或浏览器，也不改变 CREATE 路径。独立 API 探针在 p1004 保存第三个连续高重复页后暂停，记录状态为 incomplete；它没有验证服务端真实终点。`INDEX_ONLY` 探针文件只记录列表索引字段，不表示正文或回复已采集完成。
 
 ### 周期监控与混合模式
 
@@ -37,7 +39,7 @@ flowchart LR
 - `hybrid` 同时运行周期 REPLY 首页监控和一次回溯列表任务。周期首页出现重复 TID 不参与回溯流的三页重复判定。
 - `[tieba] max_backfill_pages = 0` 表示回溯不设页数上限；正数限制本轮列表读取页数，达到后记录 `paused_limit`。
 
-每个研究 run 由 `research_run` 记录；`research_checkpoint` 按 run、任务键和页码保存列表、帖子详情和评论页状态、尝试次数、下一页、服务端报告数、游标、错误及 scope 状态。论坛范围必须与恢复目标兼容。`--resume` 选择最新可恢复 run；`--run-id` 可指定精确 run，且必须与 `--resume` 同用。
+每个研究 run 由 `research_run` 记录；`research_checkpoint` 按 run、任务键和页码保存列表、帖子详情和评论页状态、尝试次数、下一页、服务端报告数、游标、错误及 scope 状态。论坛范围和持久列表契约必须与恢复目标兼容；REPLY 历史运行不可能恢复为默认 CREATE，反之亦然。`--resume` 选择最新可恢复的同契约 run；`--run-id` 可指定精确 run，且必须与 `--resume` 同用。
 
 列表恢复时，最近一个成功但仍有后续页的非终止页会重放一次，以吸收顶部删帖或更新造成的页码位移；这种恢复重读排除在三页重复判定之外。内容扩展按实体 ID 幂等写入。帖子与评论详情从成功页之后继续，失败或未完成页可重试。旧的精华列表数据和 checkpoint 保留为历史记录，不因策略调整改写成 `completed`。自动化回归及 SDK 第 71–75 页列表写入验收通过；该验收未覆盖完整主程序、详情或网页补采。旧版主入口的 SIGINT 演练及证据范围见[稳定性验收摘要](PREFLIGHT_STABILITY_SUMMARY.md)。
 

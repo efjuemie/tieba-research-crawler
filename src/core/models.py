@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from datetime import datetime  # noqa: TC003
+from typing import Literal
 
 from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
@@ -14,9 +15,24 @@ from tiebameow.models.orm import Base
 
 JSON_TYPE = JSON().with_variant(JSONB(), "postgresql")
 
+REPLY_BACKFILL_MODE = "reply_backfill"
+REPLY_BACKFILL_SOURCE_API = "aiotieba.get_threads"
+REPLY_BACKFILL_RN = 100
+REPLY_BACKFILL_SORT_TYPE = 6
+REPLY_BACKFILL_CONTRACT_VERSION = 1
 
-def research_thread_list_task_key(fid: int, is_good: bool) -> str:
-    return f"thread_list:{fid}:create:{int(is_good)}"
+
+def research_thread_list_task_key(
+    fid: int,
+    is_good: bool,
+    sort_mode: Literal["create", "reply"] = "create",
+    rn: int = 30,
+) -> str:
+    if sort_mode not in {"create", "reply"} or rn < 1:
+        raise ValueError("Invalid thread list checkpoint contract.")
+    if sort_mode == "create" and rn == 30:
+        return f"thread_list:{fid}:create:{int(is_good)}"
+    return f"thread_list:{fid}:{sort_mode}:rn{rn}:{int(is_good)}"
 
 
 def research_task_checkpoint_key(logical_task_key: str, generation: int) -> str:

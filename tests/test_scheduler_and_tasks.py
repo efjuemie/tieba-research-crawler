@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 from conftest import DummyConfig, DummyContainer, DummyForum
 
+from src.core.models import research_thread_list_task_key
 from src.scraper.queue import UniquePriorityQueue
 from src.scraper.router import QueueRouter
 from src.scraper.scheduler import BackfillIncompleteError, Scheduler
@@ -404,6 +405,55 @@ async def test_scheduler_finite_page_limit_is_reported_as_paused_limit():
 
 
 @pytest.mark.asyncio
+async def test_reply_backfill_uses_distinct_rn100_checkpoint_and_ignores_total_page_cap():
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(
+        config=DummyConfig(mode="backfill", max_backfill_pages=1),
+        forums=[DummyForum(1, "bar")],
+    )
+    container.config.research_enabled = True
+    container.research_run_id = "reply-run"
+    datastore = SimpleNamespace(
+        get_research_list_checkpoint_states=AsyncMock(return_value={}),
+        mark_research_checkpoint_scope_status=AsyncMock(),
+        set_research_run_status_if=AsyncMock(),
+    )
+    scheduler = Scheduler(router, container, datastore, backfill_sort="reply")  # type: ignore[arg-type]
+    requested = []
+
+    async def page(_forum, pn, max_pages, is_good, _cursor=None, *, sort_mode, rn):
+        requested.append((pn, max_pages, is_good, sort_mode, rn))
+        return ThreadPageResult(
+            has_more=True,
+            current_page=pn,
+            total_pages=3306,
+            total_count=330600,
+            tids=(1, 2),
+            non_top_create_times=(),
+            non_top_tids=(1, 2),
+            continuation_json={"list_sort_mode": "reply", "rn": 100},
+        )
+
+    scheduler._scan_backfill_page = page  # type: ignore[method-assign]
+
+    await scheduler._run_backfill()
+
+    assert requested == [(1, 1, False, "reply", 100)]
+    datastore.get_research_list_checkpoint_states.assert_awaited_once_with(
+        "reply-run",
+        sort_mode="reply",
+        rn=100,
+        source_api="aiotieba.get_threads",
+    )
+    datastore.mark_research_checkpoint_scope_status.assert_awaited_once_with(
+        "reply-run",
+        research_thread_list_task_key(1, False, "reply", 100),
+        1,
+        "paused_limit",
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_scheduler_homepage_scans():
     """测试首页扫描任务生成"""
@@ -529,6 +579,12 @@ def test_scan_threads_task_unique_key():
     assert t1.unique_key == (1, 1, False)
     assert t2.unique_key == (1, 1, True)
     assert t3.unique_key == (1, 2, False)
+
+    create_task = ScanThreadsTask(fid=1, fname="x", pn=1, backfill=True)
+    reply_task = ScanThreadsTask(fid=1, fname="x", pn=1, rn=100, backfill=True, sort_mode="reply")
+    assert create_task.unique_key == (1, 1, False)
+    assert reply_task.unique_key == (1, 1, False, "reply", 100, True)
+    assert reply_task.unique_key != t1.unique_key
 
 
 def test_full_scan_posts_task_unique_key():

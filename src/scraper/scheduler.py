@@ -17,7 +17,13 @@ from typing import TYPE_CHECKING, Literal
 from tiebameow.utils.logger import logger
 
 from ..core.metrics import BACKFILL_FORUMS_COUNT, PERIODIC_FORUMS_COUNT
-from ..core.models import research_thread_list_task_key
+from ..core.models import (
+    REPLY_BACKFILL_CONTRACT_VERSION,
+    REPLY_BACKFILL_RN,
+    REPLY_BACKFILL_SORT_TYPE,
+    REPLY_BACKFILL_SOURCE_API,
+    research_thread_list_task_key,
+)
 from .tasks import Priority, ScanThreadsTask, Task, ThreadPageResult
 
 if TYPE_CHECKING:
@@ -49,10 +55,20 @@ class Scheduler:
         log: 日志记录器。
     """
 
-    def __init__(self, router: QueueRouter, container: Container, datastore=None):
+    def __init__(
+        self,
+        router: QueueRouter,
+        container: Container,
+        datastore=None,
+        *,
+        backfill_sort: Literal["create", "reply"] = "create",
+    ):
         self.router = router
         self.container = container
         self.datastore = datastore
+        if backfill_sort not in {"create", "reply"}:
+            raise ValueError(f"Unsupported backfill list sort: {backfill_sort}")
+        self.backfill_sort = backfill_sort
         self.log = logger.bind(name="Scheduler")
         self._stop_event = asyncio.Event()
 
@@ -274,7 +290,16 @@ class Scheduler:
     async def _run_backfill(self):
         """历史回溯调度任务生成器。"""
         max_pages = self.container.config.max_backfill_pages
-        logger.info("Starting BACKFILL mode (homepage kickoff, max_pages={}).", max_pages)
+        sort_mode = self.backfill_sort
+        rn = REPLY_BACKFILL_RN if sort_mode == "reply" else 30
+        if sort_mode == "reply" and not self.container.config.research_enabled:
+            raise RuntimeError("REPLY historical backfill requires research.enabled=true.")
+        logger.info(
+            "Starting BACKFILL mode (sort={}, rn={}, max_pages={}).",
+            sort_mode,
+            rn,
+            max_pages,
+        )
         forums = self.container.forums or []
 
         if not forums:
@@ -283,19 +308,37 @@ class Scheduler:
 
         BACKFILL_FORUMS_COUNT.set(len(forums))
 
-        # Backfill uses CREATE sort while the live monitor uses REPLY sort, so
-        # the monitor's page 1 cannot stand in for CREATE page 1.
         start_page = 1
         streams = [(forum, False) for forum in forums]
         pages = {(forum.fid, is_good): start_page for forum, is_good in streams}
-        cursors: dict[tuple[int, bool], dict[str, object]] = {key: {} for key in pages}
+        reply_contract = (
+            {
+                "list_contract_version": REPLY_BACKFILL_CONTRACT_VERSION,
+                "list_sort_mode": "reply",
+                "source_api": REPLY_BACKFILL_SOURCE_API,
+                "rn": rn,
+                "sort_type": REPLY_BACKFILL_SORT_TYPE,
+                "is_good": False,
+            }
+            if sort_mode == "reply"
+            else {}
+        )
+        cursors: dict[tuple[int, bool], dict[str, object]] = {key: dict(reply_contract) for key in pages}
         run_id = getattr(self.container, "research_run_id", None)
         if run_id and self.datastore is not None:
-            saved_states = await self.datastore.get_research_list_checkpoint_states(run_id)
+            if sort_mode == "reply":
+                saved_states = await self.datastore.get_research_list_checkpoint_states(
+                    run_id,
+                    sort_mode=sort_mode,
+                    rn=rn,
+                    source_api=REPLY_BACKFILL_SOURCE_API,
+                )
+            else:
+                saved_states = await self.datastore.get_research_list_checkpoint_states(run_id)
             for key, (next_page, _scope_status, cursor) in saved_states.items():
                 if key in pages:
                     pages[key] = next_page if next_page is not None else 0
-                    cursors[key] = cursor or {}
+                    cursors[key] = cursor or dict(reply_contract)
         scanned = dict.fromkeys(pages, 0)
         recent_fingerprints = {key: deque(maxlen=3) for key in pages}
         for key, cursor in cursors.items():
@@ -303,6 +346,17 @@ class Scheduler:
                 recent_fingerprints[key].append(tuple(fingerprint))
         failures: list[str] = []
         limited: list[str] = []
+        if sort_mode == "reply":
+            for key, cursor in cursors.items():
+                repeat_streak = int(cursor.get("_flow_duplicate_streak", cursor.get("flow_duplicate_streak", 0)) or 0)
+                if (
+                    cursor.get("high_duplicate_pause_reason")
+                    or cursor.get("untrusted_terminal_reason")
+                    or repeat_streak >= 3
+                ):
+                    forum = next(forum for forum, is_good in streams if (forum.fid, is_good) == key)
+                    failures.append(f"forum={forum.fname} is_good={key[1]} paused_at_saved_repeat_boundary")
+                    pages[key] = 0
         active = [(forum, is_good) for forum, is_good in streams if pages[(forum.fid, is_good)] != 0]
 
         while active and not self._stop_event.is_set():
@@ -314,7 +368,15 @@ class Scheduler:
                     continue
 
                 try:
-                    result = await self._scan_backfill_page(forum, pn, max_pages, is_good, cursors[key])
+                    sort_kwargs = {"sort_mode": sort_mode, "rn": rn} if sort_mode == "reply" else {}
+                    result = await self._scan_backfill_page(
+                        forum,
+                        pn,
+                        max_pages,
+                        is_good,
+                        cursors[key],
+                        **sort_kwargs,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -341,11 +403,11 @@ class Scheduler:
                             checkpoint_cursor["replay_page_checkpoint_committed"] = pn
                         await self.datastore.record_research_checkpoint(
                             run_id=run_id,
-                            task_key=research_thread_list_task_key(forum.fid, is_good),
+                            task_key=research_thread_list_task_key(forum.fid, is_good, sort_mode, rn),
                             page_number=pn,
                             task_type="thread_list",
                             scope_type="thread_list",
-                            sort_mode="create",
+                            sort_mode=sort_mode,
                             fid=forum.fid,
                             fname=forum.fname,
                             is_good=is_good,
@@ -380,37 +442,44 @@ class Scheduler:
                     logger.error("Backfill page metadata mismatch: {}", failure)
                     active.remove((forum, is_good))
                     continue
-                if result.total_pages < 0 or result.total_count < 0:
-                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} invalid_page_metadata"
+                if sort_mode == "create":
+                    if result.total_pages < 0 or result.total_count < 0:
+                        failure = f"forum={forum.fname} is_good={is_good} pn={pn} invalid_page_metadata"
+                        failures.append(failure)
+                        logger.error("Backfill page metadata is invalid: {}", failure)
+                        active.remove((forum, is_good))
+                        continue
+                    if not result.tids and (result.total_count > 0 or result.has_more):
+                        failure = f"forum={forum.fname} is_good={is_good} pn={pn} empty_page_with_inconsistent_metadata"
+                        failures.append(failure)
+                        logger.error("Backfill page is empty but metadata indicates more data: {}", failure)
+                        active.remove((forum, is_good))
+                        continue
+                    if not result.tids and pn == start_page and (result.total_pages < 1 or result.total_count != 0):
+                        failure = (
+                            f"forum={forum.fname} is_good={is_good} pn={pn} "
+                            "empty_page_without_confirmed_empty_metadata"
+                        )
+                        failures.append(failure)
+                        logger.error("Backfill page is empty without confirmed terminal metadata: {}", failure)
+                        active.remove((forum, is_good))
+                        continue
+                    if result.has_more and result.total_pages > 0 and pn >= result.total_pages:
+                        failure = f"forum={forum.fname} is_good={is_good} pn={pn} has_more_beyond_total_pages"
+                        failures.append(failure)
+                        logger.error("Backfill page metadata is inconsistent: {}", failure)
+                        active.remove((forum, is_good))
+                        continue
+                    if not result.has_more and result.total_pages > 0 and pn < result.total_pages:
+                        failure = f"forum={forum.fname} is_good={is_good} pn={pn} terminal_page_before_total_pages"
+                        failures.append(failure)
+                        logger.error("Backfill page metadata is inconsistent: {}", failure)
+                        active.remove((forum, is_good))
+                        continue
+                elif not result.tids and result.has_more:
+                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} empty_reply_page_with_has_more"
                     failures.append(failure)
-                    logger.error("Backfill page metadata is invalid: {}", failure)
-                    active.remove((forum, is_good))
-                    continue
-                if not result.tids and (result.total_count > 0 or result.has_more):
-                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} empty_page_with_inconsistent_metadata"
-                    failures.append(failure)
-                    logger.error("Backfill page is empty but metadata indicates more data: {}", failure)
-                    active.remove((forum, is_good))
-                    continue
-                if not result.tids and pn == start_page and (result.total_pages < 1 or result.total_count != 0):
-                    failure = (
-                        f"forum={forum.fname} is_good={is_good} pn={pn} "
-                        "empty_page_without_confirmed_empty_metadata"
-                    )
-                    failures.append(failure)
-                    logger.error("Backfill page is empty without confirmed terminal metadata: {}", failure)
-                    active.remove((forum, is_good))
-                    continue
-                if result.has_more and result.total_pages > 0 and pn >= result.total_pages:
-                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} has_more_beyond_total_pages"
-                    failures.append(failure)
-                    logger.error("Backfill page metadata is inconsistent: {}", failure)
-                    active.remove((forum, is_good))
-                    continue
-                if not result.has_more and result.total_pages > 0 and pn < result.total_pages:
-                    failure = f"forum={forum.fname} is_good={is_good} pn={pn} terminal_page_before_total_pages"
-                    failures.append(failure)
-                    logger.error("Backfill page metadata is inconsistent: {}", failure)
+                    logger.error("REPLY page is empty but reports further pages: {}", failure)
                     active.remove((forum, is_good))
                     continue
 
@@ -425,20 +494,21 @@ class Scheduler:
                 if fingerprint:
                     recent_fingerprints[key].append(fingerprint)
 
-                page_times = result.non_top_create_times
-                previous_oldest = cursors[key].get("last_create_time")
-                if previous_oldest:
-                    from datetime import datetime
+                if sort_mode == "create":
+                    page_times = result.non_top_create_times
+                    previous_oldest = cursors[key].get("last_create_time")
+                    if previous_oldest:
+                        from datetime import datetime
 
-                    previous_oldest = datetime.fromisoformat(str(previous_oldest))
-                if page_times and previous_oldest is not None and page_times[0] > previous_oldest:
-                    logger.warning(
-                        "Backfill CREATE time order moved forward for forum={} is_good={} pn={}; "
-                        "continuing by page number.",
-                        forum.fname,
-                        is_good,
-                        pn,
-                    )
+                        previous_oldest = datetime.fromisoformat(str(previous_oldest))
+                    if page_times and previous_oldest is not None and page_times[0] > previous_oldest:
+                        logger.warning(
+                            "Backfill CREATE time order moved forward for forum={} is_good={} pn={}; "
+                            "continuing by page number.",
+                            forum.fname,
+                            is_good,
+                            pn,
+                        )
                 next_cursor = dict(result.continuation_json or cursors[key])
                 flow_seen = {int(tid) for tid in cursors[key].get("_flow_seen_tids", [])}
                 flow_seen.update(result.non_top_tids)
@@ -457,13 +527,18 @@ class Scheduler:
                     if result.continuation_json
                     else None
                 )
-                if duplicate_pause_reason:
+                untrusted_terminal_reason = (
+                    result.continuation_json.get("untrusted_terminal_reason")
+                    if result.continuation_json
+                    else None
+                )
+                if duplicate_pause_reason or untrusted_terminal_reason:
                     failure = (
                         f"forum={forum.fname} is_good={is_good} pn={pn} "
-                        f"reason={duplicate_pause_reason}"
+                        f"reason={duplicate_pause_reason or untrusted_terminal_reason}"
                     )
                     failures.append(failure)
-                    logger.warning("Backfill list flow paused after its committed high-overlap page: {}", failure)
+                    logger.warning("Backfill list flow paused after its committed boundary page: {}", failure)
                     active.remove((forum, is_good))
                     continue
 
@@ -475,7 +550,7 @@ class Scheduler:
                         if run_id and self.datastore is not None:
                             await self.datastore.mark_research_checkpoint_scope_status(
                                 run_id,
-                                research_thread_list_task_key(forum.fid, is_good),
+                                research_thread_list_task_key(forum.fid, is_good, sort_mode, rn),
                                 pn,
                                 "paused_limit",
                             )
@@ -524,6 +599,9 @@ class Scheduler:
         max_pages: int,
         is_good: bool,
         continuation_json: dict[str, object] | None = None,
+        *,
+        sort_mode: Literal["create", "reply"] = "create",
+        rn: int = 30,
     ) -> ThreadPageResult:
         """Queue one page and wait for its worker acknowledgement before continuing."""
         completion = asyncio.get_running_loop().create_future()
@@ -531,7 +609,9 @@ class Scheduler:
             fid=forum.fid,
             fname=forum.fname,
             pn=pn,
+            rn=rn,
             backfill=True,
+            sort_mode=sort_mode,
             max_pages=max_pages,
             is_good=is_good,
             force=self.container.config.backfill_force_scan,

@@ -10,7 +10,7 @@ import dataclasses
 import itertools
 import time
 from enum import IntEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from asyncio import Future
@@ -121,10 +121,14 @@ class ScanThreadsTask:
     force: bool = False
     completion: Future[ThreadPageResult] | None = dataclasses.field(default=None, compare=False, repr=False)
     continuation_json: dict[str, object] | None = dataclasses.field(default=None, compare=False, repr=False)
+    sort_mode: Literal["create", "reply"] | None = None
 
     @property
-    def unique_key(self) -> tuple[int, int, bool]:
-        return (self.fid, self.pn, self.is_good)
+    def unique_key(self) -> tuple[int, int, bool] | tuple[int, int, bool, str, int, bool]:
+        sort_mode = self.sort_mode or ("create" if self.backfill else "reply")
+        if not (self.backfill and sort_mode == "reply"):
+            return (self.fid, self.pn, self.is_good)
+        return (self.fid, self.pn, self.is_good, sort_mode, self.rn, self.backfill)
 
 
 @dataclasses.dataclass(slots=True, frozen=True)

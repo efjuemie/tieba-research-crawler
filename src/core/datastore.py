@@ -23,6 +23,11 @@ from tiebameow.utils.logger import logger
 
 from .metrics import CACHE_HITS, CACHE_MISSES, DB_OPERATIONS
 from .models import (
+    REPLY_BACKFILL_CONTRACT_VERSION,
+    REPLY_BACKFILL_MODE,
+    REPLY_BACKFILL_RN,
+    REPLY_BACKFILL_SORT_TYPE,
+    REPLY_BACKFILL_SOURCE_API,
     PendingCommentScan,
     PendingThreadScan,
     ResearchCheckpoint,
@@ -30,6 +35,7 @@ from .models import (
     ResearchTaskScope,
     research_comments_task_key,
     research_posts_task_key,
+    research_thread_list_task_key,
 )
 from .publisher import EventEnvelope, NoopPublisher, RedisStreamsPublisher, WebSocketPublisher, build_envelope
 
@@ -106,15 +112,59 @@ def _checkpoint_tid_set(values: Any) -> set[int]:
     return tids
 
 
-def _research_scope_key(forums: list[tuple[int, str]]) -> str:
+def _research_scope_key(forums: list[tuple[int, str]], *, mode: str = "backfill") -> str:
     normalized_forums = sorted({(int(fid), fname) for fid, fname in forums})
-    scope_payload = {
-        "forums": normalized_forums,
-        "sort_mode": "create",
-        "sampling_scope": "all_accessible_threads_and_replies",
-        "checkpoint_version": 1,
-    }
+    if mode == REPLY_BACKFILL_MODE:
+        scope_payload = {
+            "forums": normalized_forums,
+            "sort_mode": "reply",
+            "source_api": REPLY_BACKFILL_SOURCE_API,
+            "rn": REPLY_BACKFILL_RN,
+            "sort_type": REPLY_BACKFILL_SORT_TYPE,
+            "is_good": False,
+            "list_contract_version": REPLY_BACKFILL_CONTRACT_VERSION,
+            "sampling_scope": "all_accessible_threads_and_replies",
+            "checkpoint_version": 1,
+        }
+    else:
+        scope_payload = {
+            "forums": normalized_forums,
+            "sort_mode": "create",
+            "sampling_scope": "all_accessible_threads_and_replies",
+            "checkpoint_version": 1,
+        }
     return hashlib.sha256(json.dumps(scope_payload, separators=(",", ":")).encode()).hexdigest()
+
+
+def _validate_reply_backfill_checkpoint_rows(rows: list[ResearchCheckpoint]) -> None:
+    if not rows:
+        return
+    ordered_rows = sorted(rows, key=lambda row: row.page_number)
+    fid = ordered_rows[0].fid
+    if fid is None or ordered_rows[0].is_good is not False:
+        raise ValueError("REPLY history checkpoint is missing its forum/list identity.")
+    expected_task_key = research_thread_list_task_key(fid, False, "reply", REPLY_BACKFILL_RN)
+    expected_contract = {
+        "list_contract_version": REPLY_BACKFILL_CONTRACT_VERSION,
+        "list_sort_mode": "reply",
+        "source_api": REPLY_BACKFILL_SOURCE_API,
+        "rn": REPLY_BACKFILL_RN,
+        "sort_type": REPLY_BACKFILL_SORT_TYPE,
+        "is_good": False,
+    }
+    if [row.page_number for row in ordered_rows] != list(range(1, len(ordered_rows) + 1)):
+        raise ValueError("REPLY history checkpoint pages are not a continuous prefix from page 1.")
+    for row in ordered_rows:
+        cursor = row.continuation_json
+        if (
+            row.fid != fid
+            or row.is_good is not False
+            or row.sort_mode != "reply"
+            or row.task_key != expected_task_key
+            or not isinstance(cursor, dict)
+            or any(cursor.get(key) != value for key, value in expected_contract.items())
+        ):
+            raise ValueError("REPLY history checkpoint does not match its verified API/rn/sort contract.")
 
 
 async def iter_crawl_quality_summaries(
@@ -237,7 +287,7 @@ class DataStore:
     ) -> str:
         """Create a durable run or reopen the latest compatible incomplete run."""
         normalized_forums = sorted({(int(fid), fname) for fid, fname in forums})
-        scope_key = _research_scope_key(normalized_forums)
+        scope_key = _research_scope_key(normalized_forums, mode=mode)
         now = datetime.now(UTC)
         async with self.async_sessionmaker() as session:
             if resume:
@@ -254,6 +304,18 @@ class DataStore:
                 run = result.scalar_one_or_none()
                 if run is None:
                     raise ValueError("No resumable research run matches the current mode and forum scope.")
+                if mode == REPLY_BACKFILL_MODE:
+                    checkpoint_result = await session.execute(
+                        select(ResearchCheckpoint).where(
+                            ResearchCheckpoint.run_id == run.run_id,
+                            ResearchCheckpoint.scope_type == "thread_list",
+                        )
+                    )
+                    checkpoint_groups: dict[str, list[ResearchCheckpoint]] = {}
+                    for checkpoint in checkpoint_result.scalars():
+                        checkpoint_groups.setdefault(checkpoint.task_key, []).append(checkpoint)
+                    for checkpoints in checkpoint_groups.values():
+                        _validate_reply_backfill_checkpoint_rows(checkpoints)
                 run.status = "running"
                 run.reason = None
                 run.last_checked = now
@@ -272,17 +334,35 @@ class DataStore:
             return run.run_id
 
     async def load_research_run_for_drain(self, run_id: str, forums: list[tuple[int, str]]) -> str:
-        """Load an existing run only when its persisted forum scope matches."""
-        scope_key = _research_scope_key(forums)
+        """Load a run only when its persisted mode and list contract match."""
         async with self.async_sessionmaker() as session:
             result = await session.execute(
-                select(ResearchRun.status, ResearchRun.scope_key).where(ResearchRun.run_id == run_id)
+                select(ResearchRun.status, ResearchRun.scope_key, ResearchRun.mode).where(
+                    ResearchRun.run_id == run_id
+                )
             )
             run = result.one_or_none()
+            if run is not None and run.mode == REPLY_BACKFILL_MODE:
+                checkpoint_result = await session.execute(
+                    select(ResearchCheckpoint).where(
+                        ResearchCheckpoint.run_id == run_id,
+                        ResearchCheckpoint.scope_type == "thread_list",
+                    )
+                )
+                checkpoint_groups: dict[str, list[ResearchCheckpoint]] = {}
+                for checkpoint in checkpoint_result.scalars():
+                    checkpoint_groups.setdefault(checkpoint.task_key, []).append(checkpoint)
+                for checkpoints in checkpoint_groups.values():
+                    _validate_reply_backfill_checkpoint_rows(checkpoints)
         if run is None:
             raise ValueError(f"Research run {run_id} does not exist.")
+        if run.mode not in {"periodic", "backfill", "hybrid", REPLY_BACKFILL_MODE}:
+            raise ValueError(f"Research run {run_id} uses an unknown list contract mode {run.mode!r}.")
+        scope_key = _research_scope_key(forums, mode=run.mode)
         if run.scope_key != scope_key:
-            raise ValueError(f"Research run {run_id} does not match the current forum scope.")
+            raise ValueError(
+                f"Research run {run_id} does not match the current forum scope or persisted mode/list contract."
+            )
         if run.status != "completed" and run.status not in RESEARCH_RUN_RESUMABLE_STATUSES:
             raise ValueError(f"Research run {run_id} is not resumable from status {run.status!r}.")
         return run.status
@@ -372,10 +452,18 @@ class DataStore:
                 return run.status
 
             active_list_filters = [checkpoint.run_id == run_id, checkpoint.scope_type == "thread_list"]
-            needs_create_proof = getattr(run, "mode", "periodic") in {"backfill", "hybrid"}
+            mode = getattr(run, "mode", "periodic")
+            expected_list_sort = (
+                "reply"
+                if mode == REPLY_BACKFILL_MODE
+                else "create"
+                if mode in {"backfill", "hybrid"}
+                else None
+            )
+            needs_list_proof = expected_list_sort is not None
             active_list_filters.append(checkpoint.is_good.is_(False))
-            if needs_create_proof:
-                active_list_filters.append(checkpoint.sort_mode == "create")
+            if needs_list_proof:
+                active_list_filters.append(checkpoint.sort_mode == expected_list_sort)
 
             list_counts_result = await session.execute(
                 select(
@@ -408,15 +496,16 @@ class DataStore:
             )
             list_counts = list_counts_result.one()
 
-            missing_create_proof = False
-            if needs_create_proof:
+            missing_list_proof = False
+            if needs_list_proof:
                 forum_ids, invalid_forums = _research_forum_ids(getattr(run, "forums_json", []))
-                create_rows_result = await session.execute(
+                list_rows_result = await session.execute(
                     select(
                         checkpoint.fid,
                         checkpoint.status,
                         checkpoint.scope_status,
                         checkpoint.has_more,
+                        checkpoint.continuation_json,
                     )
                     .select_from(checkpoint)
                     .join(
@@ -428,15 +517,32 @@ class DataStore:
                     )
                     .where(*active_list_filters)
                 )
-                completed_create_forums = {
-                    fid
-                    for fid, status_value, scope_status, has_more in create_rows_result.all()
-                    if fid is not None
-                    and status_value == "completed"
-                    and scope_status == "completed"
-                    and has_more is False
-                }
-                missing_create_proof = invalid_forums or not forum_ids.issubset(completed_create_forums)
+                completed_list_forums: set[int] = set()
+                for fid, status_value, scope_status, has_more, cursor in list_rows_result.all():
+                    if (
+                        fid is None
+                        or status_value != "completed"
+                        or scope_status != "completed"
+                        or has_more is not False
+                    ):
+                        continue
+                    if mode == REPLY_BACKFILL_MODE:
+                        expected_contract = {
+                            "list_contract_version": REPLY_BACKFILL_CONTRACT_VERSION,
+                            "list_sort_mode": "reply",
+                            "source_api": REPLY_BACKFILL_SOURCE_API,
+                            "rn": REPLY_BACKFILL_RN,
+                            "sort_type": REPLY_BACKFILL_SORT_TYPE,
+                            "is_good": False,
+                        }
+                        if not isinstance(cursor, dict) or any(
+                            cursor.get(key) != value for key, value in expected_contract.items()
+                        ):
+                            continue
+                        if cursor.get("high_duplicate_pause_reason") or cursor.get("untrusted_terminal_reason"):
+                            continue
+                    completed_list_forums.add(fid)
+                missing_list_proof = invalid_forums or not forum_ids.issubset(completed_list_forums)
 
             scope_status_rows = await session.execute(
                 select(ResearchTaskScope.status).where(
@@ -453,7 +559,7 @@ class DataStore:
                 status, reason = "paused_rate_limit", "latest_checkpoint_paused_for_rate_limit"
             elif list_counts.incomplete_count or any(
                 scope_status != "completed" for scope_status in scope_statuses
-            ) or missing_create_proof:
+            ) or missing_list_proof:
                 status, reason = "incomplete", "latest_checkpoint_not_terminal"
             else:
                 status, reason = "completed", None
@@ -1116,15 +1222,27 @@ class DataStore:
             await session.commit()
 
     async def get_research_list_checkpoint_states(
-        self, run_id: str
+        self,
+        run_id: str,
+        *,
+        sort_mode: Literal["create", "reply"] = "create",
+        rn: int = 30,
+        source_api: str | None = None,
     ) -> dict[tuple[int, bool], tuple[int | None, str | None, dict[str, object] | None]]:
-        """Return CREATE stream resume state and rebuild successful page history.
+        """Return one list contract's resume state and rebuild successful page history.
 
         A successful non-terminal page is replayed once after restart to absorb
         page drift caused by deletions or updates at the top of the list. The
         in-memory seen set is reconstructed from successful page checkpoints;
         only page-sized TID sets are stored in each continuation JSON.
         """
+        if sort_mode not in {"create", "reply"}:
+            raise ValueError(f"Unsupported research list sort mode: {sort_mode}")
+        if sort_mode == "reply":
+            if rn != REPLY_BACKFILL_RN or source_api != REPLY_BACKFILL_SOURCE_API:
+                raise ValueError("REPLY list resume requires the verified API/rn=100 contract.")
+        elif rn != 30:
+            raise ValueError("CREATE list resume currently uses the legacy rn=30 contract.")
         history: dict[str, list[ResearchCheckpoint]] = {}
         async with self.async_sessionmaker() as session:
             result = await session.stream(
@@ -1140,8 +1258,21 @@ class DataStore:
 
         states: dict[tuple[int, bool], tuple[int | None, str | None, dict[str, object] | None]] = {}
         for rows in history.values():
+            if sort_mode == "reply":
+                _validate_reply_backfill_checkpoint_rows(rows)
             row = rows[-1]
-            if row.fid is None or row.is_good is None or getattr(row, "sort_mode", "create") != "create":
+            if row.fid is None or row.is_good is None:
+                continue
+            row_sort_mode = getattr(row, "sort_mode", "create")
+            if sort_mode == "create":
+                if row_sort_mode != "create":
+                    continue
+            elif row_sort_mode != "reply":
+                raise ValueError("REPLY history contains a checkpoint for a different list sort.")
+            expected_task_key = research_thread_list_task_key(row.fid, row.is_good, sort_mode, rn)
+            if row.task_key != expected_task_key:
+                if sort_mode == "reply":
+                    raise ValueError("REPLY history checkpoint key does not match its rn/sort contract.")
                 continue
 
             successful_rows = [
@@ -1175,8 +1306,12 @@ class DataStore:
                 cursor["_flow_history_partial"] = True
 
             duplicate_pause = bool(cursor.get("high_duplicate_pause_reason"))
+            untrusted_terminal = bool(cursor.get("untrusted_terminal_reason"))
             failed_replay = cursor.get("replay_page_checkpoint_committed") == row.page_number
-            if (row.status == "completed" and (row.has_more is True or duplicate_pause)) or failed_replay:
+            if (
+                row.status == "completed"
+                and (row.has_more is True or duplicate_pause or untrusted_terminal)
+            ) or failed_replay:
                 next_page = row.page_number
                 scope_status = row.scope_status or "running"
                 page_ids = cursor.get("page_non_top_tids")

@@ -292,6 +292,72 @@ def create_mock_container(tb_client=None, redis_client=None, config=None):
     )
 
 
+def _make_reply_history_page(
+    threads,
+    *,
+    pn=1,
+    has_more=True,
+    total_page=3306,
+    source_api="aiotieba.get_threads",
+    raw_tid_delta=0,
+    raw_fid=10,
+    raw_page=None,
+):
+    dto = make_threads_response(threads, has_more=has_more, current_page=pn, total_page=total_page)
+    dto.page.total_count = 330600
+    raw_items = [
+        SimpleNamespace(
+            tid=thread.tid + raw_tid_delta,
+            fid=raw_fid,
+            pid=thread.pid,
+            author_id=thread.author_id,
+            user=SimpleNamespace(user_id=thread.author_id),
+            is_top=thread.is_top,
+            is_good=thread.is_good,
+            create_time=int(thread.create_time.timestamp()),
+            last_time=int(thread.last_time.timestamp()),
+            reply_num=thread.reply_num,
+            title=thread.title,
+        )
+        for thread in threads
+    ]
+    raw = SimpleNamespace(
+        objs=raw_items,
+        page=raw_page
+        or SimpleNamespace(current_page=pn, total_page=total_page, total_count=330600, has_more=has_more),
+        forum=SimpleNamespace(fid=raw_fid),
+    )
+    return ResearchPage(
+        raw=raw,
+        dto=dto,
+        observed_at=datetime.now(),
+        source_api=source_api,
+    )
+
+
+def _make_reply_history_handler(response, *, new_tids=()):
+    datastore = SimpleNamespace(
+        filter_new_ids=AsyncMock(return_value=set(new_tids)),
+        record_research_checkpoint=AsyncMock(return_value=True),
+    )
+    container = create_mock_container(
+        config=SimpleNamespace(research_enabled=True, fetch_user_forum_info=False)
+    )
+    container.research_run_id = "reply-run"
+    handler = ThreadsTaskHandler(
+        worker_id=0,
+        container=container,
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler.get_threads = AsyncMock(return_value=SimpleNamespace(response=response, attempts=1))
+    handler._persist_research_page = AsyncMock()
+    handler._process_new_threads = AsyncMock()
+    handler._process_old_threads = AsyncMock()
+    handler._enqueue_missing_web_targets = AsyncMock()
+    return handler, datastore
+
+
 # ==================== ThreadsTaskHandler 测试 ====================
 
 
@@ -498,6 +564,222 @@ async def test_threads_handler_backfill_processes_one_create_page_and_retains_pi
     )
     saved_threads = datastore.save_threads_and_pending_scans.await_args.args[0]
     assert {thread.tid for thread in saved_threads} == {10, 11, 12}
+
+
+@pytest.mark.asyncio
+async def test_reply_history_requires_verified_api_page_and_ignores_total_page_metadata():
+    threads = [make_thread(tid=77), make_thread(tid=78)]
+    response = _make_reply_history_page(threads, pn=2, total_page=3306, has_more=True)
+    handler, datastore = _make_reply_history_handler(response, new_tids=(77, 78))
+
+    result = await handler.handle(
+        ScanThreadsTask(fid=10, fname="bar", pn=2, rn=100, backfill=True, sort_mode="reply")
+    )
+
+    call = handler.get_threads.await_args
+    assert call.args == ("bar",)
+    assert call.kwargs["pn"] == 2
+    assert call.kwargs["rn"] == 100
+    assert call.kwargs["sort"] is ThreadSortType.REPLY
+    assert call.kwargs["is_good"] is False
+    assert call.kwargs["_expected_fid"] == 10
+    assert result.current_page == 2
+    assert result.total_pages == 3306
+    assert handler._process_new_threads.await_args.args[1] == {77, 78}
+    assert handler._persist_research_page.await_args.args[0] is response
+
+    checkpoint = datastore.record_research_checkpoint.await_args.kwargs
+    assert checkpoint["task_key"] == "thread_list:10:reply:rn100:0"
+    assert checkpoint["sort_mode"] == "reply"
+    assert checkpoint["has_more"] is True
+    assert checkpoint["continuation_json"]["source_api"] == "aiotieba.get_threads"
+    assert checkpoint["continuation_json"]["rn"] == 100
+    assert checkpoint["continuation_json"]["sort_type"] == 6
+    assert "last_create_time" not in checkpoint["continuation_json"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["missing_raw", "source", "raw_tid", "raw_fid", "raw_page"])
+async def test_reply_history_rejects_missing_or_conflicting_raw_identity(mismatch):
+    threads = [make_thread(tid=77)]
+    response = _make_reply_history_page(threads, pn=2)
+    if mismatch == "missing_raw":
+        response = ResearchPage(
+            raw=None,
+            dto=response.dto,
+            observed_at=response.observed_at,
+            source_api=response.source_api,
+        )
+    elif mismatch == "source":
+        response = _make_reply_history_page(threads, pn=2, source_api="aiotieba.get_posts")
+    elif mismatch == "raw_tid":
+        response = _make_reply_history_page(threads, pn=2, raw_tid_delta=1)
+    elif mismatch == "raw_fid":
+        response = _make_reply_history_page(threads, pn=2, raw_fid=11)
+    else:
+        response = _make_reply_history_page(
+            threads,
+            pn=2,
+            raw_page=SimpleNamespace(current_page=1, total_page=3306, total_count=330600, has_more=True),
+        )
+    handler, _datastore = _make_reply_history_handler(response)
+
+    with pytest.raises(PageIntegrityError):
+        await handler.handle(
+            ScanThreadsTask(fid=10, fname="bar", pn=2, rn=100, backfill=True, sort_mode="reply")
+        )
+
+    handler._persist_research_page.assert_not_awaited()
+    handler._process_new_threads.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reply_history_fails_closed_before_dto_fallback_request():
+    dto_fallback = AsyncMock()
+    container = create_mock_container(
+        tb_client=SimpleNamespace(get_threads_dto=dto_fallback),
+        config=SimpleNamespace(
+            research_enabled=True,
+            fetch_user_forum_info=False,
+            research_max_api_retries=1,
+            research_retry_wait_seconds=0,
+        ),
+    )
+    datastore = SimpleNamespace()
+    handler = ThreadsTaskHandler(
+        worker_id=0,
+        container=container,
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+
+    with pytest.raises(PageIntegrityError, match="required get_threads_research"):
+        await handler.handle(
+            ScanThreadsTask(fid=10, fname="bar", pn=1, rn=100, backfill=True, sort_mode="reply")
+        )
+
+    dto_fallback.assert_not_awaited()
+    container.threads_limiter.acquire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reply_page_repeating_home_ids_are_overlap_evidence_not_identity_error():
+    response = _make_reply_history_page([make_thread(tid=77)], pn=2)
+    handler, datastore = _make_reply_history_handler(response)
+    task = ScanThreadsTask(
+        fid=10,
+        fname="bar",
+        pn=2,
+        rn=100,
+        backfill=True,
+        sort_mode="reply",
+        continuation_json={"_flow_seen_tids": [77], "_flow_duplicate_streak": 0},
+    )
+
+    result = await handler.handle(task)
+
+    assert result.tids == (77,)
+    assert result.continuation_json["page_duplicate_ratio"] == 1.0
+    assert result.continuation_json["flow_duplicate_streak"] == 1
+    assert "high_duplicate_pause_reason" not in result.continuation_json
+    assert datastore.record_research_checkpoint.await_args.kwargs["scope_status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_reply_third_high_overlap_page_commits_new_tid_before_incomplete_pause():
+    threads = [make_thread(tid=tid) for tid in range(1, 11)]
+    response = _make_reply_history_page(threads, pn=3, has_more=True)
+    handler, datastore = _make_reply_history_handler(response, new_tids=(10,))
+    task = ScanThreadsTask(
+        fid=10,
+        fname="bar",
+        pn=3,
+        rn=100,
+        backfill=True,
+        sort_mode="reply",
+        continuation_json={"_flow_seen_tids": list(range(1, 10)), "_flow_duplicate_streak": 2},
+    )
+
+    result = await handler.handle(task)
+
+    assert result.continuation_json["page_duplicate_ratio"] == 0.9
+    assert result.continuation_json["flow_duplicate_streak"] == 3
+    assert result.continuation_json["high_duplicate_pause_reason"] == "three_consecutive_pages_at_least_90_percent_seen"
+    assert 10 in result.continuation_json["page_non_top_tids"]
+    assert handler._process_new_threads.await_args.args[1] == {10}
+    checkpoint = datastore.record_research_checkpoint.await_args.kwargs
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["scope_status"] == "incomplete"
+    assert 10 in checkpoint["continuation_json"]["page_non_top_tids"]
+
+
+@pytest.mark.asyncio
+async def test_reply_terminal_page_with_high_overlap_is_not_marked_completed():
+    threads = [make_thread(tid=tid) for tid in range(1, 11)]
+    response = _make_reply_history_page(threads, pn=3, has_more=False)
+    handler, datastore = _make_reply_history_handler(response)
+    task = ScanThreadsTask(
+        fid=10,
+        fname="bar",
+        pn=3,
+        rn=100,
+        backfill=True,
+        sort_mode="reply",
+        continuation_json={"_flow_seen_tids": list(range(1, 10)), "_flow_duplicate_streak": 0},
+    )
+
+    await handler.handle(task)
+
+    checkpoint = datastore.record_research_checkpoint.await_args.kwargs
+    assert checkpoint["has_more"] is False
+    assert checkpoint["scope_status"] == "incomplete"
+    assert checkpoint["reason"] == "terminal_page_at_least_90_percent_seen"
+
+
+@pytest.mark.asyncio
+async def test_reply_nonempty_terminal_page_with_only_pinned_threads_is_untrusted():
+    pinned = make_thread(tid=99)
+    pinned.is_top = True
+    response = _make_reply_history_page([pinned], pn=1, has_more=False)
+    handler, datastore = _make_reply_history_handler(response, new_tids=(99,))
+
+    result = await handler.handle(
+        ScanThreadsTask(fid=10, fname="bar", pn=1, rn=100, backfill=True, sort_mode="reply")
+    )
+
+    checkpoint = datastore.record_research_checkpoint.await_args.kwargs
+    assert result.tids == (99,)
+    assert handler._process_new_threads.await_args.args[1] == {99}
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["scope_status"] == "incomplete"
+    assert checkpoint["reason"] == "terminal_page_without_non_top_threads"
+
+
+@pytest.mark.asyncio
+async def test_reply_replay_unions_drifted_page_ids_without_changing_repeat_streak():
+    threads = [make_thread(tid=tid) for tid in (6, 7, 8)]
+    response = _make_reply_history_page(threads, pn=4, has_more=True)
+    handler, _datastore = _make_reply_history_handler(response, new_tids=(7, 8))
+    task = ScanThreadsTask(
+        fid=10,
+        fname="bar",
+        pn=4,
+        rn=100,
+        backfill=True,
+        sort_mode="reply",
+        continuation_json={
+            "_flow_seen_tids": list(range(1, 11)),
+            "_flow_duplicate_streak": 2,
+            "_resume_replay_page": 4,
+            "_resume_page_seen_tids": [5, 6],
+        },
+    )
+
+    result = await handler.handle(task)
+
+    assert result.continuation_json["page_non_top_tids"] == [5, 6, 7, 8]
+    assert result.continuation_json["flow_duplicate_streak"] == 2
+    assert "high_duplicate_pause_reason" not in result.continuation_json
 
 
 @pytest.mark.asyncio

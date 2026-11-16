@@ -6,7 +6,7 @@ Tieba Research Crawler 是基于 [TiebaMeow/TiebaScraper](https://github.com/Tie
 
 ## 功能与数据范围
 
-- `backfill` 使用统一的“发布”排序列表；精华与普通主题由帖子本身已有的 `is_good` 字段区分，不再单独扫描精华列表。
+- `backfill` 默认使用统一的“发布”排序列表；可显式选择实验性的 API REPLY 历史发现列表。两种列表分别保存运行与分页检查点，不会互相续接。
 - `periodic` 按回复时间监控首页，使用 REPLY 排序；`hybrid` 同时运行周期监控与一次历史回溯。
 - 详情任务分页读取首楼、一级回复和楼中楼，并将每轮采集（run）、列表页和详情任务的分页检查点保存在 PostgreSQL。设定 `max_backfill_pages = 0` 表示不设页数上限；实际能读取的范围仍取决于服务端响应和任务状态，不代表某段历史必定完整。
 - 网页补采只处理 API 已保存、目标身份可核实的记录。无法访问或缺少字段证据时会保留缺失状态，不根据昵称、页面顺序或相似文本猜测身份。
@@ -17,9 +17,11 @@ Tieba Research Crawler 是基于 [TiebaMeow/TiebaScraper](https://github.com/Tie
 
 ### 回溯列表规则
 
-回溯列表按 TID 去重；创建时间乱序会记录警告并继续处理。仅当同一 run、同一列表流连续 3 个新页面中，每页至少 90% 的唯一非置顶 TID 都已在该流先前页面出现时，才暂停该流。恢复时重读的页面及置顶 TID 不计入重复率。该规则只用于 `backfill`；`periodic` 的 REPLY 首页监控不使用此判定。自动化回归已通过，SDK 第 71–75 页的列表写入验收也已通过；这不代表详情、网页补采或 2021 年以来的全量覆盖已通过，见[稳定性验收摘要](docs/PREFLIGHT_STABILITY_SUMMARY.md)。
+默认 `backfill` 使用 CREATE/rn=30；显式 `--backfill-sort reply` 使用 API REPLY/rn=100，且要求 `[research] enabled = true`。REPLY 列表只发现主题并交给现有详情队列；它不代表详情、楼中楼或网页补采已经完成。该选项为实验性入口，不能据服务端报告的页数或条数声称已发现全站全部历史主题。
 
-上一轮按旧的普通／精华双流规则验收时，普通流第 71 页出现页内创建时间逆序，精华流第 2 页出现跨页时间回跳。旧校验将相关页面保留为失败或不完整；新策略不会改写这些历史状态。目前仍不能证明回溯能完整覆盖 2021—2026 年，也不建议以完整覆盖已验证为前提启动正式采集。验收状态见[稳定性验收摘要](docs/PREFLIGHT_STABILITY_SUMMARY.md)。
+两种回溯列表都按 TID 去重；仅当同一 run、同一列表流连续 3 个新页面中，每页至少 90% 的唯一非置顶 TID 都已在该流先前页面出现时，才暂停该流并保留第三页证据。REPLY 恢复重放允许同页集合变化，按 TID 合并新旧观察，重放不改变重复计数；单个终止页若自身已有至少 90% 重复，或非空终止页仅含置顶主题，也不作为可信终点。服务端页数和数量元数据不用于 REPLY 的页号边界。置顶 TID 不计入重复率。该规则只用于 `backfill`；`periodic` 的 REPLY 首页监控不使用此判定。SDK CREATE 的自动化回归与第 71–75 页列表写入验收见[稳定性验收摘要](docs/PREFLIGHT_STABILITY_SUMMARY.md)，它不证明详情、网页补采或任何年份的全量覆盖。
+
+截至 2026-11-16，API REPLY/rn=100 连续列表探针覆盖自然页 1–1004，共观察到 99,290 条列表项；按 TID 去重为 92,263 条，重复 7,027 条（7.077%，不计 5 条恢复重放记录）。唯一索引记录的创建时间覆盖率为 100%，范围为 2010-04-11 至 2026-11-16。索引导出的 92,263 行均与相同 TID 的完整日志观察逐行一致，链接格式核验通过。p1002 开始出现高重叠，p1003–p1004 重复同一页集合；p1004 保存后触发保护并以 incomplete 暂停，未请求 p1005。服务端报告的 3,309 页不作为可达范围或完成证明。探针的 `INDEX_ONLY` 仅为主题索引，不代表正文、一级回复或楼中楼已采集；本次连续实测和边界说明见[历史主题发现可行性报告](docs/PC_HISTORICAL_DISCOVERY_FEASIBILITY.md)。
 
 ## 环境与安装
 
@@ -77,7 +79,20 @@ uv run python main.py --mode periodic
 uv run python main.py --mode hybrid
 ```
 
-`backfill` 使用单一“发布”排序列表；每个主题的 `is_good` 标记用于区分是否为精华。列表按 TID 去重，创建时间乱序只记录警告，不作为停止条件。回溯的页数上限由 `max_backfill_pages` 控制，默认 `0` 表示不设页数上限。暂停和失败状态记录在对应 checkpoint 中。
+未指定排序时，`backfill` 使用 CREATE/rn=30，行为保持原样。可选择隔离的 API REPLY 主题发现列表：
+
+```sh
+uv run python main.py --mode backfill --backfill-sort reply
+```
+
+该模式固定使用普通论坛列表、rn=100 和已验证的 API raw/DTO 身份检查；它要求 `[research] enabled = true`。其运行标记为独立的 `reply_backfill`，因此恢复时必须保留排序选项：
+
+```sh
+uv run python main.py --mode backfill --backfill-sort reply --resume
+uv run python main.py --mode backfill --backfill-sort reply --resume --run-id YOUR_REPLY_RUN_ID
+```
+
+`max_backfill_pages` 同样限制每轮列表页数，默认 `0` 表示不设页数上限。REPLY 模式不以服务端 `total_page` 或 `total_count` 判断可达页数或全量结束；连续三页各自至少 90% 的非置顶 TID 已见时，会在保存第三页后以 incomplete 暂停。单页终止信号若与高重复相符，或该非空页没有任何非置顶主题，也会按不可信终点暂停。以上停止状态用于保留证据和防止循环，不代表全站覆盖已完成。详情、字段补采、CSV 映射及周期 REPLY 首页仍走原有逻辑。
 
 在终端按 Ctrl+C 请求程序协作停止。IDE 图形界面的 Stop 和强制结束行为尚未现场验证，不能据此保证程序完成收尾或排空待办。中断后在相同论坛范围和模式下恢复原采集轮次：
 
@@ -95,6 +110,8 @@ uv run python main.py drain-pending --run-id YOUR_RUN_ID --limit 10 --max-second
 ```
 
 该命令不会扫描论坛列表或创建新 run。详情任务可能继续产生子任务；超时或中断后可针对同一 run 再次处理。更多本机运行方式见[IDE 指南](docs/IDE_SETUP.md)。
+
+列表恢复须使用原来的 run 和来源契约：REPLY 回溯要继续带 `--backfill-sort reply`，不能用默认 CREATE 恢复；`drain-pending` 使用指定 run 已持久化的来源和范围，不切换列表类型。
 
 ### 请求频率
 
@@ -170,6 +187,7 @@ uv run python -m src.research export --help
 
 - [架构与数据边界](docs/ARCHITECTURE.md)
 - [字段来源与验证范围](docs/FIELD_SOURCE_AUDIT.md)
+- [历史主题发现可行性与阶段性结果](docs/PC_HISTORICAL_DISCOVERY_FEASIBILITY.md)
 - [开发记录](docs/DEVELOPMENT_LOG.md)
 - [本机 IDE 运行指南](docs/IDE_SETUP.md)
 - 上游项目：[TiebaMeow/TiebaScraper](https://github.com/TiebaMeow/TiebaScraper)
