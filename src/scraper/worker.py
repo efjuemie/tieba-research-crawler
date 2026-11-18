@@ -855,9 +855,14 @@ class TaskHandler(ABC):
 
     @staticmethod
     def _is_confirmed_empty(page: Any, page_number: int, *, raw_page: Any = None) -> bool:
-        if raw_page is not None and not hasattr(raw_page, "total_count"):
-            return False
-        total_count = raw_page.total_count if raw_page is not None else page.total_count
+        if raw_page is None:
+            if page.total_page != 1:
+                return False
+            total_count = page.total_count
+        else:
+            if not hasattr(raw_page, "total_count"):
+                return False
+            total_count = raw_page.total_count
         return (
             page_number == 1
             and _positive_int_id(getattr(page, "current_page", None)) == 1
