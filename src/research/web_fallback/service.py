@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -197,7 +197,9 @@ async def run_field_backfill(
             pair_growth_fields=True,
         )
     plans = tuple(summary.planned_targets)
-    eligible = tuple(plan for plan in plans if plan.eligibility_status == "pending_web")
+    eligible = tuple(
+        plan for plan in plans if plan.eligibility_status in {"pending_web", "failed_retryable"}
+    )
     pending_api = sum(plan.eligibility_status == "pending_api_detail" for plan in plans)
     if dry_run or not eligible:
         return FieldBackfillSummary(
@@ -215,10 +217,10 @@ async def run_field_backfill(
             diagnostics={},
         )
 
-    if request_budget is None:
-        request_budget = make_request_budget(_configured_global_rps())
     if browser_config is None:
         browser_config = _configured_web_settings()
+    if request_budget is None:
+        request_budget = make_request_budget(float(browser_config.rps))
     factory = provider_factory or _make_browser_provider
     provider = factory(
         budget=request_budget,
@@ -250,6 +252,18 @@ async def run_field_backfill(
                 task_keys=tuple(remaining_keys),
             )
             if not leases:
+                retry_delay = await _next_retry_delay(
+                    sessions,
+                    (run_id,),
+                    task_keys=tuple(remaining_keys),
+                )
+                if retry_delay is not None:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0 or retry_delay >= remaining:
+                        stopped_reason = "max_seconds_exhausted"
+                        break
+                    await asyncio.sleep(max(0.05, retry_delay))
+                    continue
                 break
             lease = leases[0]
             plan = plan_by_key.get(lease.task_key)
@@ -257,7 +271,14 @@ async def run_field_backfill(
                 remaining_keys.remove(lease.task_key)
                 continue
             remaining_keys.remove(lease.task_key)
-            target = _target_from_plan(plan)
+            preflight = await _preflight_web_task(sessions, lease)
+            if preflight.status == "completed":
+                completed += 1
+                continue
+            if preflight.status != "ready":
+                partial += 1
+                continue
+            target = replace(_target_from_plan(plan), requested_fields=preflight.missing_fields)
             result = await _collect_with_deadline(provider, target, deadline)
             collected += 1
             _add_diagnostics(diagnostic_counts, getattr(result, "diagnostics", {}))
@@ -266,10 +287,11 @@ async def run_field_backfill(
             if status == "ok":
                 candidates = tuple(getattr(result, "candidates", ()))
                 outcomes = _not_observed_outcomes(
-                    plan.requested_fields,
+                    preflight.missing_fields,
                     candidates,
                     getattr(result, "field_outcomes", None),
                 )
+                outcomes.update(_already_satisfied_outcomes(preflight.satisfied_fields))
                 reconciled = await _complete_task(
                     sessions,
                     lease.task_key,
@@ -286,14 +308,15 @@ async def run_field_backfill(
                     partial += 1
                     retry_summary = await _enqueue_remaining_fields(sessions, lease)
                     for retry_plan in retry_summary.planned_targets:
-                        if retry_plan.eligibility_status == "pending_web":
+                        if retry_plan.eligibility_status in {"pending_web", "failed_retryable"}:
                             plan_by_key[retry_plan.task_key] = retry_plan
                             if retry_plan.task_key not in remaining_keys:
                                 remaining_keys.append(retry_plan.task_key)
                 continue
 
             task_status = _task_failure_status(status, reason)
-            outcomes = _failure_outcomes(plan.requested_fields, status, reason)
+            outcomes = _failure_outcomes(preflight.missing_fields, status, reason)
+            outcomes.update(_already_satisfied_outcomes(preflight.satisfied_fields))
             await _fail_task(
                 sessions,
                 lease.task_key,
@@ -303,6 +326,8 @@ async def run_field_backfill(
                 field_outcomes=outcomes,
                 diagnostics=getattr(result, "diagnostics", {}),
             )
+            if task_status == "failed_retryable" and lease.task_key not in remaining_keys:
+                remaining_keys.append(lease.task_key)
             if task_status in {"blocked", "needs_login"}:
                 stopped_reason = _safe_reason(reason or "blocked")
                 if _is_rate_limited(reason):
@@ -339,6 +364,9 @@ async def run_field_backfill(
         raise
     finally:
         await _close_provider(provider)
+
+    if remaining_keys and asyncio.get_running_loop().time() >= deadline and stopped_reason is None:
+        stopped_reason = "max_seconds_exhausted"
 
     return FieldBackfillSummary(
         run_id=run_id,
@@ -377,18 +405,36 @@ async def _enqueue_remaining_fields(sessions: Any, lease: Any):
     )
 
 
-async def _process_durable_web_lease(sessions: Any, provider: Any, lease: Any):
-    result = await provider.collect(_target_from_lease(lease))
+async def _process_durable_web_lease(
+    sessions: Any,
+    provider: Any,
+    lease: Any,
+    *,
+    stop_event: Any | None = None,
+):
+    preflight = await _preflight_web_task(sessions, lease)
+    if preflight.status != "ready":
+        return preflight.status, preflight
+    if stop_event is not None and stop_event.is_set():
+        return "stop_requested", replace(
+            preflight,
+            status="stop_requested",
+            reason="stop_requested",
+            preflight_skipped=True,
+        )
+    target = replace(_target_from_lease(lease), requested_fields=preflight.missing_fields)
+    result = await provider.collect(target)
     status = getattr(result, "status", "failed_retryable")
     reason = getattr(result, "reason", None)
     diagnostics = getattr(result, "diagnostics", {})
     if status == "ok":
         candidates = tuple(getattr(result, "candidates", ()))
         outcomes = _not_observed_outcomes(
-            lease.requested_fields,
+            preflight.missing_fields,
             candidates,
             getattr(result, "field_outcomes", None),
         )
+        outcomes.update(_already_satisfied_outcomes(preflight.satisfied_fields))
         reconciled = await _complete_task(
             sessions,
             lease.task_key,
@@ -408,7 +454,10 @@ async def _process_durable_web_lease(sessions: Any, provider: Any, lease: Any):
         lease.lease_token,
         status=task_status,
         reason_code=_safe_reason(reason or status),
-        field_outcomes=_failure_outcomes(lease.requested_fields, status, reason),
+        field_outcomes={
+            **_failure_outcomes(preflight.missing_fields, status, reason),
+            **_already_satisfied_outcomes(preflight.satisfied_fields),
+        },
         diagnostics=diagnostics,
     )
     return task_status, result
@@ -518,16 +567,25 @@ def _partial_task_fields_satisfied(task: Any, row: Any | None) -> bool:
     )
 
 
-async def _next_retry_delay(sessions: Any, run_ids: Sequence[str]) -> float | None:
+async def _next_retry_delay(
+    sessions: Any,
+    run_ids: Sequence[str],
+    *,
+    task_keys: Sequence[str] | None = None,
+) -> float | None:
     if not run_ids:
         return None
     now = datetime.now(UTC)
+    task_filter = (
+        ResearchWebEnrichmentTask.task_key.in_(tuple(task_keys)) if task_keys is not None else True
+    )
     async with sessions() as session:
         retry_at = await session.scalar(
             select(func.min(ResearchWebEnrichmentTask.next_retry_at)).where(
                 ResearchWebEnrichmentTask.run_id.in_(tuple(run_ids)),
                 ResearchWebEnrichmentTask.status == "failed_retryable",
                 ResearchWebEnrichmentTask.next_retry_at.is_not(None),
+                task_filter,
             )
         )
         lease_until = await session.scalar(
@@ -535,6 +593,7 @@ async def _next_retry_delay(sessions: Any, run_ids: Sequence[str]) -> float | No
                 ResearchWebEnrichmentTask.run_id.in_(tuple(run_ids)),
                 ResearchWebEnrichmentTask.status == "running",
                 ResearchWebEnrichmentTask.lease_until.is_not(None),
+                task_filter,
             )
         )
     future = [
@@ -580,6 +639,7 @@ async def drain_pending_web_enrichment(
     run_ids: Sequence[str],
     *,
     provider: Any,
+    stop_event: Any | None = None,
     wait_for_login: bool = True,
     login_confirmation: Any | None = None,
 ) -> WebWorkerSummary:
@@ -592,18 +652,26 @@ async def drain_pending_web_enrichment(
     stopped_reason = None
     login_resumed: set[str] = set()
 
-    while normalized_run_ids:
+    while normalized_run_ids and not (stop_event is not None and stop_event.is_set()):
         lease = await _lease_one_web_task(sessions, normalized_run_ids, "live-web-fallback")
         if lease is None:
+            if stop_event is not None and stop_event.is_set():
+                break
             retry_delay = await _next_retry_delay(sessions, normalized_run_ids)
             if retry_delay is None:
                 break
-            await asyncio.sleep(max(0.05, retry_delay))
+            if stop_event is None:
+                await asyncio.sleep(max(0.05, retry_delay))
+            else:
+                await _wait_for_stop_or_timeout(stop_event, retry_delay)
             continue
+        if stop_event is not None and stop_event.is_set():
+            break
 
-        collected += 1
         try:
-            status, result = await _process_durable_web_lease(sessions, provider, lease)
+            status, result = await _process_durable_web_lease(
+                sessions, provider, lease, stop_event=stop_event
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -618,6 +686,8 @@ async def drain_pending_web_enrichment(
                 field_outcomes=_failure_outcomes(lease.requested_fields, "timeout", "web_worker_target_failed"),
                 diagnostics={},
             )
+        if not getattr(result, "preflight_skipped", False):
+            collected += 1
         _add_diagnostics(diagnostics, getattr(result, "diagnostics", {}))
 
         if status == "completed":
@@ -637,7 +707,9 @@ async def drain_pending_web_enrichment(
                 and lease.task_key not in login_resumed
                 and getattr(provider, "has_manual_login_page", False)
             ):
-                if not await _confirm_login_or_stop(provider, None, confirmation=login_confirmation):
+                if not await _confirm_login_or_stop(
+                    provider, stop_event, confirmation=login_confirmation
+                ):
                     stopped_reason = "manual_login_not_confirmed"
                     break
                 await _close_manual_login_page(provider)
@@ -657,9 +729,10 @@ async def drain_pending_web_enrichment(
 
     unresolved = await _count_unresolved_web_tasks(sessions, normalized_run_ids)
     if stopped_reason is None:
-        stopped_reason = (
-            "queue_drained_with_unresolved_tasks" if unresolved else "queue_drained"
-        )
+        if stop_event is not None and stop_event.is_set():
+            stopped_reason = "stop_requested"
+        else:
+            stopped_reason = "queue_drained_with_unresolved_tasks" if unresolved else "queue_drained"
     return WebWorkerSummary(
         run_ids=normalized_run_ids,
         collected_count=collected,
@@ -676,6 +749,7 @@ async def run_live_web_fallback_worker(
     run_ids: Callable[[], Sequence[str]],
     *,
     stop_event: Any,
+    api_done_event: Any | None = None,
     browser_profile: str | Path,
     request_budget: Any | None = None,
     browser_config: Any | None = None,
@@ -684,7 +758,7 @@ async def run_live_web_fallback_worker(
     wait_for_login: bool = True,
     login_confirmation: Any | None = None,
 ) -> WebWorkerSummary:
-    """Keep one serialized browser worker open, then drain on graceful shutdown."""
+    """Run WEB work independently, draining only after normal API completion."""
     if browser_profile is None:
         raise ValueError("an explicit isolated browser_profile is required")
     if wait_for_login and not headed:
@@ -692,10 +766,10 @@ async def run_live_web_fallback_worker(
     if stop_event is None or not hasattr(stop_event, "is_set") or not hasattr(stop_event, "wait"):
         raise ValueError("an asyncio stop_event is required")
 
-    if request_budget is None:
-        request_budget = make_request_budget(_configured_global_rps())
     if browser_config is None:
         browser_config = _configured_web_settings()
+    if request_budget is None:
+        request_budget = make_request_budget(float(browser_config.rps))
     factory = provider_factory or _make_browser_provider
     provider = factory(
         budget=request_budget,
@@ -715,18 +789,25 @@ async def run_live_web_fallback_worker(
     login_resumed: set[str] = set()
     all_run_ids: set[str] = set()
     try:
-        while not stop_event.is_set():
+        while not stop_event.is_set() and not (
+            api_done_event is not None and api_done_event.is_set()
+        ):
             current_run_ids = await _snapshot_run_ids(run_ids)
             all_run_ids.update(current_run_ids)
             lease = await _lease_one_web_task(sessions, current_run_ids, "live-web-fallback")
             if lease is None:
+                if api_done_event is not None and api_done_event.is_set():
+                    break
                 retry_delay = await _next_retry_delay(sessions, current_run_ids)
                 await _wait_for_stop_or_timeout(stop_event, min(retry_delay or 0.5, 1.0))
                 continue
+            if stop_event.is_set():
+                break
 
-            collected += 1
             try:
-                status, result = await _process_durable_web_lease(sessions, provider, lease)
+                status, result = await _process_durable_web_lease(
+                    sessions, provider, lease, stop_event=stop_event
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -743,6 +824,8 @@ async def run_live_web_fallback_worker(
                     ),
                     diagnostics={},
                 )
+            if not getattr(result, "preflight_skipped", False):
+                collected += 1
             _add_diagnostics(diagnostics, getattr(result, "diagnostics", {}))
             if status == "completed":
                 completed += 1
@@ -785,13 +868,19 @@ async def run_live_web_fallback_worker(
                 stopped_reason = _safe_reason(reason or status)
                 break
 
-        if stop_event.is_set() and stopped_reason is None:
+        if (
+            api_done_event is not None
+            and api_done_event.is_set()
+            and not stop_event.is_set()
+            and stopped_reason is None
+        ):
             current_run_ids = await _snapshot_run_ids(run_ids)
             all_run_ids.update(current_run_ids)
             drained = await drain_pending_web_enrichment(
                 sessions,
                 tuple(sorted(all_run_ids)),
                 provider=provider,
+                stop_event=stop_event,
                 wait_for_login=wait_for_login,
                 login_confirmation=login_confirmation,
             )
@@ -801,9 +890,11 @@ async def run_live_web_fallback_worker(
             _add_diagnostics(diagnostics, drained.diagnostics)
             stopped_reason = (
                 "stop_requested_drained"
-                if drained.unresolved_count == 0
+                if drained.unresolved_count == 0 and not stop_event.is_set()
                 else drained.stopped_reason
             )
+        elif stop_event.is_set() and stopped_reason is None:
+            stopped_reason = "stop_requested"
     finally:
         await _close_provider(provider)
 
@@ -853,10 +944,10 @@ async def run_web_audit(
         **_filter_options(filters),
         limit=limit,
     )
-    if request_budget is None:
-        request_budget = make_request_budget(_configured_global_rps())
     if browser_config is None:
         browser_config = _configured_web_settings()
+    if request_budget is None:
+        request_budget = make_request_budget(float(browser_config.rps))
     deadline = asyncio.get_running_loop().time() + max_seconds
     targets: list[dict[str, Any]] = []
     aggregate: Counter[str] = Counter()
@@ -996,12 +1087,6 @@ def make_request_budget(global_rps: float):
         is_ready,
         minimum_interval_seconds=1 / global_rps,
     )
-
-
-def _configured_global_rps() -> float:
-    from src.core.config import Config
-
-    return float(Config().pydantic_config.rate_limit.global_rps)
 
 
 def _configured_web_settings() -> Any:
@@ -1177,6 +1262,19 @@ async def _complete_task(sessions, task_key, lease_token, candidates, **kwargs):
     from .reconcile import complete_web_enrichment_task
 
     return await complete_web_enrichment_task(sessions, task_key, lease_token, candidates, **kwargs)
+
+
+async def _preflight_web_task(sessions, lease):
+    from .reconcile import preflight_web_enrichment_task
+
+    return await preflight_web_enrichment_task(sessions, lease.task_key, lease.lease_token)
+
+
+def _already_satisfied_outcomes(fields):
+    return {
+        field_name: {"status": "confirmed", "reason": "already_satisfied"}
+        for field_name in fields
+    }
 
 
 async def _fail_task(sessions, task_key, lease_token, **kwargs):

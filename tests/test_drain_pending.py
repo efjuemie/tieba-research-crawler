@@ -465,8 +465,18 @@ def _patch_drain_runtime(monkeypatch, container, router, datastore):
     async def discover_missing(_sessions, _run_ids):
         return 0
 
-    async def live_web_worker(_sessions, _run_ids, *, stop_event, **_kwargs):
-        await stop_event.wait()
+    async def live_web_worker(_sessions, _run_ids, *, stop_event, api_done_event, **_kwargs):
+        stop_wait = asyncio.create_task(stop_event.wait())
+        api_done_wait = asyncio.create_task(api_done_event.wait())
+        try:
+            await asyncio.wait(
+                (stop_wait, api_done_wait),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            stop_wait.cancel()
+            api_done_wait.cancel()
+            await asyncio.gather(stop_wait, api_done_wait, return_exceptions=True)
         return SimpleNamespace(unresolved_count=0)
 
     monkeypatch.setattr(app_main, "pending_web_run_ids", pending_run_ids)
@@ -675,7 +685,8 @@ async def test_drain_cancellation_can_resume_same_run_without_losing_checkpoint(
 
 
 @pytest.mark.asyncio
-async def test_drain_stops_api_when_live_web_returns_summary_early(monkeypatch):
+@pytest.mark.parametrize("web_summary", [None, SimpleNamespace(unresolved_count=1)])
+async def test_drain_api_progress_continues_when_live_web_returns_early(monkeypatch, web_summary):
     api_started = asyncio.Event()
     release_page = asyncio.Event()
     web_returned = asyncio.Event()
@@ -694,7 +705,12 @@ async def test_drain_stops_api_when_live_web_returns_summary_early(monkeypatch):
                 current_page=1,
                 total_page=2,
             )
-        pytest.fail("API page 2 must not start after the live WEB worker exits")
+        return _posts_page(
+            tid,
+            [make_post(pid=101, tid=tid, fid=7, fname="synthetic", floor=2, reply_num=0)],
+            current_page=2,
+            total_page=2,
+        )
 
     client = _SyntheticClient(posts=posts, comments=lambda *_args: _comments_page([]))
     container = _container(client)
@@ -703,10 +719,11 @@ async def test_drain_stops_api_when_live_web_returns_summary_early(monkeypatch):
     _patch_drain_runtime(monkeypatch, container, router, store)
     monkeypatch.setattr("src.research.persistence.persist_research_page", AsyncMock())
 
-    async def returned_summary(_sessions, _run_ids, *, stop_event, **_kwargs):
+    async def returned_summary(_sessions, _run_ids, *, stop_event, api_done_event, **_kwargs):
         await api_started.wait()
+        assert not api_done_event.is_set()
         web_returned.set()
-        return SimpleNamespace(stopped_reason="manual_login_not_confirmed", unresolved_count=1)
+        return web_summary
 
     monkeypatch.setattr(app_main, "run_live_web_worker", returned_summary)
 
@@ -718,13 +735,112 @@ async def test_drain_stops_api_when_live_web_returns_summary_early(monkeypatch):
     assert not drain.done()
 
     release_page.set()
-    with pytest.raises(RuntimeError, match="returned before shutdown was requested"):
-        await asyncio.wait_for(drain, timeout=2)
+    await asyncio.wait_for(drain, timeout=2)
 
-    assert post_calls == [1]
-    assert scope.status == "running"
-    assert store.checkpoints[("run-synthetic", "thread_replies:1:g6", 1)]["next_page"] == 2
+    assert post_calls == [1, 2]
+    assert scope.status == "completed"
+    assert store.checkpoints[("run-synthetic", "thread_replies:1:g6", 2)]["status"] == "completed"
     assert store.run_status == "incomplete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_discovery_call", [1, 2])
+async def test_drain_user_stop_cancels_web_discovery_and_preserves_run(monkeypatch, blocked_discovery_call):
+    rescan_started = asyncio.Event()
+    rescan_cancelled = asyncio.Event()
+    web_stopped = asyncio.Event()
+    shutdown_events = []
+    store = _ResearchStore([])
+    container = _container(_SyntheticClient(posts=lambda *_args: None, comments=lambda *_args: None))
+    router = QueueRouter(maxsize=1)
+    _patch_drain_runtime(monkeypatch, container, router, store)
+    monkeypatch.setattr(
+        app_main,
+        "_install_shutdown_signal_handlers",
+        lambda event: (shutdown_events.append(event) or (lambda: None)),
+    )
+
+    discovery_calls = 0
+
+    async def discover(_sessions, _run_ids):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        if discovery_calls != blocked_discovery_call:
+            return 0
+        rescan_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            rescan_cancelled.set()
+            raise
+
+    async def live_web_worker(_sessions, _run_ids, *, stop_event, api_done_event, **kwargs):
+        assert "request_budget" not in kwargs
+        await stop_event.wait()
+        assert not api_done_event.is_set()
+        web_stopped.set()
+        return SimpleNamespace(unresolved_count=1)
+
+    monkeypatch.setattr(app_main, "discover_missing_web_targets", discover)
+    monkeypatch.setattr(app_main, "run_live_web_worker", live_web_worker)
+
+    drain = asyncio.create_task(app_main.drain_pending(run_id="run-synthetic", limit=1, max_seconds=0))
+    await asyncio.wait_for(rescan_started.wait(), timeout=1)
+    shutdown_events[0].set()
+    await asyncio.wait_for(drain, timeout=1)
+
+    assert rescan_cancelled.is_set()
+    assert web_stopped.is_set()
+    assert store.run_status == "interrupted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["discovery", "worker"])
+async def test_drain_web_errors_remain_incomplete_after_api_scope_completes(monkeypatch, failure):
+    scope = _scope("thread_replies:1", "thread_replies", 1, generation=7)
+
+    async def posts(tid, _page_number):
+        return _posts_page(
+            tid,
+            [make_post(pid=100, tid=tid, fid=7, fname="synthetic", floor=1, reply_num=0)],
+        )
+
+    async def comments(*_args):
+        return _comments_page([])
+
+    client = _SyntheticClient(posts=posts, comments=comments)
+    container = _container(client)
+    router = QueueRouter(maxsize=1)
+    store = _ResearchStore([scope])
+    _patch_drain_runtime(monkeypatch, container, router, store)
+    monkeypatch.setattr("src.research.persistence.persist_research_page", AsyncMock())
+
+    discovery_calls = 0
+
+    async def discover(_sessions, _run_ids):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        if failure == "discovery" and discovery_calls == 2:
+            raise RuntimeError("synthetic discovery failure")
+        return 0
+
+    async def live_web_worker(_sessions, _run_ids, *, api_done_event, **_kwargs):
+        await api_done_event.wait()
+        if failure == "worker":
+            raise RuntimeError("synthetic worker failure")
+        return SimpleNamespace(unresolved_count=0)
+
+    monkeypatch.setattr(app_main, "discover_missing_web_targets", discover)
+    monkeypatch.setattr(app_main, "run_live_web_worker", live_web_worker)
+
+    await asyncio.wait_for(
+        app_main.drain_pending(run_id="run-synthetic", limit=1, max_seconds=0),
+        timeout=2,
+    )
+
+    assert scope.status == "completed"
+    assert store.run_status == "incomplete"
+    assert store.run_reason in {"web_fallback_discovery_error", "web_fallback_worker_error"}
 
 
 @pytest.mark.asyncio

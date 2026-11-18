@@ -23,7 +23,7 @@ from tiebameow.models.orm import Post as PostModel
 
 from src.research.client import ResearchPage
 from src.scraper.router import QueueRouter
-from src.scraper.tasks import FullScanCommentsTask, FullScanPostsTask, Priority, Task
+from src.scraper.tasks import FullScanCommentsTask, FullScanPostsTask, Priority, ScanThreadsTask, Task
 from src.scraper.worker import (
     FetchedPage,
     FullScanCommentsTaskHandler,
@@ -60,11 +60,26 @@ def make_research_container(tb_client):
     container = create_mock_container(tb_client)
     container.config.research_enabled = True
     container.config.research_max_api_retries = 1
+    container.config.cooldown_seconds_429 = 10
     container.research_run_id = "synthetic-run"
     container.wait_for_research_ready = AsyncMock()
     container.wait_for_auth_refresh = AsyncMock()
     container.wait_for_rate_limit = AsyncMock()
     container.block_research_network = AsyncMock()
+    empty_response_streak = 0
+
+    async def record_research_api_response(*, suspicious_empty):
+        nonlocal empty_response_streak
+        if not suspicious_empty:
+            empty_response_streak = 0
+            return False
+        empty_response_streak += 1
+        if empty_response_streak < 3:
+            return False
+        empty_response_streak = 0
+        return True
+
+    container.record_research_api_response = AsyncMock(side_effect=record_research_api_response)
     return container
 
 
@@ -1142,17 +1157,19 @@ async def test_auth_refresh_callback_rate_limit_is_paused_then_bounded_retry_res
 
 
 @pytest.mark.asyncio
-async def test_exhausted_rate_limit_retries_close_shared_research_network_gate():
+@pytest.mark.parametrize("error_code", [429, 220034])
+async def test_exhausted_rate_limit_retries_leave_shared_research_network_gate_open(error_code):
     tb_client = SimpleNamespace(
         get_threads_research=AsyncMock(
             side_effect=[
-                RetriableApiError(429, "synthetic rate limit"),
-                RetriableApiError(429, "synthetic rate limit"),
+                RetriableApiError(error_code, "synthetic rate limit"),
+                RetriableApiError(error_code, "synthetic rate limit"),
             ]
         )
     )
     container = make_research_container(tb_client)
     container.config.research_max_api_retries = 2
+    container.config.cooldown_seconds_429 = 10
     datastore = SimpleNamespace(
         set_research_run_status_if=AsyncMock(return_value=True),
         resume_research_run_if_status=AsyncMock(return_value=True),
@@ -1167,18 +1184,62 @@ async def test_exhausted_rate_limit_retries_close_shared_research_network_gate()
     with pytest.raises(RetriableApiError) as error:
         await handler.get_threads("bar", pn=1)
 
-    assert error.value.code == 429
+    assert error.value.code == error_code
     assert tb_client.get_threads_research.await_count == 2
     assert container.wait_for_rate_limit.await_count == 2
-    container.block_research_network.assert_awaited_once()
+    container.wait_for_rate_limit.assert_awaited_with(10, run_id="synthetic-run")
+    container.block_research_network.assert_not_awaited()
     assert datastore.set_research_run_status_if.await_args_list[-1].args[1:3] == (
-        {"running", "paused_rate_limit"},
+        {"running", "paused_auth", "paused_rate_limit"},
         "paused_rate_limit",
     )
 
 
 @pytest.mark.asyncio
-async def test_auth_refresh_callback_challenge_blocks_network_without_overwriting_state():
+@pytest.mark.parametrize("error_code", [429, 220034])
+async def test_user_stop_interrupts_rate_limit_cooldown_without_retry(error_code):
+    cooldown_started = asyncio.Event()
+
+    async def wait_for_cooldown(seconds, *, run_id):
+        assert seconds == 10
+        assert run_id == "synthetic-run"
+        cooldown_started.set()
+        await asyncio.Future()
+
+    tb_client = SimpleNamespace(
+        get_posts_research=AsyncMock(side_effect=RetriableApiError(error_code, "synthetic rate limit"))
+    )
+    container = make_research_container(tb_client)
+    container.config.research_max_api_retries = 2
+    container.wait_for_rate_limit = AsyncMock(side_effect=wait_for_cooldown)
+    stop_event = asyncio.Event()
+    datastore = SimpleNamespace(
+        set_research_run_status_if=AsyncMock(return_value=True),
+        resume_research_run_if_status=AsyncMock(return_value=True),
+        record_research_checkpoint=AsyncMock(),
+    )
+    handler = FullScanPostsTaskHandler(
+        worker_id=0,
+        container=container,
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+        stop_event=stop_event,
+    )
+
+    request = asyncio.create_task(handler.get_posts(9, 1))
+    await asyncio.wait_for(cooldown_started.wait(), timeout=1)
+    stop_event.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(request, timeout=1)
+
+    tb_client.get_posts_research.assert_awaited_once()
+    container.wait_for_rate_limit.assert_awaited_once_with(10, run_id="synthetic-run")
+    datastore.record_research_checkpoint.assert_not_awaited()
+    datastore.resume_research_run_if_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auth_refresh_frequency_limit_cools_down_without_blocking_network():
     tb_client = SimpleNamespace(
         get_threads_research=AsyncMock(
             side_effect=[
@@ -1188,6 +1249,7 @@ async def test_auth_refresh_callback_challenge_blocks_network_without_overwritin
         )
     )
     container = make_research_container(tb_client)
+    container.config.cooldown_seconds_429 = 10
 
     async def run_callback(callback, **_kwargs):
         return await callback()
@@ -1208,12 +1270,137 @@ async def test_auth_refresh_callback_challenge_blocks_network_without_overwritin
         await handler.get_threads("bar", pn=1)
 
     assert error.value.code == 220034
-    assert container.block_research_network.await_count == 1
-    assert datastore.set_research_run_status_if.await_args_list[-1].args[1:3] == ({"paused_auth"}, "blocked")
+    container.wait_for_rate_limit.assert_awaited_once_with(10, run_id="synthetic-run")
+    container.block_research_network.assert_not_awaited()
+    assert datastore.set_research_run_status_if.await_args_list[-1].args[1:3] == (
+        {"paused_auth"},
+        "paused_rate_limit",
+    )
 
 
 @pytest.mark.asyncio
-async def test_detail_rate_limit_failure_is_checkpointed_as_paused_not_incomplete():
+async def test_empty_terminal_page_resets_shared_suspicious_envelope_streak():
+    missing_page = make_threads_response([], current_page=0, total_page=0)
+    confirmed_empty = make_threads_response([], current_page=1, total_page=1)
+    terminal_response = ResearchPage(
+        SimpleNamespace(
+            objs=[],
+            page=SimpleNamespace(current_page=1, total_page=1, total_count=0, has_more=False),
+            forum=SimpleNamespace(fid=10, fname="bar"),
+        ),
+        confirmed_empty,
+        datetime.now(UTC),
+        "aiotieba.get_threads",
+    )
+    tb_client = SimpleNamespace(
+        get_threads_research=AsyncMock(
+            side_effect=[
+                ResearchPage(SimpleNamespace(objs=[]), missing_page, datetime.now(UTC), "aiotieba.get_threads"),
+                ResearchPage(SimpleNamespace(objs=[]), missing_page, datetime.now(UTC), "aiotieba.get_threads"),
+                terminal_response,
+                ResearchPage(SimpleNamespace(objs=[]), missing_page, datetime.now(UTC), "aiotieba.get_threads"),
+                ResearchPage(SimpleNamespace(objs=[]), missing_page, datetime.now(UTC), "aiotieba.get_threads"),
+                ResearchPage(SimpleNamespace(objs=[]), missing_page, datetime.now(UTC), "aiotieba.get_threads"),
+            ]
+        )
+    )
+    container = make_research_container(tb_client)
+    container.config.cooldown_seconds_429 = 10
+    handler = ThreadsTaskHandler(
+        worker_id=0,
+        container=container,
+        datastore=cast("Any", SimpleNamespace(resume_research_run_if_status=AsyncMock())),
+        router=QueueRouter(),
+    )
+    handler._persist_research_page = AsyncMock()
+
+    for _ in range(2):
+        with pytest.raises(PageIntegrityError, match="missing or has zero page identity"):
+            await handler.get_threads("bar", pn=1)
+    await handler.handle(ScanThreadsTask(fid=10, fname="bar", pn=1))
+    for _ in range(2):
+        with pytest.raises(PageIntegrityError, match="missing or has zero page identity"):
+            await handler.get_threads("bar", pn=1)
+
+    assert container.wait_for_rate_limit.await_count == 0
+    with pytest.raises(PageIntegrityError, match="missing or has zero page identity"):
+        await handler.get_threads("bar", pn=1)
+    container.wait_for_rate_limit.assert_awaited_once_with(10, run_id="synthetic-run")
+
+
+@pytest.mark.asyncio
+async def test_invalid_reply_page_does_not_reset_shared_suspicious_empty_streak():
+    missing_page = make_threads_response([], current_page=0, total_page=0)
+    thread = make_thread(tid=123, fname="bar")
+    dto_page = make_threads_response([thread], current_page=1, total_page=1)
+    invalid_reply_page = ResearchPage(
+        SimpleNamespace(
+            objs=[SimpleNamespace(tid=124, fid=10)],
+            page=SimpleNamespace(current_page=1, total_page=1, has_more=False),
+            forum=SimpleNamespace(fid=10),
+        ),
+        dto_page,
+        datetime.now(UTC),
+        "aiotieba.get_threads",
+    )
+    tb_client = SimpleNamespace(
+        get_threads_research=AsyncMock(
+            side_effect=[
+                ResearchPage(SimpleNamespace(objs=[]), missing_page, datetime.now(UTC), "aiotieba.get_threads"),
+                ResearchPage(SimpleNamespace(objs=[]), missing_page, datetime.now(UTC), "aiotieba.get_threads"),
+                invalid_reply_page,
+                ResearchPage(SimpleNamespace(objs=[]), missing_page, datetime.now(UTC), "aiotieba.get_threads"),
+            ]
+        )
+    )
+    container = make_research_container(tb_client)
+    datastore = SimpleNamespace(resume_research_run_if_status=AsyncMock())
+    handler = ThreadsTaskHandler(0, container, cast("Any", datastore), QueueRouter())
+
+    for _ in range(2):
+        with pytest.raises(PageIntegrityError):
+            await handler.get_threads("bar", pn=1)
+    with pytest.raises(PageIntegrityError, match="raw/DTO TID sets differ"):
+        await handler.handle(
+            ScanThreadsTask(fid=10, fname="bar", pn=1, rn=100, backfill=True, sort_mode="reply")
+        )
+    with pytest.raises(PageIntegrityError, match="missing or has zero page identity"):
+        await handler.get_threads("bar", pn=1)
+
+    container.wait_for_rate_limit.assert_awaited_once_with(10, run_id="synthetic-run")
+
+
+@pytest.mark.asyncio
+async def test_empty_page_missing_requested_forum_identity_counts_as_suspicious():
+    empty_identity = SimpleNamespace(
+        objs=[],
+        page=SimpleNamespace(current_page=1, total_page=1, total_count=0, has_more=False),
+        forum=SimpleNamespace(fid=0),
+    )
+    tb_client = SimpleNamespace(
+        get_threads_research=AsyncMock(
+            return_value=ResearchPage(
+                SimpleNamespace(objs=[]), empty_identity, datetime.now(UTC), "aiotieba.get_threads"
+            )
+        )
+    )
+    container = make_research_container(tb_client)
+    container.config.cooldown_seconds_429 = 10
+    handler = ThreadsTaskHandler(
+        worker_id=0,
+        container=container,
+        datastore=cast("Any", SimpleNamespace(resume_research_run_if_status=AsyncMock())),
+        router=QueueRouter(),
+    )
+
+    with pytest.raises(PageIntegrityError, match="forum identity"):
+        await handler.get_threads("bar", pn=1, _expected_fid=10)
+
+    assert await container.record_research_api_response(suspicious_empty=True) is False
+
+
+@pytest.mark.asyncio
+async def test_exhausted_detail_rate_limit_failure_is_checkpointed_incomplete():
     datastore = SimpleNamespace(
         record_research_checkpoint=AsyncMock(),
         set_research_run_status_if=AsyncMock(),
@@ -1237,7 +1424,7 @@ async def test_detail_rate_limit_failure_is_checkpointed_as_paused_not_incomplet
     )
 
     checkpoint = datastore.record_research_checkpoint.await_args.kwargs
-    assert checkpoint["status"] == "paused_rate_limit"
-    assert checkpoint["scope_status"] == "paused_rate_limit"
+    assert checkpoint["status"] == "failed"
+    assert checkpoint["scope_status"] == "incomplete"
     assert checkpoint["next_page"] == 2
     datastore.set_research_run_status_if.assert_not_awaited()

@@ -283,6 +283,20 @@ class TaskHandler(ABC):
             require_research_method=require_research_method,
         )
         page = self._dto(fetched.response)
+        objects = getattr(page, "objs", None)
+        if self.research_enabled and not objects:
+            raw_page = getattr(getattr(fetched.response, "raw", None), "page", None)
+            await self._validate_research_empty_page(
+                "thread list", page, requested_page, "page", raw_page=raw_page
+            )
+            forum_fid = _positive_int_id(getattr(getattr(page, "forum", None), "fid", None))
+            if forum_fid is None or (expected_fid is not None and forum_fid != expected_fid):
+                await self._record_research_api_response(
+                    suspicious_empty=True,
+                    api_type="threads",
+                    page_number=requested_page,
+                )
+                raise PageIntegrityError("Thread list empty response is missing or mismatching forum identity.")
         self._validate_page_number("thread list", requested_page, page.page.current_page)
         if expected_fid is not None:
             wrong_fids = {thread.fid for thread in page.objs if thread.fid != expected_fid}
@@ -311,13 +325,27 @@ class TaskHandler(ABC):
             kwargs,
         )
         page = self._dto(fetched.response)
+        objects = getattr(page, "objs", None)
+        if self.research_enabled and not objects:
+            confirmation_page = 1 if pn == 0xFFFF else pn
+            raw_page = getattr(getattr(fetched.response, "raw", None), "page", None)
+            await self._validate_research_empty_page(
+                "post detail", page, confirmation_page, "page", raw_page=raw_page
+            )
         if pn != 0xFFFF:
             self._validate_page_number("post detail", pn, page.page.current_page)
         wrong_tids = {post.tid for post in page.objs if post.tid != tid}
         if wrong_tids:
             raise PageIntegrityError(f"Post page returned tids {sorted(wrong_tids)} instead of {tid}.")
         raw_thread = getattr(getattr(fetched.response, "raw", None), "thread", None)
-        raw_tid = getattr(raw_thread, "tid", tid)
+        raw_tid = getattr(raw_thread, "tid", None)
+        if self.research_enabled and not objects and _positive_int_id(raw_tid) != tid:
+            await self._record_research_api_response(
+                suspicious_empty=True,
+                api_type="posts",
+                page_number=pn,
+            )
+            raise PageIntegrityError("Post page empty response is missing or mismatching thread identity.")
         if raw_thread is not None and raw_tid != tid:
             raise PageIntegrityError(f"Post page first-post detail returned tid {raw_tid} instead of {tid}.")
         return fetched
@@ -341,6 +369,12 @@ class TaskHandler(ABC):
             {},
         )
         page = self._dto(fetched.response)
+        objects = getattr(page, "objs", None)
+        if self.research_enabled and not objects:
+            raw_page = getattr(getattr(fetched.response, "raw", None), "page", None)
+            await self._validate_research_empty_page(
+                "comment detail", page, pn, "page", raw_page=raw_page
+            )
         self._validate_page_number("comment detail", pn, page.page.current_page)
         wrong_scope = {(comment.tid, comment.pid) for comment in page.objs if comment.tid != tid or comment.pid != pid}
         if wrong_scope:
@@ -348,6 +382,81 @@ class TaskHandler(ABC):
                 f"Comment page returned parent scopes {sorted(wrong_scope)} instead of {(tid, pid)}."
             )
         return fetched
+
+    async def _validate_research_empty_page(
+        self,
+        scope: str,
+        page: Any,
+        requested_page: int,
+        identity: str,
+        *,
+        raw_page: Any = None,
+    ) -> None:
+        page_data = getattr(page, "page", None)
+        current_page = _positive_int_id(getattr(page_data, "current_page", None)) if page_data is not None else None
+        if current_page is not None and self._is_confirmed_empty(
+            page_data, requested_page, raw_page=raw_page
+        ):
+            return
+        api_type = {"thread list": "threads", "post detail": "posts", "comment detail": "comments"}[scope]
+        await self._record_research_api_response(
+            suspicious_empty=True,
+            api_type=api_type,
+            page_number=requested_page,
+        )
+        reason = (
+            f"missing or has zero {identity} identity"
+            if current_page is None
+            else "not a confirmed terminal page"
+        )
+        raise PageIntegrityError(
+            f"{scope.capitalize()} empty response is {reason} for page {requested_page}."
+        )
+
+    async def _record_research_api_response(
+        self,
+        *,
+        suspicious_empty: bool,
+        api_type: str,
+        page_number: int,
+    ) -> None:
+        if not self.research_enabled:
+            return
+        record_response = getattr(self.container, "record_research_api_response", None)
+        if record_response is None:
+            return
+        cooldown_required = await record_response(suspicious_empty=suspicious_empty)
+        if not cooldown_required:
+            return
+        cooldown_seconds = float(self.container.config.cooldown_seconds_429)
+        run_id = getattr(self.container, "research_run_id", None)
+        self.log.warning(
+            "Three consecutive suspicious empty research API responses; endpoint={} page={} cooldown_seconds={}",
+            api_type,
+            page_number,
+            cooldown_seconds,
+        )
+        await self._await_api_gate(self.container.wait_for_rate_limit(cooldown_seconds, run_id=run_id))
+        self.log.info("Research API cooldown ended; requests will continue at the configured rate.")
+
+    async def _record_validated_research_page(self, api_type: str, page_number: int, page: Any) -> None:
+        if not self.research_enabled:
+            return
+        await self._record_research_api_response(
+            suspicious_empty=False,
+            api_type=api_type,
+            page_number=page_number,
+        )
+        page_data = getattr(page, "page", None)
+        total_pages = getattr(page_data, "total_page", 0)
+        item_count = len(getattr(page, "objs", ()) or ())
+        self.log.info(
+            "Validated research API page endpoint={} page={}/{} items={}",
+            api_type,
+            page_number,
+            total_pages,
+            item_count,
+        )
 
     @staticmethod
     def _validate_page_number(scope: str, requested: int, returned: int) -> None:
@@ -428,75 +537,62 @@ class TaskHandler(ABC):
                             )
                         )
                     except RetriableApiError as refresh_error:
-                        if refresh_error.code == 429:
+                        if refresh_error.code in {429, 220034}:
                             if run_id:
                                 await self.datastore.set_research_run_status_if(
                                     run_id,
                                     {"paused_auth"},
                                     "paused_rate_limit",
-                                    f"{api_type}_api_error_code_429_after_auth_refresh",
+                                    f"{api_type}_api_error_code_{refresh_error.code}_after_auth_refresh",
                                 )
-                            await self._await_api_gate(
-                                self.container.wait_for_rate_limit(
-                                    self.container.config.cooldown_seconds_429,
-                                    run_id=run_id,
-                                )
+                            cooldown_seconds = self.container.config.cooldown_seconds_429
+                            self.log.warning(
+                                "Research API {} returned frequency limit code {}; cooling down for {} seconds.",
+                                api_type,
+                                refresh_error.code,
+                                cooldown_seconds,
                             )
-                            if attempt >= attempt_limit:
-                                await self.container.block_research_network()
-                                raise
+                            await self._await_api_gate(
+                                self.container.wait_for_rate_limit(cooldown_seconds, run_id=run_id)
+                            )
                             if run_id:
                                 await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
-                            wait_seconds = self.container.config.research_retry_wait_seconds
-                            await self._await_api_gate(asyncio.sleep(wait_seconds * attempt))
+                            if attempt >= attempt_limit:
+                                raise
+                            self.log.info("Research API cooldown ended; retrying at the configured request rate.")
                             continue
-                        if refresh_error.code == 220034:
-                            if run_id:
-                                await self.datastore.set_research_run_status_if(
-                                    run_id,
-                                    {"paused_auth"},
-                                    "blocked",
-                                    f"{api_type}_api_error_code_220034_after_auth_refresh",
-                                )
-                            await self.container.block_research_network()
                         raise
                     if run_id:
                         await self.datastore.resume_research_run_if_status(run_id, "paused_auth")
                     return FetchedPage(response=response, attempts=attempt + 1)
-                if research_enabled and error.code == 429:
-                    run_id = getattr(self.container, "research_run_id", None)
-                    if run_id:
-                        await self.datastore.set_research_run_status_if(
-                            run_id,
-                            {"running", "paused_rate_limit"},
-                            "paused_rate_limit",
-                            f"{api_type}_api_error_code_429",
-                        )
-                    await self._await_api_gate(
-                        self.container.wait_for_rate_limit(
-                            self.container.config.cooldown_seconds_429,
-                            run_id=run_id,
-                        )
-                    )
-                    if attempt >= attempt_limit:
-                        await self.container.block_research_network()
-                        raise
-                    if run_id:
-                        await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
-                    wait_seconds = self.container.config.research_retry_wait_seconds
-                    await self._await_api_gate(asyncio.sleep(wait_seconds * attempt))
-                    continue
-                if research_enabled and error.code == 220034:
+                if research_enabled and error.code in {429, 220034}:
                     run_id = getattr(self.container, "research_run_id", None)
                     if run_id:
                         await self.datastore.set_research_run_status_if(
                             run_id,
                             {"running", "paused_auth", "paused_rate_limit"},
-                            "blocked",
-                            f"{api_type}_api_error_code_220034",
+                            "paused_rate_limit",
+                            f"{api_type}_api_error_code_{error.code}",
                         )
-                    await self.container.block_research_network()
-                    raise
+                    cooldown_seconds = self.container.config.cooldown_seconds_429
+                    self.log.warning(
+                        "Research API {} returned frequency limit code {}; cooling down for {} seconds.",
+                        api_type,
+                        error.code,
+                        cooldown_seconds,
+                    )
+                    await self._await_api_gate(
+                        self.container.wait_for_rate_limit(
+                            cooldown_seconds,
+                            run_id=run_id,
+                        )
+                    )
+                    if run_id:
+                        await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
+                    if attempt >= attempt_limit:
+                        raise
+                    self.log.info("Research API cooldown ended; retrying at the configured request rate.")
+                    continue
 
                 if attempt >= attempt_limit:
                     raise
@@ -637,50 +733,33 @@ class TaskHandler(ABC):
                         )
                     )
                 except RetriableApiError as error:
-                    if error.code == 429:
-                        if run_id:
-                            await self.datastore.set_research_run_status_if(
-                                run_id,
-                                {"paused_auth"},
-                                "paused_rate_limit",
-                                "user_forum_api_error_code_429_after_auth_refresh",
-                            )
-                        await self.container.block_research_network()
-                    elif error.code == 220034:
-                        if run_id:
-                            await self.datastore.set_research_run_status_if(
-                                run_id,
-                                {"paused_auth"},
-                                "blocked",
-                                "user_forum_api_error_code_220034_after_auth_refresh",
-                            )
-                        await self.container.block_research_network()
-                    elif run_id:
-                        await self.datastore.resume_research_run_if_status(run_id, "paused_auth")
                     if latest_page is not None:
                         await persist_research_page(sessionmaker_, latest_page)
+                    if error.code in {429, 220034}:
+                        await self._handle_user_forum_rate_limit(
+                            run_id,
+                            attempt,
+                            attempt_limit,
+                            error_code=error.code,
+                        )
+                        continue
+                    if run_id:
+                        await self.datastore.resume_research_run_if_status(run_id, "paused_auth")
                     raise
                 if run_id:
                     await self.datastore.resume_research_run_if_status(run_id, "paused_auth")
                 break
 
-            if dto.error_code == 429:
+            if dto.error_code in {429, 220034}:
                 if attempt >= attempt_limit:
                     await persist_research_page(sessionmaker_, latest_page)
-                await self._handle_user_forum_rate_limit(run_id, attempt, attempt_limit)
+                await self._handle_user_forum_rate_limit(
+                    run_id,
+                    attempt,
+                    attempt_limit,
+                    error_code=dto.error_code,
+                )
                 continue
-
-            if dto.error_code == 220034:
-                if run_id:
-                    await self.datastore.set_research_run_status_if(
-                        run_id,
-                        {"running", "paused_auth", "paused_rate_limit"},
-                        "blocked",
-                        "user_forum_api_error_code_220034",
-                    )
-                await self.container.block_research_network()
-                await persist_research_page(sessionmaker_, latest_page)
-                raise RetriableApiError(220034, "Research user-forum request was blocked.")
 
             if attempt < attempt_limit:
                 await self._await_api_gate(asyncio.sleep(self.container.config.research_retry_wait_seconds * attempt))
@@ -693,26 +772,38 @@ class TaskHandler(ABC):
         assert latest_page is not None
         await persist_research_page(sessionmaker_, latest_page)
 
-    async def _handle_user_forum_rate_limit(self, run_id: str | None, attempt: int, attempt_limit: int) -> None:
+    async def _handle_user_forum_rate_limit(
+        self,
+        run_id: str | None,
+        attempt: int,
+        attempt_limit: int,
+        *,
+        error_code: int,
+    ) -> None:
         if run_id:
             await self.datastore.set_research_run_status_if(
                 run_id,
                 {"running", "paused_auth", "paused_rate_limit"},
                 "paused_rate_limit",
-                "user_forum_api_error_code_429",
+                f"user_forum_api_error_code_{error_code}",
             )
+        cooldown_seconds = self.container.config.cooldown_seconds_429
+        self.log.warning(
+            "Research API user-forum lookup returned frequency limit code {}; cooling down for {} seconds.",
+            error_code,
+            cooldown_seconds,
+        )
         await self._await_api_gate(
             self.container.wait_for_rate_limit(
-                self.container.config.cooldown_seconds_429,
+                cooldown_seconds,
                 run_id=run_id,
             )
         )
-        if attempt >= attempt_limit:
-            await self.container.block_research_network()
-            raise RetriableApiError(429, "Research user-forum request exhausted bounded retries.")
         if run_id:
             await self.datastore.resume_research_run_if_status(run_id, "paused_rate_limit")
-        await asyncio.sleep(self.container.config.research_retry_wait_seconds * attempt)
+        if attempt >= attempt_limit:
+            raise RetriableApiError(error_code, "Research user-forum request exhausted bounded retries.")
+        self.log.info("Research API cooldown ended; retrying the user-forum lookup at the configured request rate.")
 
     @property
     def research_enabled(self) -> bool:
@@ -763,8 +854,17 @@ class TaskHandler(ABC):
             raise PageIntegrityError(f"{scope} terminated before total_pages on page {page_number}.")
 
     @staticmethod
-    def _is_confirmed_empty(page: Any, page_number: int) -> bool:
-        return page_number == 1 and not page.has_more and page.total_count == 0 and page.total_page in (0, 1)
+    def _is_confirmed_empty(page: Any, page_number: int, *, raw_page: Any = None) -> bool:
+        if raw_page is not None and not hasattr(raw_page, "total_count"):
+            return False
+        total_count = raw_page.total_count if raw_page is not None else page.total_count
+        return (
+            page_number == 1
+            and _positive_int_id(getattr(page, "current_page", None)) == 1
+            and not page.has_more
+            and total_count == 0
+            and page.total_page in (0, 1)
+        )
 
     @staticmethod
     def _validate_repeated_page(ids: list[int], cursor: dict[str, object], *, has_more: bool, scope: str) -> None:
@@ -791,8 +891,8 @@ class TaskHandler(ABC):
             error_code = getattr(error, "code", None)
             status = {
                 4011: "paused_auth",
-                429: "paused_rate_limit",
-                220034: "blocked",
+                429: "failed",
+                220034: "failed",
             }.get(error_code, "blocked" if error_code == 4 else "failed")
             scope_status = status if status in {"paused_auth", "paused_rate_limit", "blocked"} else "incomplete"
             current_generation = await self.datastore.record_research_checkpoint(
@@ -952,10 +1052,10 @@ class ThreadsTaskHandler(TaskHandler):
         else:
             if threads_data.page.total_page < 0 or threads_data.page.total_count < 0:
                 raise PageIntegrityError(f"Thread list returned negative page metadata for {fname} pn={pn}.")
-            if not threads_data.objs and (
-                threads_data.page.has_more
-                or threads_data.page.total_count > 0
-                or threads_data.page.total_page < 1
+            if not threads_data.objs and not self._is_confirmed_empty(
+                threads_data.page,
+                pn,
+                raw_page=getattr(getattr(fetched_page.response, "raw", None), "page", None),
             ):
                 raise PageIntegrityError(f"Thread list returned an unconfirmed empty page for {fname} pn={pn}.")
             if threads_data.page.has_more and threads_data.page.total_page > 0 and pn >= threads_data.page.total_page:
@@ -1070,6 +1170,7 @@ class ThreadsTaskHandler(TaskHandler):
             include_create_time=sort_mode == "create",
         )
         continuation_json.update(expected_contract)
+        await self._record_validated_research_page("threads", pn, threads_data)
         await self._persist_research_page(fetched_page.response)
 
         if not threads_data.objs:
@@ -1672,8 +1773,13 @@ class FullScanPostsTaskHandler(TaskHandler):
 
                 self._validate_terminal_metadata("post detail", pn, page.page.has_more, page.page.total_page)
                 if not page.objs:
-                    if self.research_enabled or not self._is_confirmed_empty(page.page, pn):
+                    if not self._is_confirmed_empty(
+                        page.page,
+                        pn,
+                        raw_page=getattr(getattr(fetched.response, "raw", None), "page", None),
+                    ):
                         raise PageIntegrityError(f"Unexpected empty post page for tid={tid} pn={pn}.")
+                    await self._record_validated_research_page("posts", pn, page)
                     cursor = self._continuation_from_page([], cursor, has_more=False)
                     if scope_managed:
                         committed, _children = await self._commit_research_posts_page(
@@ -1715,6 +1821,7 @@ class FullScanPostsTaskHandler(TaskHandler):
                     has_more=page.page.has_more,
                     scope=f"posts tid={tid}",
                 )
+                await self._record_validated_research_page("posts", pn, page)
                 cursor = self._continuation_from_page(
                     [post.pid for post in page.objs], cursor, has_more=page.page.has_more
                 )
@@ -1773,7 +1880,8 @@ class FullScanPostsTaskHandler(TaskHandler):
                 continuation_json=cursor,
                 generation=generation if scope_managed else None,
             )
-            self.log.error("Failed to process post pages for tid={} pn={} error={}", tid, pn, type(e).__name__)
+            error_detail = str(e) if isinstance(e, PageIntegrityError) else type(e).__name__
+            self.log.error("Failed to process post pages for tid={} pn={} error={}", tid, pn, error_detail)
         finally:
             await self.release_lock(lock_key)
 
@@ -1943,6 +2051,7 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                 comment_rn=10,
             )
             latest_page = self._dto(latest_fetched.response)
+            await self._record_validated_research_page("posts", latest_page.page.current_page, latest_page)
             await self._persist_research_page(latest_fetched.response)
 
             if not latest_page or not latest_page.objs:
@@ -2047,6 +2156,7 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                     comment_rn=10,
                 )
                 posts_page = self._dto(fetched.response)
+                await self._record_validated_research_page("posts", pn, posts_page)
                 await self._persist_research_page(fetched.response)
 
             if not posts_page or not posts_page.objs:
@@ -2073,6 +2183,7 @@ class IncrementalScanPostsTaskHandler(TaskHandler):
                 comment_rn=10,
             )
             hot_page = self._dto(hot_fetched.response)
+            await self._record_validated_research_page("posts", hot_page.page.current_page, hot_page)
             await self._persist_research_page(hot_fetched.response)
 
             if hot_page and hot_page.objs:
@@ -2479,8 +2590,13 @@ class FullScanCommentsTaskHandler(TaskHandler):
                 )
 
                 if not page.objs:
-                    if not self._is_confirmed_empty(page.page, pn):
+                    if not self._is_confirmed_empty(
+                        page.page,
+                        pn,
+                        raw_page=getattr(getattr(fetched.response, "raw", None), "page", None),
+                    ):
                         raise PageIntegrityError(f"Unexpected empty comment page for tid={tid} pid={pid} pn={pn}.")
+                    await self._record_validated_research_page("comments", pn, page)
                     if scope_managed:
                         committed = await self._commit_research_comments_page(
                             task_content,
@@ -2524,6 +2640,7 @@ class FullScanCommentsTaskHandler(TaskHandler):
                     has_more=page.page.has_more,
                     scope=f"comments tid={tid} parent_pid={pid}",
                 )
+                await self._record_validated_research_page("comments", pn, page)
                 cursor = self._continuation_from_page(
                     [comment.cid for comment in page.objs], cursor, has_more=page.page.has_more
                 )
@@ -2593,12 +2710,13 @@ class FullScanCommentsTaskHandler(TaskHandler):
                 continuation_json=cursor,
                 generation=generation if scope_managed else None,
             )
+            error_detail = str(e) if isinstance(e, PageIntegrityError) else type(e).__name__
             self.log.error(
                 "Failed to process comment pages for tid={} parent_pid={} pn={} error={}",
                 tid,
                 pid,
                 pn,
-                type(e).__name__,
+                error_detail,
             )
         finally:
             await self.release_lock(lock_key)
@@ -2645,6 +2763,7 @@ class FullScanCommentsTaskHandler(TaskHandler):
                 comments_page = initial_page_data
             else:
                 comments_page = await self.get_comments(tid, pid, pn)
+                await self._record_validated_research_page("comments", pn, comments_page)
 
             if not comments_page or not comments_page.objs:
                 self.log.warning("No comments found on pid={}, pn={}. Stopping scan.", pid, pn)
@@ -2723,6 +2842,9 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
                 return
             comments_fetched = await self.get_comments(tid, pid)
             comments_page = self._dto(comments_fetched.response)
+            await self._record_validated_research_page(
+                "comments", comments_page.page.current_page, comments_page
+            )
             await self._persist_research_page(comments_fetched.response)
 
             if not comments_page or not comments_page.objs:
@@ -2782,6 +2904,7 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
                     return
                 fetched = await self.get_comments(tid, pid, pn)
                 comments_page = self._dto(fetched.response)
+                await self._record_validated_research_page("comments", pn, comments_page)
                 await self._persist_research_page(fetched.response)
 
             if not comments_page or not comments_page.objs:
@@ -2938,6 +3061,7 @@ class DeepScanTaskHandler(TaskHandler):
                 comment_rn=10,
             )
             posts_page = self._dto(fetched.response)
+            await self._record_validated_research_page("posts", pn, posts_page)
             await self._persist_research_page(fetched.response)
             if not posts_page or not posts_page.objs:
                 self.log.warning("DeepScan: No posts found on tid={}, pn={}.", tid, pn)

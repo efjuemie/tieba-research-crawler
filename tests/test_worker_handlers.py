@@ -146,7 +146,7 @@ async def test_research_detail_pages_enrich_unique_author_forum_snapshots(source
 
 
 @pytest.mark.asyncio
-async def test_user_forum_rejection_blocks_network_without_finishing_page(monkeypatch):
+async def test_user_forum_frequency_limit_cools_down_without_blocking_network(monkeypatch):
     persisted: list[tuple[str, str | None]] = []
 
     async def persist(_sessionmaker, page, *, session=None, run_id=None):
@@ -164,12 +164,17 @@ async def test_user_forum_rejection_blocks_network_without_finishing_page(monkey
             fetch_user_forum_info=True,
             research_max_api_retries=1,
             research_retry_wait_seconds=0,
+            cooldown_seconds_429=10,
         ),
     )
     container.async_sessionmaker = object()
     container.research_run_id = "synthetic-run"
     container.block_research_network = AsyncMock()
-    datastore = SimpleNamespace(set_research_run_status_if=AsyncMock())
+    container.wait_for_rate_limit = AsyncMock()
+    datastore = SimpleNamespace(
+        set_research_run_status_if=AsyncMock(),
+        resume_research_run_if_status=AsyncMock(),
+    )
     handler = FullScanPostsTaskHandler(0, container, cast("Any", datastore), QueueRouter())
     raw = SimpleNamespace(
         thread=SimpleNamespace(fid=42, author_id=10, user=SimpleNamespace(user_id=10, portrait="portrait-10")),
@@ -187,9 +192,11 @@ async def test_user_forum_rejection_blocks_network_without_finishing_page(monkey
 
     assert error.value.code == 220034
     assert persisted == [("aiotieba.get_user_forum_info", None)]
+    container.wait_for_rate_limit.assert_awaited_once_with(10, run_id="synthetic-run")
     datastore.set_research_run_status_if.assert_awaited_once()
-    assert datastore.set_research_run_status_if.await_args.args[2] == "blocked"
-    container.block_research_network.assert_awaited_once()
+    assert datastore.set_research_run_status_if.await_args.args[2] == "paused_rate_limit"
+    datastore.resume_research_run_if_status.assert_awaited_once_with("synthetic-run", "paused_rate_limit")
+    container.block_research_network.assert_not_awaited()
 
 
 @pytest.mark.asyncio

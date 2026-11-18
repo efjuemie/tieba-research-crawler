@@ -107,9 +107,9 @@ port = 8001
 # 并发数限制
 concurrency = 10
 # 遇 HTTP 429 后的全局冷却时间（秒）
-cooldown_seconds_429 = 5.0
+cooldown_seconds_429 = 10.0
 # 所有 aiotieba HTTP 请求共享的全局上限；研究Client内部每个HTTP请求都会消耗一次
-global_rps = 0.2
+global_rps = 0.5
 # 分接口 RPS 配置
 # 贴吧服务端对各接口独立限流，使用令牌桶算法
 # threads/posts 接口令牌桶容量≈60, 恢复速率≈2.0/s
@@ -187,3 +187,4 @@ max_pages = 1
 max_expansions = 10
 # 每个目标浏览器任务的超时秒数；可在本机配置中调低。
 timeout_seconds = 90.0
+rps = 0.2

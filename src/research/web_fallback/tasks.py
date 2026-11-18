@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -304,7 +304,6 @@ def _task_key(
     author_portrait: str | None,
     fid: int | None,
     requested_fields: tuple[str, ...],
-    target_observed_at: datetime,
     scope_generation: int,
     parent_scope_generation: int | None,
 ) -> str:
@@ -320,7 +319,6 @@ def _task_key(
         "author_portrait": author_portrait,
         "fid": fid,
         "requested_fields": requested_fields,
-        "target_observed_at": _now(target_observed_at).isoformat(),
         "scope_generation": scope_generation,
         "parent_scope_generation": parent_scope_generation,
     }
@@ -334,6 +332,222 @@ def _insert_factory(dialect: str) -> Any:
     if dialect == "sqlite":
         return sqlite_insert
     raise ValueError(f"Unsupported database dialect for web task persistence: {dialect}.")
+
+
+def _enqueue_identity_lock_key(task: dict[str, Any]) -> int:
+    identity = (
+        task["run_id"],
+        task["target_type"],
+        task["target_id"],
+        task["scope_generation"],
+        task["parent_scope_generation"],
+    )
+    encoded = json.dumps(identity, separators=(",", ":"), ensure_ascii=True)
+    return int.from_bytes(hashlib.sha256(encoded.encode("utf-8")).digest()[:8], "big", signed=True)
+
+
+def _record_enqueue_failure(
+    session,
+    task: ResearchWebEnrichmentTask,
+    *,
+    status: str,
+    reason: str,
+    occurred_at: datetime,
+) -> None:
+    session.add(
+        ResearchWebEnrichmentFailure(
+            failure_id=str(uuid4()),
+            task_key=task.task_key,
+            lease_generation=task.lease_generation,
+            status=status,
+            reason_code=reason,
+            occurred_at=occurred_at,
+            identity_evidence_json=None,
+        )
+    )
+
+
+async def _persist_enqueued_task(
+    async_sessionmaker_: async_sessionmaker,
+    task: dict[str, Any],
+    *,
+    dialect: str,
+    now: datetime,
+    only_missing_fields: bool,
+) -> tuple[bool, bool, str]:
+    """Persist one target under a short identity-scoped transaction."""
+    insert_factory = _insert_factory(dialect)
+    async with async_sessionmaker_() as session, session.begin():
+        if dialect == "postgresql":
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": _enqueue_identity_lock_key(task)},
+            )
+
+        existing_rows = (
+            await session.scalars(
+                select(ResearchWebEnrichmentTask)
+                .where(
+                    ResearchWebEnrichmentTask.run_id == task["run_id"],
+                    ResearchWebEnrichmentTask.target_type == task["target_type"],
+                    ResearchWebEnrichmentTask.target_id == task["target_id"],
+                    ResearchWebEnrichmentTask.tid == task["tid"],
+                    ResearchWebEnrichmentTask.author_user_id == task["author_user_id"],
+                    ResearchWebEnrichmentTask.author_portrait.is_(None)
+                    if task["author_portrait"] is None
+                    else ResearchWebEnrichmentTask.author_portrait == task["author_portrait"],
+                    ResearchWebEnrichmentTask.fid.is_(None)
+                    if task["fid"] is None
+                    else ResearchWebEnrichmentTask.fid == task["fid"],
+                    ResearchWebEnrichmentTask.parent_post_pid.is_(None)
+                    if task["parent_post_pid"] is None
+                    else ResearchWebEnrichmentTask.parent_post_pid == task["parent_post_pid"],
+                    ResearchWebEnrichmentTask.scope_generation == task["scope_generation"],
+                    ResearchWebEnrichmentTask.parent_scope_generation.is_(None)
+                    if task["parent_scope_generation"] is None
+                    else ResearchWebEnrichmentTask.parent_scope_generation == task["parent_scope_generation"],
+                )
+                .order_by(ResearchWebEnrichmentTask.created_at.desc(), ResearchWebEnrichmentTask.task_key)
+                .with_for_update()
+            )
+        ).all()
+        requested = set(task["requested_fields_json"])
+        existing = next(
+            (row for row in existing_rows if requested.issubset(set(row.requested_fields_json))),
+            None,
+        )
+        if existing is not None:
+            planned_status = task["status"]
+            if existing.task_key != task["task_key"]:
+                task["task_key"] = existing.task_key
+                task["requested_fields_json"] = list(existing.requested_fields_json)
+            if planned_status == "pending_web" and existing.status == "pending_api_detail":
+                existing.status = "pending_web"
+            elif planned_status == "pending_web" and existing.status == "partially_completed":
+                if existing.attempts < existing.max_attempts:
+                    existing.status = "failed_retryable"
+                    existing.next_retry_at = now + timedelta(seconds=3 if existing.attempts == 1 else 5)
+                    existing.last_error_type = "failed_retryable"
+                    existing.last_error = "partial_fields_unresolved"
+                    existing.completed_at = None
+                    _record_enqueue_failure(
+                        session,
+                        existing,
+                        status="failed_retryable",
+                        reason="partial_fields_unresolved",
+                        occurred_at=now,
+                    )
+                else:
+                    existing.status = "failed_final"
+                    existing.last_error_type = "failed_final"
+                    existing.last_error = "max_attempts_exhausted_after_partial"
+                    existing.completed_at = now
+                    existing.updated_at = now
+                    existing.field_statuses_json = {
+                        name: {
+                            "status": "failed_final",
+                            "reason": "max_attempts_exhausted_after_partial",
+                        }
+                        for name in existing.requested_fields_json
+                    }
+                    _record_enqueue_failure(
+                        session,
+                        existing,
+                        status="failed_final",
+                        reason="max_attempts_exhausted_after_partial",
+                        occurred_at=now,
+                    )
+            elif (
+                planned_status == "pending_web"
+                and existing.status == "completed"
+                and only_missing_fields
+            ):
+                if existing.attempts < existing.max_attempts:
+                    existing.status = "pending_web"
+                    existing.completed_at = None
+                else:
+                    existing.status = "failed_final"
+                    existing.last_error_type = "failed_final"
+                    existing.last_error = "web_attempt_limit_exhausted_after_api_refresh"
+                    existing.completed_at = now
+                    existing.updated_at = now
+                    existing.field_statuses_json = {
+                        name: {
+                            "status": "failed_final",
+                            "reason": "web_attempt_limit_exhausted_after_api_refresh",
+                        }
+                        for name in existing.requested_fields_json
+                    }
+                    _record_enqueue_failure(
+                        session,
+                        existing,
+                        status="failed_final",
+                        reason="web_attempt_limit_exhausted_after_api_refresh",
+                        occurred_at=now,
+                    )
+            if existing.status == "pending_web":
+                existing.updated_at = now
+                existing.last_error_type = None
+                existing.last_error = None
+            task["status"] = existing.status
+            return False, True, existing.task_key
+
+        statement = insert_factory(ResearchWebEnrichmentTask).values(**task).on_conflict_do_nothing(
+            index_elements=[ResearchWebEnrichmentTask.task_key]
+        )
+        result = await session.execute(statement)
+        if result.rowcount == 1:
+            return True, False, task["task_key"]
+
+        existing = await session.scalar(
+            select(ResearchWebEnrichmentTask)
+            .where(ResearchWebEnrichmentTask.task_key == task["task_key"])
+            .with_for_update()
+        )
+        if existing is not None and task["status"] == "pending_web":
+            if existing.status == "pending_api_detail":
+                existing.status = "pending_web"
+            elif existing.status == "partially_completed":
+                if existing.attempts < existing.max_attempts:
+                    existing.status = "failed_retryable"
+                    existing.next_retry_at = now + timedelta(seconds=3 if existing.attempts == 1 else 5)
+                    existing.last_error_type = "failed_retryable"
+                    existing.last_error = "partial_fields_unresolved"
+                    existing.completed_at = None
+                    _record_enqueue_failure(
+                        session,
+                        existing,
+                        status="failed_retryable",
+                        reason="partial_fields_unresolved",
+                        occurred_at=now,
+                    )
+                else:
+                    existing.status = "failed_final"
+                    existing.last_error_type = "failed_final"
+                    existing.last_error = "max_attempts_exhausted_after_partial"
+                    existing.completed_at = now
+                    existing.updated_at = now
+                    existing.field_statuses_json = {
+                        name: {
+                            "status": "failed_final",
+                            "reason": "max_attempts_exhausted_after_partial",
+                        }
+                        for name in existing.requested_fields_json
+                    }
+                    _record_enqueue_failure(
+                        session,
+                        existing,
+                        status="failed_final",
+                        reason="max_attempts_exhausted_after_partial",
+                        occurred_at=now,
+                    )
+            if existing.status == "pending_web":
+                existing.updated_at = now
+                existing.last_error_type = None
+                existing.last_error = None
+        if existing is not None:
+            task["status"] = existing.status
+        return False, True, task["task_key"]
 
 
 async def enqueue_web_enrichment_tasks(
@@ -551,7 +765,6 @@ async def enqueue_web_enrichment_tasks(
                     author_portrait=row.author_portrait,
                     fid=row.fid,
                     requested_fields=field_names,
-                    target_observed_at=row.observed_at,
                     scope_generation=parent_scope.generation if parent_scope else thread_scope.generation,
                     parent_scope_generation=thread_scope.generation if parent_scope else None,
                 )
@@ -615,46 +828,23 @@ async def enqueue_web_enrichment_tasks(
                 plans,
             )
 
-        insert_factory = _insert_factory(session.get_bind().dialect.name)
-        created = 0
-        deduplicated = 0
-        task_keys: list[str] = []
-        for task in planned:
-            key = task["task_key"]
-            task_keys.append(key)
-            statement = insert_factory(ResearchWebEnrichmentTask).values(**task).on_conflict_do_nothing(
-                index_elements=[ResearchWebEnrichmentTask.task_key]
-            )
-            result = await session.execute(statement)
-            if result.rowcount == 1:
-                created += 1
-                continue
-            deduplicated += 1
-            existing = await session.scalar(
-                select(ResearchWebEnrichmentTask)
-                .where(ResearchWebEnrichmentTask.task_key == key)
-                .with_for_update()
-            )
-            if existing is not None and task["status"] == "pending_web":
-                if existing.status == "pending_api_detail":
-                    existing.status = "pending_web"
-                elif existing.status == "partially_completed":
-                    if existing.attempts < existing.max_attempts:
-                        existing.status = "pending_web"
-                        existing.field_statuses_json = {
-                            name: {"status": "pending", "reason": None}
-                            for name in task["requested_fields_json"]
-                        }
-                        existing.completed_at = None
-                    else:
-                        existing.status = "failed_final"
-                        task["status"] = "failed_final"
-                if existing.status == "pending_web":
-                    existing.updated_at = now
-                    existing.last_error_type = None
-                    existing.last_error = None
+        dialect = session.get_bind().dialect.name
+    created = 0
+    deduplicated = 0
+    task_keys: list[str] = []
+    for task in planned:
+        was_created, was_deduplicated, task_key = await _persist_enqueued_task(
+            async_sessionmaker_,
+            task,
+            dialect=dialect,
+            now=now,
+            only_missing_fields=only_missing_fields,
+        )
+        created += was_created
+        deduplicated += was_deduplicated
+        task_keys.append(task_key)
 
-        plans = _planned_targets(planned)
+    plans = _planned_targets(planned)
 
     return EnqueueSummary(run_id, len(planned), created, deduplicated, skipped, tuple(task_keys), plans)
 

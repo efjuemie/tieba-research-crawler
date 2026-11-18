@@ -53,6 +53,11 @@ def _summary(*plans: WebEnrichmentTargetPlan, created: int = 1) -> EnqueueSummar
     )
 
 
+async def _ready_preflight(_sessions, lease):
+    fields = tuple(getattr(lease, "requested_fields", ("ip_location_text",)))
+    return SimpleNamespace(status="ready", missing_fields=fields, satisfied_fields=())
+
+
 class _SQLiteSessionAdapter:
     def __init__(self, session):
         self.session = session
@@ -381,6 +386,7 @@ async def test_field_backfill_leases_only_planned_keys_and_preserves_comment_sco
 
     monkeypatch.setattr(service, "enqueue_web_enrichment_tasks", enqueue)
     monkeypatch.setattr(service, "lease_web_enrichment_tasks", lease)
+    monkeypatch.setattr(service, "_preflight_web_task", _ready_preflight)
     monkeypatch.setattr(service, "_complete_task", complete)
     filters = service.TargetFilters(
         "comment", (plan.target_id,), tid=plan.tid, fid=plan.fid, parent_pid=plan.parent_post_pid
@@ -430,6 +436,7 @@ async def test_blocked_429_stops_without_retrying_remaining_targets(monkeypatch)
 
     monkeypatch.setattr(service, "enqueue_web_enrichment_tasks", enqueue)
     monkeypatch.setattr(service, "lease_web_enrichment_tasks", lease)
+    monkeypatch.setattr(service, "_preflight_web_task", _ready_preflight)
     monkeypatch.setattr(service, "_fail_task", fail)
     result = await service.run_field_backfill(
         object(),
@@ -453,19 +460,29 @@ async def test_blocked_429_stops_without_retrying_remaining_targets(monkeypatch)
 async def test_retryable_field_backfill_uses_persisted_retry_policy(monkeypatch):
     plan = _plan()
     failures = []
+    lease_count = 0
     provider = _FakeProvider([_browser_result("timeout", "browser_task_timeout")])
 
     async def enqueue(*_args, **_kwargs):
         return _summary(plan)
 
     async def lease(*_args, **_kwargs):
-        return [SimpleNamespace(task_key=plan.task_key, lease_token="synthetic-token")]
+        nonlocal lease_count
+        lease_count += 1
+        if lease_count == 1:
+            return [SimpleNamespace(task_key=plan.task_key, lease_token="synthetic-token")]
+        return []
+
+    async def no_retry_delay(*_args, **_kwargs):
+        return None
 
     async def fail(_sessions, _task_key, _lease_token, **kwargs):
         failures.append(kwargs)
 
     monkeypatch.setattr(service, "enqueue_web_enrichment_tasks", enqueue)
     monkeypatch.setattr(service, "lease_web_enrichment_tasks", lease)
+    monkeypatch.setattr(service, "_preflight_web_task", _ready_preflight)
+    monkeypatch.setattr(service, "_next_retry_delay", no_retry_delay)
     monkeypatch.setattr(service, "_fail_task", fail)
     result = await service.run_field_backfill(
         object(),
@@ -487,17 +504,17 @@ async def test_retryable_field_backfill_uses_persisted_retry_policy(monkeypatch)
 @pytest.mark.asyncio
 async def test_durable_timeout_uses_persisted_retry_policy(monkeypatch):
     failures = []
-    target = object()
+    target = service._target_from_plan(_plan())
     lease = SimpleNamespace(
         task_key="synthetic-task",
         lease_token="synthetic-token",
-        requested_fields=("ip_location_text",),
+        requested_fields=target.requested_fields,
     )
     result = SimpleNamespace(status="timeout", reason="browser_task_timeout", diagnostics={})
 
     class Provider:
         async def collect(self, requested_target):
-            assert requested_target is target
+            assert requested_target.requested_fields == target.requested_fields
             return result
 
     async def fail(_sessions, _task_key, _lease_token, **kwargs):
@@ -505,6 +522,7 @@ async def test_durable_timeout_uses_persisted_retry_policy(monkeypatch):
         return "failed_retryable"
 
     monkeypatch.setattr(service, "_target_from_lease", lambda _lease: target)
+    monkeypatch.setattr(service, "_preflight_web_task", _ready_preflight)
     monkeypatch.setattr(service, "_fail_task", fail)
     status, observed = await service._process_durable_web_lease(object(), Provider(), lease)
 
@@ -572,10 +590,10 @@ async def test_live_worker_timeout_uses_persisted_retry_policy(monkeypatch):
     provider = _FakeProvider([])
 
     async def next_lease(*_args):
-        stop_event.set()
         return lease
 
-    async def timeout(*_args):
+    async def timeout(*_args, stop_event):
+        stop_event.set()
         raise TimeoutError("synthetic browser timeout")
 
     async def fail(_sessions, _task_key, _lease_token, **kwargs):
@@ -611,7 +629,7 @@ async def test_live_worker_timeout_uses_persisted_retry_policy(monkeypatch):
 
     assert failures[0].get("retry_after") is None
     assert summary.collected_count == 1
-    assert summary.stopped_reason == "stop_requested_drained"
+    assert summary.stopped_reason == "stop_requested"
     assert provider.closed == 1
 
 
@@ -660,6 +678,7 @@ async def test_manual_login_releases_lease_before_confirmation_and_resumes_exact
 
     monkeypatch.setattr(service, "enqueue_web_enrichment_tasks", enqueue)
     monkeypatch.setattr(service, "lease_web_enrichment_tasks", lease)
+    monkeypatch.setattr(service, "_preflight_web_task", _ready_preflight)
     monkeypatch.setattr(service, "_fail_task", fail)
     monkeypatch.setattr(service, "resume_web_enrichment_tasks", resume)
     monkeypatch.setattr(service, "_complete_task", complete)
@@ -689,6 +708,7 @@ async def test_manual_login_releases_lease_before_confirmation_and_resumes_exact
 @pytest.mark.asyncio
 async def test_live_worker_reuses_one_headed_provider_to_drain_multiple_runs(monkeypatch):
     stop_event = asyncio.Event()
+    api_done_event = asyncio.Event()
     provider = _FakeProvider([])
     provider_args = []
     lease_calls = []
@@ -709,11 +729,21 @@ async def test_live_worker_reuses_one_headed_provider_to_drain_multiple_runs(mon
                 return available.pop(index)
         return None
 
-    async def process(_sessions, current_provider, lease):
+    async def process(_sessions, current_provider, lease, *, stop_event):
         process_calls.append((current_provider, lease.run_id, lease.task_key))
-        if lease.run_id == "current-run":
-            stop_event.set()
+        if lease.run_id == "old-run":
+            api_done_event.set()
         return "completed", SimpleNamespace(status="ok", reason=None, diagnostics={})
+
+    async def drain(*_args, **_kwargs):
+        return SimpleNamespace(
+            collected_count=0,
+            completed_count=0,
+            partial_count=0,
+            diagnostics={},
+            unresolved_count=0,
+            stopped_reason="queue_drained",
+        )
 
     async def no_unresolved(_sessions, _run_ids):
         return 0
@@ -725,11 +755,13 @@ async def test_live_worker_reuses_one_headed_provider_to_drain_multiple_runs(mon
     monkeypatch.setattr(service, "_process_durable_web_lease", process)
     monkeypatch.setattr(service, "_count_unresolved_web_tasks", no_unresolved)
     monkeypatch.setattr(service, "_next_retry_delay", no_retry_delay)
+    monkeypatch.setattr(service, "drain_pending_web_enrichment", drain)
 
     summary = await service.run_live_web_fallback_worker(
         object(),
         lambda: ("current-run", "old-run"),
         stop_event=stop_event,
+        api_done_event=api_done_event,
         browser_profile="/private/synthetic-profile",
         request_budget=_FakeBudget(),
         browser_config=SimpleNamespace(max_pages=1, max_expansions=1, timeout_seconds=30),

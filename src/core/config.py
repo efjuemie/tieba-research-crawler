@@ -110,9 +110,9 @@ class RateLimitConfig(BaseModel):
     """请求频率限制配置模型"""
 
     concurrency: int = Field(default=10, gt=0)
-    cooldown_seconds_429: float = Field(default=5.0, gt=0)
+    cooldown_seconds_429: float = Field(default=10.0, gt=0)
 
-    global_rps: float = Field(default=0.2, gt=0)
+    global_rps: float = Field(default=0.5, gt=0)
     threads_rps: float = Field(default=2.0, gt=0)
     posts_rps: float = Field(default=2.0, gt=0)
     comments_rps: float = Field(default=5.0, gt=0)
@@ -213,6 +213,7 @@ class WebFallbackConfig(BaseModel):
     max_pages: int = Field(default=1, ge=1, le=10)
     max_expansions: int = Field(default=10, ge=0, le=10)
     timeout_seconds: float = Field(default=90.0, gt=0, le=120)
+    rps: float = Field(default=0.2, gt=0)
 
 
 class PydanticConfig(BaseSettings):

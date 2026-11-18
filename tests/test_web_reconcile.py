@@ -1,3 +1,4 @@
+import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,7 @@ from src.research.web_fallback.reconcile import (
     _finish_attempt_after_error,
     complete_web_enrichment_task,
     fail_web_enrichment_task,
+    preflight_web_enrichment_task,
 )
 from src.research.web_fallback.tasks import (
     cancel_web_enrichment_task,
@@ -376,6 +378,510 @@ async def test_verified_field_applies_by_exact_post_and_source_is_sanitized(reco
         assert observation.temporal_scope == "web_observation_at_observed_time"
         assert task.status == "completed"
         assert "elapsed_seconds" in task.last_diagnostics_json
+
+
+@pytest.mark.asyncio
+async def test_durable_preflight_skips_task_filled_by_api_before_browser(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
+    with Session(engine) as session, session.begin():
+        post = session.get(ResearchPost, 2101)
+        post.author_nickname = "API refreshed title"
+        post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+
+    class Provider:
+        async def collect(self, _target):
+            pytest.fail("preflight-completed tasks must not visit the browser")
+
+    status, _result = await service._process_durable_web_lease(maker, Provider(), lease)
+
+    assert status == "completed"
+    with Session(engine) as session:
+        post = session.get(ResearchPost, 2101)
+        task = session.get(ResearchWebEnrichmentTask, lease.task_key)
+        attempt = session.get(ResearchWebEnrichmentAttempt, (lease.task_key, lease.lease_generation))
+        assert post.author_nickname == "API refreshed title"
+        assert task.status == "completed"
+        assert task.last_diagnostics_json["status"] == "already_satisfied"
+        assert task.last_diagnostics_json["pages"] == 0
+        assert attempt.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_durable_preflight_collects_only_missing_fields_after_api_refresh(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_post(
+        maker,
+        2101,
+        ["global_growth_level", "global_growth_icon_url", "ip_location_text"],
+    )
+    with Session(engine) as session, session.begin():
+        post = session.get(ResearchPost, 2101)
+        post.global_growth_level = 12
+        post.global_growth_icon_url = "https://growth.example.test/icon.png"
+        post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    targets = []
+
+    class Provider:
+        async def collect(self, target):
+            targets.append(target)
+            return SimpleNamespace(
+                status="ok",
+                candidates=(_candidate(lease, "ip_location_text", "Vancouver"),),
+                field_outcomes={},
+                diagnostics={},
+            )
+
+    status, _result = await service._process_durable_web_lease(maker, Provider(), lease)
+
+    assert status == "completed"
+    assert len(targets) == 1
+    assert targets[0].requested_fields == ("ip_location_text",)
+    with Session(engine) as session:
+        post = session.get(ResearchPost, 2101)
+        assert post.ip_location_text == "Vancouver"
+        task = session.get(ResearchWebEnrichmentTask, lease.task_key)
+        assert task.field_statuses_json["global_growth_level"] == {
+            "status": "confirmed",
+            "reason": "already_satisfied",
+        }
+        observations = session.scalars(
+            select(ResearchFieldObservation).where(
+                ResearchFieldObservation.task_key == lease.task_key,
+                ResearchFieldObservation.field_name.in_(
+                    ("global_growth_level", "global_growth_icon_url")
+                ),
+            )
+        ).all()
+        assert observations == []
+
+
+@pytest.mark.asyncio
+async def test_single_growth_field_preflight_keeps_legacy_request_scope(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_post(maker, 2101, ["global_growth_level"])
+    with Session(engine) as session, session.begin():
+        post = session.get(ResearchPost, 2101)
+        post.global_growth_level = 12
+        post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+
+    class Provider:
+        async def collect(self, _target):
+            pytest.fail("a known single-field legacy task should be skipped")
+
+    status, result = await service._process_durable_web_lease(maker, Provider(), lease)
+
+    assert status == "completed"
+    assert result.preflight_skipped is True
+    with Session(engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, lease.task_key)
+        assert task.requested_fields_json == ["global_growth_level"]
+
+
+@pytest.mark.asyncio
+async def test_preflight_satisfied_fields_are_rechecked_at_merge(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_post(
+        maker,
+        2101,
+        ["global_growth_level", "global_growth_icon_url", "ip_location_text"],
+    )
+    with Session(engine) as session, session.begin():
+        post = session.get(ResearchPost, 2101)
+        post.global_growth_level = 12
+        post.global_growth_icon_url = "https://growth.example.test/icon.png"
+        post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+
+    class Provider:
+        async def collect(self, _target):
+            with Session(engine) as session, session.begin():
+                post = session.get(ResearchPost, 2101)
+                post.global_growth_level = None
+                post.global_growth_icon_url = None
+                post.observed_at = datetime(2026, 1, 3, tzinfo=UTC)
+            return SimpleNamespace(
+                status="ok",
+                candidates=(_candidate(lease, "ip_location_text", "Vancouver"),),
+                field_outcomes={},
+                diagnostics={},
+            )
+
+    status, _result = await service._process_durable_web_lease(maker, Provider(), lease)
+
+    assert status == "partially_completed"
+    with Session(engine) as session:
+        post = session.get(ResearchPost, 2101)
+        task = session.get(ResearchWebEnrichmentTask, lease.task_key)
+        assert post.ip_location_text == "Vancouver"
+        assert task.status == "partially_completed"
+        assert task.field_statuses_json["global_growth_level"]["status"] == "not_tested"
+
+
+@pytest.mark.asyncio
+async def test_stale_thread_content_marker_can_fall_back_to_verified_list_metadata(reconcile_db):
+    engine, maker = reconcile_db
+    with Session(engine) as session, session.begin():
+        row = session.get(ResearchThread, 1001)
+        row.source_api = "aiotieba.get_threads"
+        row.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+        scope = session.get(ResearchTaskScope, ("run-reconcile-001", "thread_replies:1001"))
+        scope.status = "pending"
+        session.add(
+            ResearchContentObservation(
+                owner_type="thread_first_post",
+                owner_id=1001,
+                tid=1001,
+                source_api="aiotieba.get_posts",
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+
+    _summary, lease = await _lease_thread(maker, ["author_nickname"])
+    result = await preflight_web_enrichment_task(maker, lease.task_key, lease.lease_token)
+
+    assert result.status == "ready"
+    assert result.missing_fields == ("author_nickname",)
+
+
+@pytest.mark.asyncio
+async def test_live_web_worker_drains_after_api_done_and_uses_its_own_budget(reconcile_db):
+    _engine, maker = reconcile_db
+    await enqueue_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        ["author_nickname"],
+        target_type="post",
+        target_ids=[2101, 2102],
+        tid=1001,
+    )
+    provider_targets = []
+    provider_budgets = []
+
+    class Provider:
+        async def collect(self, target):
+            provider_targets.append(target)
+            return SimpleNamespace(
+                status="ok",
+                candidates=(_candidate(target, "author_nickname", f"web-{target.target_id}"),),
+                field_outcomes={},
+                diagnostics={"pages": 1},
+            )
+
+    async def factory(**kwargs):
+        provider_budgets.append(kwargs["budget"])
+        return Provider()
+
+    stop_event = asyncio.Event()
+    api_done_event = asyncio.Event()
+    api_done_event.set()
+    result = await service.run_live_web_fallback_worker(
+        maker,
+        lambda: ("run-reconcile-001",),
+        stop_event=stop_event,
+        api_done_event=api_done_event,
+        browser_profile="synthetic-profile",
+        browser_config=SimpleNamespace(rps=0.2),
+        provider_factory=factory,
+        headed=False,
+        wait_for_login=False,
+    )
+
+    assert result.completed_count == 2
+    assert result.unresolved_count == 0
+    assert {target.target_id for target in provider_targets} == {"2101", "2102"}
+    assert len(provider_budgets) == 1
+    assert provider_budgets[0] is not None
+
+
+@pytest.mark.asyncio
+async def test_user_stop_interrupts_api_done_web_drain_after_current_visit(reconcile_db):
+    _engine, maker = reconcile_db
+    await enqueue_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        ["author_nickname"],
+        target_type="post",
+        target_ids=[2101, 2102],
+        tid=1001,
+    )
+    stop_event = asyncio.Event()
+    api_done_event = asyncio.Event()
+    api_done_event.set()
+    visited = []
+
+    class Provider:
+        async def collect(self, target):
+            visited.append(target.target_id)
+            stop_event.set()
+            return SimpleNamespace(
+                status="ok",
+                candidates=(_candidate(target, "author_nickname", f"web-{target.target_id}"),),
+                field_outcomes={},
+                diagnostics={"pages": 1},
+            )
+
+    result = await service.run_live_web_fallback_worker(
+        maker,
+        lambda: ("run-reconcile-001",),
+        stop_event=stop_event,
+        api_done_event=api_done_event,
+        browser_profile="synthetic-profile",
+        browser_config=SimpleNamespace(rps=0.2),
+        provider_factory=lambda **_kwargs: Provider(),
+        headed=False,
+        wait_for_login=False,
+    )
+
+    assert len(visited) == 1
+    assert result.completed_count == 1
+    assert result.unresolved_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["drain", "live"])
+async def test_stop_during_lease_wait_does_not_start_web_visit(reconcile_db, monkeypatch, entrypoint):
+    _engine, maker = reconcile_db
+    await enqueue_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        ["author_nickname"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+    )
+    stop_event = asyncio.Event()
+    original_lease = service._lease_one_web_task
+
+    async def lease_then_stop(*args):
+        lease = await original_lease(*args)
+        stop_event.set()
+        return lease
+
+    monkeypatch.setattr(service, "_lease_one_web_task", lease_then_stop)
+    visited = []
+
+    class Provider:
+        async def collect(self, target):
+            visited.append(target.target_id)
+            return SimpleNamespace(status="failed_retryable", candidates=(), diagnostics={})
+
+    provider = Provider()
+    if entrypoint == "drain":
+        result = await service.drain_pending_web_enrichment(
+            maker,
+            ("run-reconcile-001",),
+            provider=provider,
+            stop_event=stop_event,
+            wait_for_login=False,
+        )
+    else:
+        result = await service.run_live_web_fallback_worker(
+            maker,
+            lambda: ("run-reconcile-001",),
+            stop_event=stop_event,
+            browser_profile="synthetic-profile",
+            browser_config=SimpleNamespace(rps=0.2),
+            provider_factory=lambda **_kwargs: provider,
+            headed=False,
+            wait_for_login=False,
+        )
+
+    assert visited == []
+    assert result.collected_count == 0
+    assert result.unresolved_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_during_preflight_does_not_start_web_visit(reconcile_db, monkeypatch):
+    _engine, maker = reconcile_db
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
+    stop_event = asyncio.Event()
+    original_preflight = service._preflight_web_task
+
+    async def preflight_then_stop(sessions, current_lease):
+        result = await original_preflight(sessions, current_lease)
+        stop_event.set()
+        return result
+
+    monkeypatch.setattr(service, "_preflight_web_task", preflight_then_stop)
+
+    class Provider:
+        async def collect(self, _target):
+            pytest.fail("stop during preflight must prevent a new browser visit")
+
+    status, _result = await service._process_durable_web_lease(
+        maker, Provider(), lease, stop_event=stop_event
+    )
+
+    assert status == "stop_requested"
+    with Session(_engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, lease.task_key)
+        assert task.status == "running"
+        assert task.lease_token == lease.lease_token
+
+
+@pytest.mark.asyncio
+async def test_api_refresh_during_web_visit_is_not_overwritten(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
+
+    class Provider:
+        async def collect(self, _target):
+            with Session(engine) as session, session.begin():
+                post = session.get(ResearchPost, 2101)
+                post.author_nickname = "API arrived during visit"
+                post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+            return SimpleNamespace(
+                status="ok",
+                candidates=(_candidate(lease, "author_nickname", "stale browser title"),),
+                field_outcomes={},
+                diagnostics={},
+            )
+
+    status, _result = await service._process_durable_web_lease(maker, Provider(), lease)
+
+    assert status == "partially_completed"
+    with Session(engine) as session:
+        post = session.get(ResearchPost, 2101)
+        task = session.get(ResearchWebEnrichmentTask, lease.task_key)
+        assert post.author_nickname == "API arrived during visit"
+        assert task.status == "partially_completed"
+        assert task.field_statuses_json["author_nickname"]["status"] == "conflict"
+
+
+@pytest.mark.asyncio
+async def test_partial_web_retries_use_three_then_five_seconds_and_stop_after_three_attempts(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, first_lease = await _lease_post(
+        maker, 2101, ["author_nickname", "ip_location_text"]
+    )
+
+    class PartialProvider:
+        async def collect(self, target):
+            assert target.requested_fields == ("author_nickname", "ip_location_text")
+            return SimpleNamespace(
+                status="ok",
+                candidates=(_candidate(first_lease, "author_nickname", "Partial title"),),
+                field_outcomes={},
+                diagnostics={},
+            )
+
+    status, _result = await service._process_durable_web_lease(
+        maker, PartialProvider(), first_lease
+    )
+    assert status == "partially_completed"
+    await service._enqueue_remaining_fields(maker, first_lease)
+    with Session(engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, first_lease.task_key)
+        assert task.status == "failed_retryable"
+        assert task.attempts == 1
+        first_due = task.next_retry_at.replace(tzinfo=UTC)
+    now = datetime.now(UTC)
+    assert timedelta(seconds=2.8) <= first_due - now <= timedelta(seconds=3.2)
+    assert await lease_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        "too-early-first-retry",
+        task_keys=(first_lease.task_key,),
+        now=first_due - timedelta(milliseconds=1),
+    ) == []
+    second_lease = (
+        await lease_web_enrichment_tasks(
+            maker,
+            "run-reconcile-001",
+            "second-partial-attempt",
+            task_keys=(first_lease.task_key,),
+            now=first_due + timedelta(milliseconds=1),
+        )
+    )[0]
+    assert second_lease.lease_generation == 2
+
+    with Session(engine) as session, session.begin():
+        session.get(ResearchWebEnrichmentTask, first_lease.task_key).status = "partially_completed"
+    await service._enqueue_remaining_fields(maker, second_lease)
+    with Session(engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, first_lease.task_key)
+        assert task.status == "failed_retryable"
+        assert task.attempts == 2
+        second_due = task.next_retry_at.replace(tzinfo=UTC)
+    now = datetime.now(UTC)
+    assert timedelta(seconds=4.8) <= second_due - now <= timedelta(seconds=5.2)
+    assert await lease_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        "too-early-second-retry",
+        task_keys=(first_lease.task_key,),
+        now=second_due - timedelta(milliseconds=1),
+    ) == []
+    third_lease = (
+        await lease_web_enrichment_tasks(
+            maker,
+            "run-reconcile-001",
+            "third-partial-attempt",
+            task_keys=(first_lease.task_key,),
+            now=second_due + timedelta(milliseconds=1),
+        )
+    )[0]
+    assert third_lease.lease_generation == 3
+
+    with Session(engine) as session, session.begin():
+        session.get(ResearchWebEnrichmentTask, first_lease.task_key).status = "partially_completed"
+    await service._enqueue_remaining_fields(maker, third_lease)
+    with Session(engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, first_lease.task_key)
+        failures = session.scalars(
+            select(ResearchWebEnrichmentFailure).where(
+                ResearchWebEnrichmentFailure.task_key == first_lease.task_key,
+                ResearchWebEnrichmentFailure.reason_code == "max_attempts_exhausted_after_partial",
+            )
+        ).all()
+        assert task.status == "failed_final"
+        assert task.attempts == 3
+        assert len(failures) == 1
+
+
+@pytest.mark.asyncio
+async def test_cli_field_backfill_does_not_immediately_revisit_partial_task(reconcile_db):
+    engine, maker = reconcile_db
+    calls = []
+
+    class Provider:
+        async def collect(self, target):
+            calls.append(target)
+            return SimpleNamespace(
+                status="ok",
+                candidates=(_candidate(target, "author_nickname", "CLI partial title"),),
+                field_outcomes={},
+                diagnostics={},
+            )
+
+    summary = await service.run_field_backfill(
+        maker,
+        "run-reconcile-001",
+        ["author_nickname", "ip_location_text"],
+        service.TargetFilters(target_type="post", target_ids=(2101,), tid=1001),
+        limit=1,
+        max_seconds=1,
+        browser_profile="synthetic-profile",
+        request_budget=object(),
+        browser_config=SimpleNamespace(rps=0.2),
+        provider_factory=lambda **_kwargs: Provider(),
+    )
+
+    assert len(calls) == 1
+    assert summary.collected_count == 1
+    assert summary.partial_count == 1
+    assert summary.stopped_reason == "max_seconds_exhausted"
+    with Session(engine) as session:
+        task = session.scalar(
+            select(ResearchWebEnrichmentTask).where(
+                ResearchWebEnrichmentTask.target_id == 2101,
+                ResearchWebEnrichmentTask.target_type == "post",
+            )
+        )
+        assert task.status == "failed_retryable"
+        assert task.attempts == 1
+        assert task.next_retry_at is not None
 
 
 @pytest.mark.asyncio
@@ -1066,7 +1572,7 @@ async def test_thread_list_metadata_fallback_rejects_counter_fields(reconcile_db
 
 
 @pytest.mark.asyncio
-async def test_partial_predecessor_is_resolved_when_successor_fills_remaining_fields(reconcile_db):
+async def test_partial_task_retry_keeps_key_and_waits_for_due_time(reconcile_db):
     engine, maker = reconcile_db
     _summary, initial_lease = await _lease_post(
         maker,
@@ -1088,28 +1594,31 @@ async def test_partial_predecessor_is_resolved_when_successor_fills_remaining_fi
     assert first.status == "partially_completed"
 
     retry_summary = await service._enqueue_remaining_fields(maker, initial_lease)
-    assert retry_summary.planned_targets[0].requested_fields == ("ip_location_text",)
-    successor_lease = (
+    assert retry_summary.task_keys == (initial_lease.task_key,)
+    with Session(engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, initial_lease.task_key)
+        assert task.status == "failed_retryable"
+        assert task.attempts == 1
+        due_at = task.next_retry_at.replace(tzinfo=UTC)
+
+    assert await lease_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        "too-early-worker",
+        task_keys=(initial_lease.task_key,),
+        now=due_at - timedelta(milliseconds=1),
+    ) == []
+    retry_lease = (
         await lease_web_enrichment_tasks(
             maker,
             "run-reconcile-001",
-            "successor-worker",
-            task_keys=retry_summary.task_keys,
+            "due-worker",
+            task_keys=(initial_lease.task_key,),
+            now=due_at + timedelta(milliseconds=1),
         )
     )[0]
-    second = await complete_web_enrichment_task(
-        maker,
-        successor_lease.task_key,
-        successor_lease.lease_token,
-        [_candidate(successor_lease, "ip_location_text", "浙江")],
-    )
-
-    assert second.status == "completed"
-    with Session(engine) as session:
-        predecessor = session.get(ResearchWebEnrichmentTask, initial_lease.task_key)
-        assert predecessor.status == "partially_completed"
-        assert predecessor.field_statuses_json["ip_location_text"]["status"] == "not_tested"
-    assert await service._count_unresolved_web_tasks(maker, ("run-reconcile-001",)) == 0
+    assert retry_lease.task_key == initial_lease.task_key
+    assert retry_lease.lease_generation == 2
 
 
 @pytest.mark.asyncio
@@ -1427,7 +1936,7 @@ async def test_expired_cancelled_scope_and_changed_watermark_responses_are_rejec
 
 
 @pytest.mark.asyncio
-async def test_old_scope_generation_and_api_watermark_cannot_write(reconcile_db):
+async def test_old_scope_generation_and_target_identity_cannot_write(reconcile_db):
     engine, maker = reconcile_db
     _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
     with Session(engine) as session, session.begin():
@@ -1454,14 +1963,15 @@ async def test_old_scope_generation_and_api_watermark_cannot_write(reconcile_db)
     )[0]
     with Session(engine) as session, session.begin():
         row = session.get(ResearchPost, 2101)
+        row.author_user_id = 999
         row.observed_at = datetime(2026, 1, 9, tzinfo=UTC)
-    stale_watermark = await complete_web_enrichment_task(
+    stale_identity = await complete_web_enrichment_task(
         maker,
         renewed.task_key,
         renewed.lease_token,
         [_candidate(renewed, "author_nickname", "old-watermark")],
     )
-    assert stale_watermark.reason_code == "target_api_watermark_changed"
+    assert stale_identity.reason_code == "target_database_identity_changed"
     with Session(engine) as session:
         assert session.get(ResearchPost, 2101).author_nickname is None
 

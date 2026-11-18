@@ -106,7 +106,9 @@ port = 8001
 # 并发数限制
 concurrency = 10
 # 遇 HTTP 429 后的全局冷却时间（秒）
-cooldown_seconds_429 = 5.0
+cooldown_seconds_429 = 10.0
+# All research API requests share this global limit.
+global_rps = 0.5
 # 分接口 RPS 配置
 # 贴吧服务端对各接口独立限流，使用令牌桶算法
 # threads/posts 接口令牌桶容量≈60, 恢复速率≈2.0/s
@@ -169,3 +171,4 @@ browser_profile = "data/web-fallback-profile"
 max_pages = 1
 max_expansions = 10
 timeout_seconds = 90.0
+rps = 0.2

@@ -232,19 +232,27 @@ async def _stop_api_workers(workers: list[Worker], worker_tasks: list[asyncio.Ta
         await asyncio.gather(*worker_tasks, return_exceptions=True)
 
 
-async def _require_web_worker_to_wait_for_stop(
-    web_worker_task: asyncio.Task,
-    web_stop_event: asyncio.Event | None,
-) -> Any:
-    summary = await web_worker_task
-    if web_stop_event is None or not web_stop_event.is_set():
-        reason = getattr(summary, "stopped_reason", None) or "unspecified"
-        unresolved = getattr(summary, "unresolved_count", "unknown")
-        raise RuntimeError(
-            "The live WEB fallback worker returned before shutdown was requested "
-            f"(reason={reason}, unresolved={unresolved})."
+def _report_web_worker_exit(web_worker_task: asyncio.Task) -> None:
+    try:
+        summary = web_worker_task.result()
+    except asyncio.CancelledError:
+        logger.info("WEB fallback worker was stopped; API production continues independently.")
+    except Exception as error:
+        logger.warning(
+            "WEB fallback worker exited with {} while API production continues.",
+            type(error).__name__,
         )
-    return summary
+    else:
+        logger.info(
+            "WEB fallback worker exited with reason={} unresolved={}; API production continues.",
+            getattr(summary, "stopped_reason", None),
+            getattr(summary, "unresolved_count", "unknown"),
+        )
+
+
+def _cancel_recovery_task(recovery_task: asyncio.Task | None) -> None:
+    if recovery_task is not None and not recovery_task.done():
+        recovery_task.cancel()
 
 
 async def _run_periodic_mode(
@@ -255,7 +263,9 @@ async def _run_periodic_mode(
     *,
     web_worker_task: asyncio.Task | None = None,
     web_stop_event: asyncio.Event | None = None,
+    recovery_task: asyncio.Task | None = None,
     on_api_stopped: Any | None = None,
+    on_api_interrupted: Any | None = None,
 ) -> None:
     """运行周期模式； cooperative stop leaves queued API scopes for recovery."""
     tasks: list[asyncio.Task] = []
@@ -265,30 +275,28 @@ async def _run_periodic_mode(
     if worker_tasks is None:
         worker_tasks = [asyncio.create_task(w.run(), name=f"worker-{w.lane}-{w.worker_id}") for w in workers]
     tasks.extend(worker_tasks)
-    web_watch_task = None
-    if web_worker_task is not None:
-        web_watch_task = asyncio.create_task(
-            _require_web_worker_to_wait_for_stop(web_worker_task, web_stop_event),
-            name="live-web-worker-supervisor",
-        )
-        tasks.append(web_watch_task)
+    if recovery_task is not None:
+        tasks.append(recovery_task)
 
     aggregate = asyncio.gather(*tasks)
     try:
         await asyncio.shield(aggregate)
+        if on_api_stopped is not None:
+            await on_api_stopped()
     except asyncio.CancelledError:
         logger.info("Received shutdown signal. Starting graceful shutdown...")
         await _stop_scheduler_tasks(scheduler, [scheduler_task])
+        _cancel_recovery_task(recovery_task)
         await _stop_api_workers(workers, worker_tasks)
-        if on_api_stopped is not None:
-            await on_api_stopped()
-        logger.info("API producers stopped; WEB queue drained for stored targets.")
+        if on_api_interrupted is not None:
+            await on_api_interrupted()
         raise
     except Exception:
         await _stop_scheduler_tasks(scheduler, [scheduler_task])
+        _cancel_recovery_task(recovery_task)
         await _stop_api_workers(workers, worker_tasks)
-        if on_api_stopped is not None:
-            await on_api_stopped()
+        if on_api_interrupted is not None:
+            await on_api_interrupted()
         raise
     finally:
         await _cancel_and_reap_tasks(tasks, aggregate)
@@ -302,7 +310,9 @@ async def _run_hybrid_mode(
     *,
     web_worker_task: asyncio.Task | None = None,
     web_stop_event: asyncio.Event | None = None,
+    recovery_task: asyncio.Task | None = None,
     on_api_stopped: Any | None = None,
+    on_api_interrupted: Any | None = None,
 ) -> None:
     """Run periodic and backfill producers with one cooperative drain path."""
     tasks: list[asyncio.Task] = []
@@ -316,30 +326,28 @@ async def _run_hybrid_mode(
     if worker_tasks is None:
         worker_tasks = [asyncio.create_task(w.run(), name=f"worker-{w.lane}-{w.worker_id}") for w in workers]
     tasks.extend(worker_tasks)
-    web_watch_task = None
-    if web_worker_task is not None:
-        web_watch_task = asyncio.create_task(
-            _require_web_worker_to_wait_for_stop(web_worker_task, web_stop_event),
-            name="live-web-worker-supervisor",
-        )
-        tasks.append(web_watch_task)
+    if recovery_task is not None:
+        tasks.append(recovery_task)
 
     aggregate = asyncio.gather(*tasks)
     try:
         await asyncio.shield(aggregate)
+        if on_api_stopped is not None:
+            await on_api_stopped()
     except asyncio.CancelledError:
         logger.info("Received shutdown signal in hybrid mode. Starting graceful shutdown...")
         await _stop_scheduler_tasks(scheduler, [periodic_task, backfill_task])
+        _cancel_recovery_task(recovery_task)
         await _stop_api_workers(workers, worker_tasks)
-        if on_api_stopped is not None:
-            await on_api_stopped()
-        logger.info("API producers stopped; WEB queue drained for stored targets.")
+        if on_api_interrupted is not None:
+            await on_api_interrupted()
         raise
     except Exception:
         await _stop_scheduler_tasks(scheduler, [periodic_task, backfill_task])
+        _cancel_recovery_task(recovery_task)
         await _stop_api_workers(workers, worker_tasks)
-        if on_api_stopped is not None:
-            await on_api_stopped()
+        if on_api_interrupted is not None:
+            await on_api_interrupted()
         raise
     finally:
         await _cancel_and_reap_tasks(tasks, aggregate)
@@ -353,67 +361,54 @@ async def _run_backfill_mode(
     *,
     web_worker_task: asyncio.Task | None,
     web_stop_event: asyncio.Event | None = None,
+    recovery_task: asyncio.Task | None = None,
     on_api_stopped: Any | None,
+    on_api_interrupted: Any | None = None,
 ) -> None:
     scheduler_task = asyncio.create_task(scheduler.run(mode="backfill"), name="scheduler")
 
     async def wait_for_api_drain() -> None:
         await scheduler_task
+        if recovery_task is not None:
+            await recovery_task
         await router.wait_idle()
 
     api_drain_task = asyncio.create_task(wait_for_api_drain(), name="api-backfill-drain")
-    web_watch_task = (
-        asyncio.create_task(
-            _require_web_worker_to_wait_for_stop(web_worker_task, web_stop_event),
-            name="live-web-worker-supervisor",
-        )
-        if web_worker_task is not None
-        else None
-    )
     try:
-        if web_watch_task is not None:
-            done, _pending = await asyncio.wait(
-                {api_drain_task, web_watch_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if web_watch_task in done:
-                await web_watch_task
-                raise RuntimeError("The live WEB fallback worker exited before API producers stopped.")
         await api_drain_task
         await _stop_api_workers(workers, worker_tasks)
         if on_api_stopped is not None:
             await on_api_stopped()
-        if web_watch_task is not None:
-            await web_watch_task
     except asyncio.CancelledError:
         await _stop_scheduler_tasks(scheduler, [scheduler_task])
         if not api_drain_task.done():
             api_drain_task.cancel()
             await asyncio.gather(api_drain_task, return_exceptions=True)
+        _cancel_recovery_task(recovery_task)
         await _stop_api_workers(workers, worker_tasks)
-        if on_api_stopped is not None:
-            await on_api_stopped()
+        if on_api_interrupted is not None:
+            await on_api_interrupted()
         raise
     except Exception:
         await _stop_scheduler_tasks(scheduler, [scheduler_task])
         if not api_drain_task.done():
             api_drain_task.cancel()
             await asyncio.gather(api_drain_task, return_exceptions=True)
+        _cancel_recovery_task(recovery_task)
         await _stop_api_workers(workers, worker_tasks)
-        if on_api_stopped is not None:
-            await on_api_stopped()
+        if on_api_interrupted is not None:
+            await on_api_interrupted()
         raise
     finally:
         if not api_drain_task.done():
             api_drain_task.cancel()
             await asyncio.gather(api_drain_task, return_exceptions=True)
+        if recovery_task is not None and not recovery_task.done():
+            recovery_task.cancel()
+            await asyncio.gather(recovery_task, return_exceptions=True)
         if not scheduler_task.done():
             scheduler_task.cancel()
         await asyncio.gather(scheduler_task, return_exceptions=True)
-        if web_watch_task is not None and not web_watch_task.done():
-            web_watch_task.cancel()
-        if web_watch_task is not None:
-            await asyncio.gather(web_watch_task, return_exceptions=True)
 
 
 async def _prepare_research_run(
@@ -524,20 +519,22 @@ async def drain_pending(
     workers: list[Worker] = []
     worker_tasks: list[asyncio.Task] = []
     web_worker_task: asyncio.Task | None = None
-    web_watch_task: asyncio.Task | None = None
     web_stop_event: asyncio.Event | None = None
+    api_done_event: asyncio.Event | None = None
     web_run_ids: tuple[str, ...] = ()
     active_run_id: str | None = None
     api_drain_task: asyncio.Task | None = None
     api_monitor_task: asyncio.Task | None = None
+    web_discovery_task: asyncio.Task | None = None
     web_finished = False
     web_summary: Any | None = None
     cancelled = False
     initial_run_status: str | None = None
     web_discovered_count = 0
+    web_lifecycle_error = False
 
     async def start_web_worker(current_run_id: str) -> None:
-        nonlocal web_worker_task, web_watch_task, web_stop_event, web_run_ids, web_discovered_count
+        nonlocal web_worker_task, web_stop_event, api_done_event, web_run_ids, web_discovery_task
         responsible_forums = tuple((int(forum.fid), str(forum.fname)) for forum in (container.forums or []))
         web_run_ids = await pending_web_run_ids(
             datastore.async_sessionmaker,
@@ -545,74 +542,134 @@ async def drain_pending(
             responsible_forums=responsible_forums,
         )
         web_stop_event = asyncio.Event()
+        api_done_event = asyncio.Event()
         web_config = container.config.pydantic_config.web_fallback
         web_worker_task = asyncio.create_task(
             run_live_web_worker(
                 datastore.async_sessionmaker,
                 web_run_ids,
                 stop_event=web_stop_event,
+                api_done_event=api_done_event,
                 browser_profile=web_config.browser_profile,
-                request_budget=container.semaphore,
                 browser_config=web_config,
             ),
             name="web-fallback-worker",
         )
-        web_watch_task = asyncio.create_task(
-            _require_web_worker_to_wait_for_stop(web_worker_task, web_stop_event),
-            name="live-web-worker-supervisor",
+        web_worker_task.add_done_callback(_report_web_worker_exit)
+        web_discovery_task = asyncio.create_task(
+            discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids),
+            name="web-startup-discovery",
         )
-        web_discovered_count = await discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids)
 
-    async def stop_api_and_drain_web() -> Any | None:
-        nonlocal web_finished, web_summary
+    async def finish_web_after_api_stopped() -> Any | None:
+        nonlocal web_finished, web_summary, cancelled, web_discovered_count
         if workers:
             await _stop_api_workers(workers, worker_tasks)
-        if web_worker_task is None or web_stop_event is None or web_finished:
+        if web_worker_task is None or web_stop_event is None or api_done_event is None or web_finished:
             return web_summary
-        discovery_error: Exception | None = None
-        exited_before_shutdown = False
-        try:
+
+        async def complete_api_then_web_drain() -> Any | None:
+            nonlocal web_finished, web_summary, web_discovered_count, web_lifecycle_error
+            discovery_error: Exception | None = None
+            web_error: Exception | None = None
+            if web_discovery_task is not None:
+                try:
+                    web_discovered_count = await asyncio.shield(web_discovery_task)
+                except Exception as error:
+                    discovery_error = error
+                    logger.exception("WEB startup discovery failed: {}", error)
             try:
                 await discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids)
             except Exception as error:
-                discovery_error = error
+                discovery_error = discovery_error or error
                 logger.exception("Could not rescan stored API metadata before WEB shutdown: {}", error)
-            exited_before_shutdown = web_worker_task.done() and not web_stop_event.is_set()
-        finally:
-            web_stop_event.set()
-        try:
-            web_summary = await web_worker_task
-        finally:
-            web_finished = True
-            if web_watch_task is not None:
-                await asyncio.gather(web_watch_task, return_exceptions=True)
-        if web_watch_task is not None:
-            await web_watch_task
-        if exited_before_shutdown:
-            raise RuntimeError("The live WEB fallback worker exited before drain-pending requested shutdown.")
-        unresolved_count = getattr(web_summary, "unresolved_count", 0)
-        if unresolved_count:
-            for pending_run_id in web_run_ids:
+
+            api_done_event.set()
+            try:
+                web_summary = await asyncio.shield(web_worker_task)
+            except asyncio.CancelledError:
+                if not web_worker_task.cancelled():
+                    raise
+                web_finished = True
+            except Exception as error:
+                web_error = error
+                logger.warning("WEB fallback worker failed after API completion: {}", type(error).__name__)
+                web_finished = True
+            else:
+                web_finished = True
+
+            unresolved_count = getattr(web_summary, "unresolved_count", 0)
+            if unresolved_count or discovery_error is not None or web_error is not None or web_summary is None:
+                web_lifecycle_error = True
                 await datastore.set_research_run_status_if(
-                    pending_run_id,
+                    run_id,
                     {"running", "completed", "incomplete"},
                     "incomplete",
-                    "web_fallback_unresolved_tasks",
+                    "web_fallback_unresolved_tasks"
+                    if unresolved_count
+                    else "web_fallback_worker_error"
+                    if web_error is not None or web_summary is None
+                    else "web_fallback_discovery_error",
                 )
-        else:
-            for pending_run_id in web_run_ids:
+            else:
                 if (
-                    pending_run_id == run_id
-                    and initial_run_status == "completed"
+                    initial_run_status == "completed"
                     and web_discovered_count == 0
                     and not getattr(web_summary, "collected_count", 0)
                     and not getattr(web_summary, "completed_count", 0)
                     and not getattr(web_summary, "partial_count", 0)
                 ):
-                    continue
-                await datastore.reconcile_research_run_status_after_drain(pending_run_id)
-        if discovery_error is not None:
-            raise discovery_error
+                    return web_summary
+                status = await datastore.reconcile_research_run_status_after_drain(run_id)
+                logger.info("drain-pending finished; run status is {}.", status)
+            return web_summary
+
+        finish_task = asyncio.create_task(
+            complete_api_then_web_drain(),
+            name="web-api-drain-finish",
+        )
+        shutdown_wait = asyncio.create_task(shutdown_event.wait(), name="drain-web-stop-wait")
+        try:
+            done, _pending = await asyncio.wait(
+                {finish_task, shutdown_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if shutdown_wait in done:
+                cancelled = True
+                web_stop_event.set()
+                finish_task.cancel()
+                await asyncio.gather(finish_task, return_exceptions=True)
+                await stop_web_for_interruption()
+                return web_summary
+            return await finish_task
+        except asyncio.CancelledError:
+            web_stop_event.set()
+            if not finish_task.done():
+                finish_task.cancel()
+                await asyncio.gather(finish_task, return_exceptions=True)
+            raise
+        finally:
+            if not shutdown_wait.done():
+                shutdown_wait.cancel()
+            await asyncio.gather(shutdown_wait, return_exceptions=True)
+
+    async def stop_web_for_interruption() -> Any | None:
+        nonlocal web_finished, web_summary
+        if web_discovery_task is not None and not web_discovery_task.done():
+            web_discovery_task.cancel()
+            await asyncio.gather(web_discovery_task, return_exceptions=True)
+        if web_worker_task is None or web_stop_event is None or web_finished:
+            return web_summary
+        web_stop_event.set()
+        try:
+            web_summary = await asyncio.shield(web_worker_task)
+        except asyncio.CancelledError:
+            if not web_worker_task.cancelled():
+                raise
+        except Exception as error:
+            logger.warning("WEB fallback worker stopped with {} during interruption.", type(error).__name__)
+        finally:
+            web_finished = web_worker_task.done()
         return web_summary
 
     try:
@@ -701,23 +758,8 @@ async def drain_pending(
 
             api_drain_task = asyncio.create_task(enqueue_and_wait_idle(), name="api-detail-drain")
 
-            async def wait_for_api_drain_or_web_exit() -> None:
-                if web_watch_task is None:
-                    await api_drain_task
-                    return
-                done, _pending = await asyncio.wait(
-                    {api_drain_task, web_watch_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if web_watch_task in done:
-                    await web_watch_task
-                await api_drain_task
-
-            api_monitor_task = asyncio.create_task(
-                wait_for_api_drain_or_web_exit(),
-                name="api-web-drain-supervisor",
-            )
-            cancelled = await _await_mode_or_shutdown(api_monitor_task, shutdown_event)
+            api_monitor_task = api_drain_task
+            cancelled = await _await_mode_or_shutdown(api_drain_task, shutdown_event)
             if not cancelled:
                 api_drained = await api_drain_task
                 if not api_drained:
@@ -729,7 +771,15 @@ async def drain_pending(
                     )
                     logger.warning("drain-pending reached its {} second API detail deadline.", max_seconds)
 
-        web_summary = await stop_api_and_drain_web()
+        if cancelled:
+            if api_drain_task is not None and not api_drain_task.done():
+                api_drain_task.cancel()
+                await asyncio.gather(api_drain_task, return_exceptions=True)
+            if workers:
+                await _stop_api_workers(workers, worker_tasks)
+            await stop_web_for_interruption()
+        else:
+            web_summary = await finish_web_after_api_stopped()
         unresolved_count = getattr(web_summary, "unresolved_count", 0)
         if cancelled:
             for pending_run_id in web_run_ids:
@@ -739,7 +789,7 @@ async def drain_pending(
                     "interrupted",
                     "drain_cancelled_after_current_api_page",
                 )
-        elif selected and not unresolved_count:
+        elif selected and not unresolved_count and not web_lifecycle_error:
             status = await datastore.reconcile_research_run_status_after_drain(active_run_id)
             logger.info("drain-pending finished; run status is {}.", status)
 
@@ -753,7 +803,9 @@ async def drain_pending(
             api_monitor_task.cancel()
             await asyncio.gather(api_monitor_task, return_exceptions=True)
         if datastore is not None:
-            await stop_api_and_drain_web()
+            if workers:
+                await _stop_api_workers(workers, worker_tasks)
+            await stop_web_for_interruption()
             for pending_run_id in web_run_ids or ((active_run_id,) if active_run_id else ()):
                 await datastore.set_research_run_status_if(
                     pending_run_id,
@@ -770,9 +822,9 @@ async def drain_pending(
             if workers:
                 await _stop_api_workers(workers, worker_tasks)
             try:
-                await stop_api_and_drain_web()
+                await stop_web_for_interruption()
             except Exception:
-                logger.exception("WEB queue did not fully drain after drain-pending failure.")
+                logger.exception("WEB fallback could not stop cleanly after drain-pending failure.")
             if active_run_id is not None:
                 await datastore.set_research_run_status_if(
                     active_run_id,
@@ -792,9 +844,9 @@ async def drain_pending(
             await _stop_api_workers(workers, worker_tasks)
         if web_worker_task is not None and not web_finished:
             try:
-                await stop_api_and_drain_web()
+                await stop_web_for_interruption()
             except Exception:
-                logger.exception("WEB fallback shutdown did not finish cleanly; durable tasks remain recoverable.")
+                logger.exception("WEB fallback stop did not finish cleanly; durable tasks remain recoverable.")
         restore_signal_handlers()
         if datastore is not None:
             try:
@@ -885,17 +937,41 @@ async def main(
     workers: list[Worker] = []
     worker_tasks: list[asyncio.Task] = []
     mode_task: asyncio.Task | None = None
+    recovery_task: asyncio.Task | None = None
     web_worker_task: asyncio.Task | None = None
     web_stop_event: asyncio.Event | None = None
+    api_done_event: asyncio.Event | None = None
+    web_discovery_task: asyncio.Task | None = None
     web_run_ids: tuple[str, ...] = ()
     web_finished = False
     web_summary: Any | None = None
+
+    async def stop_web_for_interruption() -> Any | None:
+        nonlocal web_finished, web_summary
+        if web_discovery_task is not None and not web_discovery_task.done():
+            web_discovery_task.cancel()
+            await asyncio.gather(web_discovery_task, return_exceptions=True)
+        if web_worker_task is None or web_stop_event is None or web_finished:
+            return web_summary
+        web_stop_event.set()
+        try:
+            web_summary = await asyncio.shield(web_worker_task)
+        except asyncio.CancelledError:
+            if not web_worker_task.cancelled():
+                raise
+        except Exception as error:
+            logger.warning("WEB fallback worker stopped with {} during interruption.", type(error).__name__)
+        finally:
+            web_finished = web_worker_task.done()
+        return web_summary
 
     async def finish_web_after_api_stopped() -> Any | None:
         nonlocal web_finished, web_summary
         if datastore is None:
             return web_summary
-        if web_worker_task is None or web_stop_event is None:
+        if shutdown_event.is_set():
+            return await stop_web_for_interruption()
+        if web_worker_task is None or web_stop_event is None or api_done_event is None:
             if research_run_id is not None:
                 await datastore.reconcile_research_run_status_after_drain(research_run_id)
             return web_summary
@@ -903,43 +979,56 @@ async def main(
             return web_summary
 
         discovery_error: Exception | None = None
-        exited_before_shutdown = False
-        try:
+        web_error: Exception | None = None
+        if web_discovery_task is not None:
             try:
-                created = await discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids)
+                created = await asyncio.shield(web_discovery_task)
                 if created:
-                    logger.info("Queued {} missing metadata targets after API producers stopped.", created)
+                    logger.info("Queued {} missing metadata targets during API production.", created)
             except Exception as error:
                 discovery_error = error
-                logger.exception("Could not rescan stored API metadata before WEB shutdown: {}", error)
-            exited_before_shutdown = web_worker_task.done() and not web_stop_event.is_set()
-        finally:
-            web_stop_event.set()
-
+                logger.exception("WEB startup discovery failed: {}", error)
         try:
-            web_summary = await web_worker_task
-        finally:
-            web_finished = True
+            created = await discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids)
+            if created:
+                logger.info("Queued {} missing metadata targets after API producers stopped.", created)
+        except Exception as error:
+            discovery_error = discovery_error or error
+            logger.exception("Could not rescan stored API metadata before WEB shutdown: {}", error)
 
-        if exited_before_shutdown:
-            raise RuntimeError(
-                "The live WEB fallback worker exited before API shutdown requested a final drain."
-            )
+        pending_run_ids = web_run_ids or ((research_run_id,) if research_run_id is not None else ())
+        for pending_run_id in pending_run_ids:
+            await datastore.reconcile_research_run_status_after_drain(pending_run_id)
+
+        api_done_event.set()
+        try:
+            web_summary = await asyncio.shield(web_worker_task)
+        except asyncio.CancelledError:
+            if not web_worker_task.cancelled():
+                raise
+            web_finished = True
+        except Exception as error:
+            web_error = error
+            logger.warning("WEB fallback worker failed after API completion: {}", type(error).__name__)
+            web_finished = True
+        else:
+            web_finished = True
         unresolved_count = getattr(web_summary, "unresolved_count", 0)
-        if unresolved_count:
-            for pending_run_id in web_run_ids:
+        if unresolved_count or discovery_error is not None or web_error is not None or web_summary is None:
+            for pending_run_id in pending_run_ids:
                 await datastore.set_research_run_status_if(
                     pending_run_id,
                     {"running", "completed", "incomplete"},
                     "incomplete",
-                    "web_fallback_unresolved_tasks",
+                    "web_fallback_unresolved_tasks"
+                    if unresolved_count
+                    else "web_fallback_worker_error"
+                    if web_error is not None or web_summary is None
+                    else "web_fallback_discovery_error",
                 )
         else:
-            for pending_run_id in web_run_ids:
+            for pending_run_id in pending_run_ids:
                 await datastore.reconcile_research_run_status_after_drain(pending_run_id)
-
-        if discovery_error is not None:
-            raise discovery_error
         return web_summary
 
     try:
@@ -996,12 +1085,16 @@ async def main(
         ]
         tasks.extend(worker_tasks)
         responsible_fids = {forum.fid for forum in (container.forums or [])}
-        await _recover_pending_tasks(
-            datastore,
-            router,
-            responsible_fids=responsible_fids,
-            research_run_id=research_run_id,
+        recovery_task = asyncio.create_task(
+            _recover_pending_tasks(
+                datastore,
+                router,
+                responsible_fids=responsible_fids,
+                research_run_id=research_run_id,
+            ),
+            name="api-pending-recovery",
         )
+        tasks.append(recovery_task)
 
         if research_run_id is not None and hasattr(datastore, "async_sessionmaker"):
             responsible_forums = tuple((int(forum.fid), str(forum.fname)) for forum in (container.forums or []))
@@ -1011,20 +1104,26 @@ async def main(
                 responsible_forums=responsible_forums,
             )
             web_stop_event = asyncio.Event()
+            api_done_event = asyncio.Event()
             web_config = container.config.pydantic_config.web_fallback
             web_worker_task = asyncio.create_task(
                 run_live_web_worker(
                     datastore.async_sessionmaker,
                     web_run_ids,
                     stop_event=web_stop_event,
+                    api_done_event=api_done_event,
                     browser_profile=web_config.browser_profile,
-                    request_budget=container.semaphore,
                     browser_config=web_config,
                 ),
                 name="web-fallback-worker",
             )
+            web_worker_task.add_done_callback(_report_web_worker_exit)
             tasks.append(web_worker_task)
-            await discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids)
+            web_discovery_task = asyncio.create_task(
+                discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids),
+                name="web-startup-discovery",
+            )
+            tasks.append(web_discovery_task)
 
         if mode == "periodic":
             mode_task = asyncio.create_task(
@@ -1035,7 +1134,9 @@ async def main(
                     worker_tasks=worker_tasks,
                     web_worker_task=web_worker_task,
                     web_stop_event=web_stop_event,
+                    recovery_task=recovery_task,
                     on_api_stopped=finish_web_after_api_stopped,
+                    on_api_interrupted=stop_web_for_interruption,
                 ),
                 name="periodic-mode",
             )
@@ -1048,7 +1149,9 @@ async def main(
                     worker_tasks,
                     web_worker_task=web_worker_task,
                     web_stop_event=web_stop_event,
+                    recovery_task=recovery_task,
                     on_api_stopped=finish_web_after_api_stopped,
+                    on_api_interrupted=stop_web_for_interruption,
                 ),
                 name="backfill-mode",
             )
@@ -1061,7 +1164,9 @@ async def main(
                     worker_tasks=worker_tasks,
                     web_worker_task=web_worker_task,
                     web_stop_event=web_stop_event,
+                    recovery_task=recovery_task,
                     on_api_stopped=finish_web_after_api_stopped,
+                    on_api_interrupted=stop_web_for_interruption,
                 ),
                 name="hybrid-mode",
             )
@@ -1100,11 +1205,14 @@ async def main(
             scheduler.stop()
         if workers:
             await _stop_api_workers(workers, worker_tasks)
+        if recovery_task is not None and not recovery_task.done():
+            recovery_task.cancel()
+            await asyncio.gather(recovery_task, return_exceptions=True)
         if web_worker_task is not None and not web_finished:
             try:
-                await finish_web_after_api_stopped()
+                await stop_web_for_interruption()
             except Exception:
-                logger.exception("WEB fallback shutdown did not finish cleanly; durable tasks remain recoverable.")
+                logger.exception("WEB fallback stop did not finish cleanly; durable tasks remain recoverable.")
 
         if monitor_task and not monitor_task.done():
             monitor_task.cancel()

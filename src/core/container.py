@@ -91,6 +91,8 @@ class Container:
         self.research_network_ready.set()
         self._research_rate_limit_deadline = 0.0
         self._research_rate_limit_lock = asyncio.Lock()
+        self._research_empty_response_streak = 0
+        self._research_empty_response_lock = asyncio.Lock()
         self._auth_refresh_lock = asyncio.Lock()
         self._research_account_file_state: tuple[int, int, int, int] | None = None
         self._research_credentials_loaded = False
@@ -482,11 +484,19 @@ class Container:
                             fingerprint = self._research_account_file_state
                             auth_rejected = True
                             break
-                        if error.code == 429 and attempt < retry_limit:
+                        if error.code in {429, 220034} and attempt < retry_limit:
+                            cooldown_seconds = self.config.cooldown_seconds_429
+                            logger.warning(
+                                "Research API auth refresh returned frequency limit code {}; "
+                                "cooling down for {} seconds.",
+                                error.code,
+                                cooldown_seconds,
+                            )
                             await self.wait_for_rate_limit(
-                                self.config.cooldown_seconds_429,
+                                cooldown_seconds,
                                 run_id=run_id,
                             )
+                            logger.info("Research API auth refresh cooldown ended; retrying at the configured rate.")
                             continue
                         raise
                 if auth_rejected:
@@ -530,6 +540,18 @@ class Container:
             if remaining <= 0:
                 return
             await asyncio.sleep(remaining)
+
+    async def record_research_api_response(self, *, suspicious_empty: bool) -> bool:
+        """Track suspicious empty API envelopes across all research workers."""
+        async with self._research_empty_response_lock:
+            if not suspicious_empty:
+                self._research_empty_response_streak = 0
+                return False
+            self._research_empty_response_streak += 1
+            if self._research_empty_response_streak < 3:
+                return False
+            self._research_empty_response_streak = 0
+            return True
 
     async def block_research_network(self) -> None:
         """Stop new research API requests until a new explicitly resumed process."""

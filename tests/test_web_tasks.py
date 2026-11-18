@@ -13,6 +13,7 @@ from src.research.models import (
     ResearchPost,
     ResearchThread,
     ResearchWebEnrichmentAttempt,
+    ResearchWebEnrichmentFailure,
     ResearchWebEnrichmentTask,
 )
 from src.research.web_fallback.reconcile import fail_web_enrichment_task
@@ -705,8 +706,24 @@ async def test_growth_url_alone_satisfies_growth_fallback_and_partial_task_retri
         only_missing_fields=True,
         max_attempts=2,
     )
+    with Session(engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, retry.task_keys[0])
+        assert task.status == "failed_retryable"
+        assert task.attempts == 1
+        retry_at = task.next_retry_at.replace(tzinfo=UTC)
+    assert await lease_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        "too-early-worker",
+        task_keys=retry.task_keys,
+        now=retry_at - timedelta(milliseconds=1),
+    ) == []
     retry_lease = (await lease_web_enrichment_tasks(
-        maker, "run-web-001", "worker-b", task_keys=retry.task_keys
+        maker,
+        "run-web-001",
+        "worker-b",
+        task_keys=retry.task_keys,
+        now=retry_at + timedelta(milliseconds=1),
     ))[0]
     assert retry_lease.lease_generation == lease.lease_generation + 1
     with Session(engine) as session, session.begin():
@@ -964,7 +981,7 @@ async def test_retry_delay_increases_and_stops_after_three_attempts(research_db)
         max_attempts=3,
     )
     now = datetime.now(UTC)
-    for attempt, delay in ((1, 30), (2, 60), (3, None)):
+    for attempt, delay in ((1, 3), (2, 5), (3, None)):
         lease = (
             await lease_web_enrichment_tasks(
                 maker,
@@ -1008,3 +1025,154 @@ async def test_retry_delay_increases_and_stops_after_three_attempts(research_db)
         now=now + timedelta(days=1),
         task_keys=summary.task_keys,
     ) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_status", ["failed_retryable", "blocked", "failed_final"])
+async def test_timestamp_only_refresh_reuses_task_without_resetting_history(research_db, existing_status):
+    engine, maker = research_db
+    fields = ["ip_location_text"]
+    original = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        fields,
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+    task_key = original.task_keys[0]
+    due_at = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    attempts = 3 if existing_status == "failed_final" else 1
+    next_retry_at = due_at if existing_status == "failed_retryable" else None
+    with Session(engine) as session, session.begin():
+        task = session.get(ResearchWebEnrichmentTask, task_key)
+        task.status = existing_status
+        task.attempts = attempts
+        task.next_retry_at = next_retry_at
+        post = session.get(ResearchPost, 2101)
+        post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+
+    refreshed = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        fields,
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+
+    assert refreshed.task_keys == (task_key,)
+    assert refreshed.created_count == 0
+    assert refreshed.deduplicated_count == 1
+    with Session(engine) as session:
+        tasks = session.scalars(select(ResearchWebEnrichmentTask)).all()
+        task = session.get(ResearchWebEnrichmentTask, task_key)
+        assert len(tasks) == 1
+        assert task.status == existing_status
+        assert task.attempts == attempts
+        assert task.next_retry_at.replace(tzinfo=UTC) == next_retry_at if next_retry_at else task.next_retry_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "diagnostics",
+    [{"status": "already_satisfied", "pages": 0}, {"status": "ok", "pages": 1}],
+)
+async def test_completed_task_reopens_same_key_when_field_later_missing(research_db, diagnostics):
+    engine, maker = research_db
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+    task_key = summary.task_keys[0]
+    with Session(engine) as session, session.begin():
+        task = session.get(ResearchWebEnrichmentTask, task_key)
+        task.status = "completed"
+        task.attempts = 1
+        task.lease_generation = 1
+        task.last_diagnostics_json = diagnostics
+        task.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        post = session.get(ResearchPost, 2101)
+        post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+
+    refreshed = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+
+    assert refreshed.task_keys == (task_key,)
+    assert refreshed.created_count == 0
+    with Session(engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, task_key)
+        assert task.status == "pending_web"
+        assert task.attempts == 1
+        assert task.lease_generation == 1
+    leases = await lease_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        "retry-preflight-completed",
+        task_keys=(task_key,),
+    )
+    assert len(leases) == 1
+    assert leases[0].lease_generation == 2
+
+
+@pytest.mark.asyncio
+async def test_preflight_completed_task_at_attempt_limit_becomes_audited_final(research_db):
+    engine, maker = research_db
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+    task_key = summary.task_keys[0]
+    with Session(engine) as session, session.begin():
+        task = session.get(ResearchWebEnrichmentTask, task_key)
+        task.status = "completed"
+        task.attempts = 3
+        task.max_attempts = 3
+        task.lease_generation = 3
+        task.last_diagnostics_json = {"status": "already_satisfied", "pages": 0}
+        task.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+        post = session.get(ResearchPost, 2101)
+        post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+
+    refreshed = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+
+    assert refreshed.task_keys == (task_key,)
+    with Session(engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, task_key)
+        failures = session.scalars(
+            select(ResearchWebEnrichmentFailure).where(
+                ResearchWebEnrichmentFailure.task_key == task_key,
+                ResearchWebEnrichmentFailure.reason_code
+                == "web_attempt_limit_exhausted_after_api_refresh",
+            )
+        ).all()
+        assert task.status == "failed_final"
+        assert task.attempts == 3
+        assert len(failures) == 1

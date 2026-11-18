@@ -141,11 +141,12 @@ async def run_live_web_worker(
     run_ids: Sequence[str],
     *,
     stop_event: asyncio.Event,
+    api_done_event: asyncio.Event | None = None,
     browser_profile: str,
-    request_budget: Any,
-    browser_config: Any,
+    request_budget: Any | None = None,
+    browser_config: Any | None = None,
 ) -> Any:
-    """Run the single provider-backed WEB consumer until producers are closed and it drains."""
+    """Run WEB work alongside API producers, then drain only on normal API completion."""
     from .service import run_live_web_fallback_worker
 
     stable_run_ids = tuple(dict.fromkeys(run_ids))
@@ -153,6 +154,7 @@ async def run_live_web_worker(
         sessions,
         lambda: stable_run_ids,
         stop_event=stop_event,
+        api_done_event=api_done_event,
         browser_profile=browser_profile,
         request_budget=request_budget,
         browser_config=browser_config,

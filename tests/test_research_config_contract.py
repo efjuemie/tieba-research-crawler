@@ -20,6 +20,7 @@ def test_negative_backfill_page_limit_is_rejected():
 
 
 def test_global_request_rate_limit_has_a_positive_conservative_default():
-    assert RateLimitConfig().global_rps == 0.2
+    assert RateLimitConfig().global_rps == 0.5
+    assert RateLimitConfig().cooldown_seconds_429 == 10
     with pytest.raises(ValidationError):
         RateLimitConfig(global_rps=0)

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from src.core.config import WebFallbackConfig
+from src.core.config import RateLimitConfig, WebFallbackConfig
 
 
 def test_web_fallback_defaults_are_bounded_and_serialized_in_examples():
@@ -15,6 +15,7 @@ def test_web_fallback_defaults_are_bounded_and_serialized_in_examples():
     assert settings.max_pages == 1
     assert settings.max_expansions == 10
     assert settings.timeout_seconds == 90.0
+    assert settings.rps == 0.2
 
     root = Path(__file__).resolve().parents[1]
     for name in ("config.example.toml", "config.docker.example.toml"):
@@ -25,7 +26,15 @@ def test_web_fallback_defaults_are_bounded_and_serialized_in_examples():
             "max_pages": 1,
             "max_expansions": 10,
             "timeout_seconds": 90.0,
+            "rps": 0.2,
         }
+
+
+def test_api_rate_limit_defaults_are_half_rps_with_ten_second_cooldown():
+    settings = RateLimitConfig()
+
+    assert settings.global_rps == 0.5
+    assert settings.cooldown_seconds_429 == 10.0
 
 
 def test_web_fallback_config_keeps_explicit_lower_search_limits():
