@@ -765,6 +765,7 @@ async def lease_web_enrichment_tasks(
             select(ResearchWebEnrichmentTask)
             .where(eligible)
             .order_by(
+                ResearchWebEnrichmentTask.attempts.asc(),
                 ResearchWebEnrichmentTask.priority.desc(),
                 ResearchWebEnrichmentTask.created_at,
                 ResearchWebEnrichmentTask.target_type,

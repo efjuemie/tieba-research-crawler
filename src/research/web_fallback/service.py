@@ -302,7 +302,6 @@ async def run_field_backfill(
                 reason_code=_safe_reason(reason or status),
                 field_outcomes=outcomes,
                 diagnostics=getattr(result, "diagnostics", {}),
-                retry_after=30 if task_status == "failed_retryable" else None,
             )
             if task_status in {"blocked", "needs_login"}:
                 stopped_reason = _safe_reason(reason or "blocked")
@@ -411,7 +410,6 @@ async def _process_durable_web_lease(sessions: Any, provider: Any, lease: Any):
         reason_code=_safe_reason(reason or status),
         field_outcomes=_failure_outcomes(lease.requested_fields, status, reason),
         diagnostics=diagnostics,
-        retry_after=30 if task_status == "failed_retryable" else None,
     )
     return task_status, result
 
@@ -619,7 +617,6 @@ async def drain_pending_web_enrichment(
                 reason_code="web_worker_target_failed",
                 field_outcomes=_failure_outcomes(lease.requested_fields, "timeout", "web_worker_target_failed"),
                 diagnostics={},
-                retry_after=30,
             )
         _add_diagnostics(diagnostics, getattr(result, "diagnostics", {}))
 
@@ -745,7 +742,6 @@ async def run_live_web_fallback_worker(
                         lease.requested_fields, "timeout", "web_worker_target_failed"
                     ),
                     diagnostics={},
-                    retry_after=30,
                 )
             _add_diagnostics(diagnostics, getattr(result, "diagnostics", {}))
             if status == "completed":

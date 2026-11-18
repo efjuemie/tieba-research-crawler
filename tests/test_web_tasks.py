@@ -431,6 +431,36 @@ async def test_unfiltered_plan_preserves_tid_and_parent_filters_across_target_ty
 
 
 @pytest.mark.asyncio
+async def test_untried_target_precedes_older_due_high_priority_retry(research_db):
+    engine, maker = research_db
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101, 2102],
+        tid=1001,
+    )
+    now = datetime.now(UTC)
+    with Session(engine) as session, session.begin():
+        rows = session.scalars(select(ResearchWebEnrichmentTask)).all()
+        retry = next(row for row in rows if row.target_id == 2101)
+        fresh = next(row for row in rows if row.target_id == 2102)
+        retry.status = "failed_retryable"
+        retry.attempts = 1
+        retry.priority = fresh.priority + 100
+        retry.created_at = now - timedelta(days=1)
+        retry.next_retry_at = now - timedelta(seconds=1)
+        fresh.created_at = now
+
+    leases = await lease_web_enrichment_tasks(
+        maker, "run-web-001", "retry-order-worker", now=now, limit=2
+    )
+    assert [lease.target_id for lease in leases] == [2102, 2101]
+    assert {lease.task_key for lease in leases} == set(summary.task_keys)
+
+
+@pytest.mark.asyncio
 async def test_lease_task_keys_filter_exhausted_cleanup_and_empty_keys_are_noop(research_db):
     engine, maker = research_db
     summary = await enqueue_web_enrichment_tasks(
@@ -920,3 +950,61 @@ async def test_blocked_tasks_require_explicit_resume_and_retry_is_bounded(resear
             "elapsed_seconds": attempt.diagnostics_json["elapsed_seconds"],
         }
         assert "secret_url" not in attempt.diagnostics_json
+
+
+@pytest.mark.asyncio
+async def test_retry_delay_increases_and_stops_after_three_attempts(research_db):
+    engine, maker = research_db
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_level"],
+        target_type="thread",
+        tid=1001,
+        max_attempts=3,
+    )
+    now = datetime.now(UTC)
+    for attempt, delay in ((1, 30), (2, 60), (3, None)):
+        lease = (
+            await lease_web_enrichment_tasks(
+                maker,
+                "run-web-001",
+                "retry-worker",
+                now=now,
+                task_keys=summary.task_keys,
+            )
+        )[0]
+        status = await fail_web_enrichment_task(
+            maker,
+            lease.task_key,
+            lease.lease_token,
+            status="failed_retryable",
+            reason_code="browser_task_timeout",
+            now=now,
+        )
+        with Session(engine) as session:
+            task = session.get(ResearchWebEnrichmentTask, lease.task_key)
+            assert task.attempts == attempt
+            if delay is None:
+                assert status == "failed_final"
+                assert task.next_retry_at is None
+            else:
+                assert status == "failed_retryable"
+                assert task.next_retry_at.replace(tzinfo=UTC) == now + timedelta(seconds=delay)
+        if delay is not None:
+            assert await lease_web_enrichment_tasks(
+                maker,
+                "run-web-001",
+                "too-early",
+                now=now + timedelta(seconds=delay - 1),
+                task_keys=summary.task_keys,
+            ) == []
+            now += timedelta(seconds=delay)
+
+    assert await lease_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        "exhausted",
+        now=now + timedelta(days=1),
+        task_keys=summary.task_keys,
+    ) == []
