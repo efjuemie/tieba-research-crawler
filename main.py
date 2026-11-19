@@ -71,13 +71,19 @@ async def _recover_pending_tasks(
 
         await adopt_legacy(research_run_id, responsible_fids)
         recovered = 0
-        async for scope_batch in pending_scopes(research_run_id, responsible_fids, batch_size=500):
-            recovered += await _enqueue_research_scope_batch(
-                router,
-                scope_batch,
-                responsible_fids,
+        for scope_type in ("thread_replies", "post_comments"):
+            async for scope_batch in pending_scopes(
                 research_run_id,
-            )
+                responsible_fids,
+                batch_size=500,
+                scope_type=scope_type,
+            ):
+                recovered += await _enqueue_research_scope_batch(
+                    router,
+                    scope_batch,
+                    responsible_fids,
+                    research_run_id,
+                )
 
         if recovered:
             logger.info("Recovered current research task scopes: {}", recovered)
@@ -165,6 +171,99 @@ async def _enqueue_research_scope_batch(
         await router.put(Task(priority=priority, content=content))
         enqueued += 1
     return enqueued
+
+
+async def _dispatch_pending_comment_scopes(
+    datastore: DataStore,
+    router: QueueRouter,
+    responsible_fids: set[int],
+    research_run_id: str,
+    *,
+    producers_done: asyncio.Event | None = None,
+    selected_comment_scopes: set[tuple[str, int]] | None = None,
+    selected_thread_scopes: set[tuple[str, int]] | None = None,
+) -> bool:
+    """Feed durable pending comment scopes into the bounded comments queue."""
+    dispatched: set[tuple[str, int]] = set()
+
+    async def read_pending() -> list[Any]:
+        scopes: list[Any] = []
+        async for batch in datastore.iter_pending_research_task_scopes(
+            research_run_id,
+            responsible_fids,
+            batch_size=500,
+            scope_type="post_comments",
+            status="pending",
+        ):
+            for scope in batch:
+                key = (scope.logical_task_key, scope.generation)
+                parent_key = (scope.parent_logical_task_key, scope.parent_generation)
+                if selected_comment_scopes is not None or selected_thread_scopes is not None:
+                    if key not in (selected_comment_scopes or set()) and parent_key not in (
+                        selected_thread_scopes or set()
+                    ):
+                        continue
+                scopes.append(scope)
+        return scopes
+
+    while True:
+        pending = await read_pending()
+        newly_dispatched = 0
+        for scope in pending:
+            key = (scope.logical_task_key, scope.generation)
+            if key in dispatched:
+                continue
+            if scope.tid is None or scope.parent_pid is None:
+                raise ValueError(f"Research comment scope {scope.logical_task_key!r} has incomplete identity.")
+            content = FullScanCommentsTask(
+                tid=int(scope.tid),
+                pid=int(scope.parent_pid),
+                backfill=scope.backfill,
+                parent_kind=scope.parent_kind,
+                run_id=research_run_id,
+                generation=scope.generation,
+                parent_generation=scope.parent_generation,
+                fid=scope.fid,
+                fname=scope.fname,
+                rn=scope.rn,
+                pending_only=True,
+            )
+            priority = Priority.BACKFILL_POSTS if scope.backfill else Priority.LOW
+            task = Task(priority=priority, content=content)
+            try:
+                router.put_nowait(task)
+            except asyncio.QueueFull:
+                await router.put(task)
+            dispatched.add(key)
+            newly_dispatched += 1
+        if newly_dispatched:
+            logger.info("Dispatched {} durable comment scopes to API workers.", newly_dispatched)
+
+        if producers_done is None:
+            await asyncio.sleep(1)
+            continue
+        if not producers_done.is_set():
+            try:
+                await asyncio.wait_for(producers_done.wait(), timeout=1)
+            except TimeoutError:
+                continue
+            continue
+
+        await router.wait_idle()
+        pending = await read_pending()
+        undispatched = [scope for scope in pending if (scope.logical_task_key, scope.generation) not in dispatched]
+        if undispatched:
+            continue
+        if producers_done is not None and producers_done.is_set():
+            return not pending
+
+        try:
+            if producers_done is None:
+                await asyncio.sleep(1)
+            else:
+                await asyncio.wait_for(producers_done.wait(), timeout=1)
+        except TimeoutError:
+            continue
 
 
 async def _snapshot_pending_research_scopes(
@@ -264,6 +363,7 @@ async def _run_periodic_mode(
     web_worker_task: asyncio.Task | None = None,
     web_stop_event: asyncio.Event | None = None,
     recovery_task: asyncio.Task | None = None,
+    comment_dispatch_task: asyncio.Task | None = None,
     on_api_stopped: Any | None = None,
     on_api_interrupted: Any | None = None,
 ) -> None:
@@ -277,6 +377,8 @@ async def _run_periodic_mode(
     tasks.extend(worker_tasks)
     if recovery_task is not None:
         tasks.append(recovery_task)
+    if comment_dispatch_task is not None:
+        tasks.append(comment_dispatch_task)
 
     aggregate = asyncio.gather(*tasks)
     try:
@@ -287,6 +389,9 @@ async def _run_periodic_mode(
         logger.info("Received shutdown signal. Starting graceful shutdown...")
         await _stop_scheduler_tasks(scheduler, [scheduler_task])
         _cancel_recovery_task(recovery_task)
+        if comment_dispatch_task is not None and not comment_dispatch_task.done():
+            comment_dispatch_task.cancel()
+            await asyncio.gather(comment_dispatch_task, return_exceptions=True)
         await _stop_api_workers(workers, worker_tasks)
         if on_api_interrupted is not None:
             await on_api_interrupted()
@@ -294,6 +399,9 @@ async def _run_periodic_mode(
     except Exception:
         await _stop_scheduler_tasks(scheduler, [scheduler_task])
         _cancel_recovery_task(recovery_task)
+        if comment_dispatch_task is not None and not comment_dispatch_task.done():
+            comment_dispatch_task.cancel()
+            await asyncio.gather(comment_dispatch_task, return_exceptions=True)
         await _stop_api_workers(workers, worker_tasks)
         if on_api_interrupted is not None:
             await on_api_interrupted()
@@ -311,6 +419,7 @@ async def _run_hybrid_mode(
     web_worker_task: asyncio.Task | None = None,
     web_stop_event: asyncio.Event | None = None,
     recovery_task: asyncio.Task | None = None,
+    comment_dispatch_task: asyncio.Task | None = None,
     on_api_stopped: Any | None = None,
     on_api_interrupted: Any | None = None,
 ) -> None:
@@ -328,6 +437,8 @@ async def _run_hybrid_mode(
     tasks.extend(worker_tasks)
     if recovery_task is not None:
         tasks.append(recovery_task)
+    if comment_dispatch_task is not None:
+        tasks.append(comment_dispatch_task)
 
     aggregate = asyncio.gather(*tasks)
     try:
@@ -338,6 +449,9 @@ async def _run_hybrid_mode(
         logger.info("Received shutdown signal in hybrid mode. Starting graceful shutdown...")
         await _stop_scheduler_tasks(scheduler, [periodic_task, backfill_task])
         _cancel_recovery_task(recovery_task)
+        if comment_dispatch_task is not None and not comment_dispatch_task.done():
+            comment_dispatch_task.cancel()
+            await asyncio.gather(comment_dispatch_task, return_exceptions=True)
         await _stop_api_workers(workers, worker_tasks)
         if on_api_interrupted is not None:
             await on_api_interrupted()
@@ -345,6 +459,9 @@ async def _run_hybrid_mode(
     except Exception:
         await _stop_scheduler_tasks(scheduler, [periodic_task, backfill_task])
         _cancel_recovery_task(recovery_task)
+        if comment_dispatch_task is not None and not comment_dispatch_task.done():
+            comment_dispatch_task.cancel()
+            await asyncio.gather(comment_dispatch_task, return_exceptions=True)
         await _stop_api_workers(workers, worker_tasks)
         if on_api_interrupted is not None:
             await on_api_interrupted()
@@ -362,16 +479,37 @@ async def _run_backfill_mode(
     web_worker_task: asyncio.Task | None,
     web_stop_event: asyncio.Event | None = None,
     recovery_task: asyncio.Task | None = None,
+    comment_dispatch_task: asyncio.Task | None = None,
+    producers_done: asyncio.Event | None = None,
     on_api_stopped: Any | None,
     on_api_interrupted: Any | None = None,
 ) -> None:
     scheduler_task = asyncio.create_task(scheduler.run(mode="backfill"), name="scheduler")
 
     async def wait_for_api_drain() -> None:
-        await scheduler_task
+        if comment_dispatch_task is None or producers_done is None:
+            await scheduler_task
+            if recovery_task is not None:
+                await recovery_task
+            await router.wait_idle()
+            return
+
+        producers: set[asyncio.Task] = {scheduler_task}
         if recovery_task is not None:
-            await recovery_task
-        await router.wait_idle()
+            producers.add(recovery_task)
+        while producers:
+            watched = {*producers, comment_dispatch_task}
+            done, _pending = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+            if comment_dispatch_task in done and any(task not in done for task in producers):
+                comment_dispatch_task.result()
+                raise RuntimeError("Comment dispatcher exited before API producers finished.")
+            for task in done:
+                if task in producers:
+                    task.result()
+                    producers.discard(task)
+        producers_done.set()
+        if not await comment_dispatch_task:
+            raise RuntimeError("Comment dispatcher did not drain all pending API scopes.")
 
     api_drain_task = asyncio.create_task(wait_for_api_drain(), name="api-backfill-drain")
     try:
@@ -385,6 +523,9 @@ async def _run_backfill_mode(
             api_drain_task.cancel()
             await asyncio.gather(api_drain_task, return_exceptions=True)
         _cancel_recovery_task(recovery_task)
+        if comment_dispatch_task is not None and not comment_dispatch_task.done():
+            comment_dispatch_task.cancel()
+            await asyncio.gather(comment_dispatch_task, return_exceptions=True)
         await _stop_api_workers(workers, worker_tasks)
         if on_api_interrupted is not None:
             await on_api_interrupted()
@@ -395,6 +536,9 @@ async def _run_backfill_mode(
             api_drain_task.cancel()
             await asyncio.gather(api_drain_task, return_exceptions=True)
         _cancel_recovery_task(recovery_task)
+        if comment_dispatch_task is not None and not comment_dispatch_task.done():
+            comment_dispatch_task.cancel()
+            await asyncio.gather(comment_dispatch_task, return_exceptions=True)
         await _stop_api_workers(workers, worker_tasks)
         if on_api_interrupted is not None:
             await on_api_interrupted()
@@ -406,6 +550,9 @@ async def _run_backfill_mode(
         if recovery_task is not None and not recovery_task.done():
             recovery_task.cancel()
             await asyncio.gather(recovery_task, return_exceptions=True)
+        if comment_dispatch_task is not None and not comment_dispatch_task.done():
+            comment_dispatch_task.cancel()
+            await asyncio.gather(comment_dispatch_task, return_exceptions=True)
         if not scheduler_task.done():
             scheduler_task.cancel()
         await asyncio.gather(scheduler_task, return_exceptions=True)
@@ -525,6 +672,8 @@ async def drain_pending(
     active_run_id: str | None = None
     api_drain_task: asyncio.Task | None = None
     api_monitor_task: asyncio.Task | None = None
+    comment_dispatch_task: asyncio.Task | None = None
+    comment_producers_done: asyncio.Event | None = None
     web_discovery_task: asyncio.Task | None = None
     web_finished = False
     web_summary: Any | None = None
@@ -532,6 +681,7 @@ async def drain_pending(
     initial_run_status: str | None = None
     web_discovered_count = 0
     web_lifecycle_error = False
+    comment_dispatch_complete = True
 
     async def start_web_worker(current_run_id: str) -> None:
         nonlocal web_worker_task, web_stop_event, api_done_event, web_run_ids, web_discovery_task
@@ -599,7 +749,13 @@ async def drain_pending(
                 web_finished = True
 
             unresolved_count = getattr(web_summary, "unresolved_count", 0)
-            if unresolved_count or discovery_error is not None or web_error is not None or web_summary is None:
+            if (
+                unresolved_count
+                or discovery_error is not None
+                or web_error is not None
+                or web_summary is None
+                or not comment_dispatch_complete
+            ):
                 web_lifecycle_error = True
                 await datastore.set_research_run_status_if(
                     run_id,
@@ -609,11 +765,14 @@ async def drain_pending(
                     if unresolved_count
                     else "web_fallback_worker_error"
                     if web_error is not None or web_summary is None
+                    else "pending_comment_scopes_not_drained"
+                    if not comment_dispatch_complete
                     else "web_fallback_discovery_error",
                 )
             else:
                 if (
                     initial_run_status == "completed"
+                    and comment_dispatch_complete
                     and web_discovered_count == 0
                     and not getattr(web_summary, "collected_count", 0)
                     and not getattr(web_summary, "completed_count", 0)
@@ -735,6 +894,29 @@ async def drain_pending(
                 asyncio.create_task(worker.run(), name=f"worker-{worker.lane}-{worker.worker_id}")
                 for worker in workers
             ]
+            comment_producers_done = asyncio.Event()
+            selected_comment_scopes = {
+                (scope.logical_task_key, scope.generation)
+                for scope in selected
+                if scope.scope_type == "post_comments"
+            }
+            selected_thread_scopes = {
+                (scope.logical_task_key, scope.generation)
+                for scope in selected
+                if scope.scope_type == "thread_replies"
+            }
+            comment_dispatch_task = asyncio.create_task(
+                _dispatch_pending_comment_scopes(
+                    datastore,
+                    router,
+                    responsible_fids,
+                    active_run_id,
+                    producers_done=comment_producers_done,
+                    selected_comment_scopes=selected_comment_scopes,
+                    selected_thread_scopes=selected_thread_scopes,
+                ),
+                name="api-comment-scope-dispatcher",
+            )
             logger.info(
                 "Draining research run {}: initial_scopes={}, tid={}, limit={}, max_seconds={}",
                 active_run_id,
@@ -745,13 +927,37 @@ async def drain_pending(
             )
 
             async def enqueue_and_wait_idle() -> bool:
-                await _enqueue_research_scope_batch(router, selected, responsible_fids, active_run_id)
+                nonlocal comment_dispatch_complete
+
+                async def enqueue_initial_scopes() -> None:
+                    await _enqueue_research_scope_batch(router, selected, responsible_fids, active_run_id)
+                    comment_producers_done.set()
+
+                async def supervise_dispatch() -> None:
+                    nonlocal comment_dispatch_complete
+                    enqueue_task = asyncio.create_task(enqueue_initial_scopes(), name="drain-initial-scopes")
+                    try:
+                        while not enqueue_task.done():
+                            done, _pending = await asyncio.wait(
+                                {enqueue_task, comment_dispatch_task},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if comment_dispatch_task in done and not enqueue_task.done():
+                                comment_dispatch_task.result()
+                                raise RuntimeError("Comment dispatcher exited before drain producers finished.")
+                        enqueue_task.result()
+                        comment_dispatch_complete = await comment_dispatch_task
+                    finally:
+                        if not enqueue_task.done():
+                            enqueue_task.cancel()
+                            await asyncio.gather(enqueue_task, return_exceptions=True)
+
                 try:
                     if max_seconds == 0:
-                        await router.wait_idle()
+                        await supervise_dispatch()
                     else:
                         async with asyncio.timeout(max_seconds):
-                            await router.wait_idle()
+                            await supervise_dispatch()
                 except TimeoutError:
                     return False
                 return True
@@ -763,6 +969,9 @@ async def drain_pending(
             if not cancelled:
                 api_drained = await api_drain_task
                 if not api_drained:
+                    if comment_dispatch_task is not None and not comment_dispatch_task.done():
+                        comment_dispatch_task.cancel()
+                        await asyncio.gather(comment_dispatch_task, return_exceptions=True)
                     await datastore.set_research_run_status_if(
                         active_run_id,
                         {"running", "incomplete"},
@@ -775,6 +984,9 @@ async def drain_pending(
             if api_drain_task is not None and not api_drain_task.done():
                 api_drain_task.cancel()
                 await asyncio.gather(api_drain_task, return_exceptions=True)
+            if comment_dispatch_task is not None and not comment_dispatch_task.done():
+                comment_dispatch_task.cancel()
+                await asyncio.gather(comment_dispatch_task, return_exceptions=True)
             if workers:
                 await _stop_api_workers(workers, worker_tasks)
             await stop_web_for_interruption()
@@ -790,8 +1002,16 @@ async def drain_pending(
                     "drain_cancelled_after_current_api_page",
                 )
         elif selected and not unresolved_count and not web_lifecycle_error:
-            status = await datastore.reconcile_research_run_status_after_drain(active_run_id)
-            logger.info("drain-pending finished; run status is {}.", status)
+            if comment_dispatch_complete:
+                status = await datastore.reconcile_research_run_status_after_drain(active_run_id)
+                logger.info("drain-pending finished; run status is {}.", status)
+            else:
+                await datastore.set_research_run_status_if(
+                    active_run_id,
+                    {"running", "completed", "incomplete"},
+                    "incomplete",
+                    "pending_comment_scopes_not_drained",
+                )
 
         return len(selected)
     except asyncio.CancelledError:
@@ -802,6 +1022,9 @@ async def drain_pending(
         if api_monitor_task is not None and not api_monitor_task.done():
             api_monitor_task.cancel()
             await asyncio.gather(api_monitor_task, return_exceptions=True)
+        if comment_dispatch_task is not None and not comment_dispatch_task.done():
+            comment_dispatch_task.cancel()
+            await asyncio.gather(comment_dispatch_task, return_exceptions=True)
         if datastore is not None:
             if workers:
                 await _stop_api_workers(workers, worker_tasks)
@@ -819,6 +1042,9 @@ async def drain_pending(
             if api_monitor_task is not None and not api_monitor_task.done():
                 api_monitor_task.cancel()
                 await asyncio.gather(api_monitor_task, return_exceptions=True)
+            if comment_dispatch_task is not None and not comment_dispatch_task.done():
+                comment_dispatch_task.cancel()
+                await asyncio.gather(comment_dispatch_task, return_exceptions=True)
             if workers:
                 await _stop_api_workers(workers, worker_tasks)
             try:
@@ -840,6 +1066,9 @@ async def drain_pending(
         if api_monitor_task is not None and not api_monitor_task.done():
             api_monitor_task.cancel()
             await asyncio.gather(api_monitor_task, return_exceptions=True)
+        if comment_dispatch_task is not None and not comment_dispatch_task.done():
+            comment_dispatch_task.cancel()
+            await asyncio.gather(comment_dispatch_task, return_exceptions=True)
         if workers:
             await _stop_api_workers(workers, worker_tasks)
         if web_worker_task is not None and not web_finished:
@@ -938,6 +1167,8 @@ async def main(
     worker_tasks: list[asyncio.Task] = []
     mode_task: asyncio.Task | None = None
     recovery_task: asyncio.Task | None = None
+    comment_dispatch_task: asyncio.Task | None = None
+    producers_done: asyncio.Event | None = None
     web_worker_task: asyncio.Task | None = None
     web_stop_event: asyncio.Event | None = None
     api_done_event: asyncio.Event | None = None
@@ -973,7 +1204,20 @@ async def main(
             return await stop_web_for_interruption()
         if web_worker_task is None or web_stop_event is None or api_done_event is None:
             if research_run_id is not None:
-                await datastore.reconcile_research_run_status_after_drain(research_run_id)
+                dispatch_complete = (
+                    comment_dispatch_task is None
+                    or not comment_dispatch_task.done()
+                    or comment_dispatch_task.result()
+                )
+                if dispatch_complete:
+                    await datastore.reconcile_research_run_status_after_drain(research_run_id)
+                else:
+                    await datastore.set_research_run_status_if(
+                        research_run_id,
+                        {"running", "completed", "incomplete"},
+                        "incomplete",
+                        "pending_comment_scopes_not_drained",
+                    )
             return web_summary
         if web_finished:
             return web_summary
@@ -1014,7 +1258,18 @@ async def main(
         else:
             web_finished = True
         unresolved_count = getattr(web_summary, "unresolved_count", 0)
-        if unresolved_count or discovery_error is not None or web_error is not None or web_summary is None:
+        dispatch_complete = (
+            comment_dispatch_task is None
+            or not comment_dispatch_task.done()
+            or comment_dispatch_task.result()
+        )
+        if (
+            unresolved_count
+            or discovery_error is not None
+            or web_error is not None
+            or web_summary is None
+            or not dispatch_complete
+        ):
             for pending_run_id in pending_run_ids:
                 await datastore.set_research_run_status_if(
                     pending_run_id,
@@ -1024,6 +1279,8 @@ async def main(
                     if unresolved_count
                     else "web_fallback_worker_error"
                     if web_error is not None or web_summary is None
+                    else "pending_comment_scopes_not_drained"
+                    if not dispatch_complete
                     else "web_fallback_discovery_error",
                 )
         else:
@@ -1096,6 +1353,20 @@ async def main(
         )
         tasks.append(recovery_task)
 
+        if research_run_id is not None:
+            producers_done = asyncio.Event() if mode == "backfill" else None
+            comment_dispatch_task = asyncio.create_task(
+                _dispatch_pending_comment_scopes(
+                    datastore,
+                    router,
+                    responsible_fids,
+                    research_run_id,
+                    producers_done=producers_done,
+                ),
+                name="api-comment-scope-dispatcher",
+            )
+            tasks.append(comment_dispatch_task)
+
         if research_run_id is not None and hasattr(datastore, "async_sessionmaker"):
             responsible_forums = tuple((int(forum.fid), str(forum.fname)) for forum in (container.forums or []))
             web_run_ids = await pending_web_run_ids(
@@ -1135,6 +1406,7 @@ async def main(
                     web_worker_task=web_worker_task,
                     web_stop_event=web_stop_event,
                     recovery_task=recovery_task,
+                    comment_dispatch_task=comment_dispatch_task,
                     on_api_stopped=finish_web_after_api_stopped,
                     on_api_interrupted=stop_web_for_interruption,
                 ),
@@ -1150,6 +1422,8 @@ async def main(
                     web_worker_task=web_worker_task,
                     web_stop_event=web_stop_event,
                     recovery_task=recovery_task,
+                    comment_dispatch_task=comment_dispatch_task,
+                    producers_done=producers_done,
                     on_api_stopped=finish_web_after_api_stopped,
                     on_api_interrupted=stop_web_for_interruption,
                 ),
@@ -1165,6 +1439,7 @@ async def main(
                     web_worker_task=web_worker_task,
                     web_stop_event=web_stop_event,
                     recovery_task=recovery_task,
+                    comment_dispatch_task=comment_dispatch_task,
                     on_api_stopped=finish_web_after_api_stopped,
                     on_api_interrupted=stop_web_for_interruption,
                 ),

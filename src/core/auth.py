@@ -6,7 +6,7 @@ import asyncio
 import contextvars
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from aiotieba.enums import ReqUInfo
 from tiebameow.client.tieba_client import ErrorHandler, RetriableApiError, UnretriableApiError
@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
 class GateAwareSemaphore:
     """Semaphore adapter that rechecks request gates after acquiring capacity."""
+
+    _API_LANE_CYCLE = ("threads", "posts", "posts", "comments")
 
     def __init__(
         self,
@@ -39,6 +41,10 @@ class GateAwareSemaphore:
         self._admission_lock = asyncio.Lock()
         self._bypass_auth = contextvars.ContextVar(f"research_auth_bypass_{id(self)}", default=False)
         self._api_stop_event = contextvars.ContextVar(f"research_api_stop_event_{id(self)}", default=None)
+        self._api_type = contextvars.ContextVar(f"research_api_type_{id(self)}", default=None)
+        self._api_waiters: dict[str, list[object]] = {"threads": [], "posts": [], "comments": []}
+        self._api_cycle_index = 0
+        self._api_admission_changed = asyncio.Event()
 
     async def acquire(self) -> bool:
         stop_event = self._api_stop_event.get()
@@ -60,6 +66,17 @@ class GateAwareSemaphore:
             try:
                 if stop_event is not None and stop_event.is_set():
                     raise asyncio.CancelledError
+                api_type = self._api_type.get()
+                if api_type is not None and self._minimum_interval_seconds > 0:
+                    lane_granted = await self._await_or_api_stop(
+                        self._wait_for_api_lane_slot(api_type), stop_event
+                    )
+                    if stop_event is not None and stop_event.is_set():
+                        raise asyncio.CancelledError
+                    if lane_granted:
+                        granted = True
+                        return True
+                    continue
                 if self._minimum_interval_seconds == 0:
                     gate_is_open = await self._await_or_api_stop(self._active_gate_is_open(), stop_event)
                     granted = gate_is_open
@@ -88,6 +105,54 @@ class GateAwareSemaphore:
 
             if remaining > 0:
                 await self._await_or_api_stop(asyncio.sleep(remaining), stop_event)
+
+    async def _wait_for_api_lane_slot(self, api_type: str) -> bool:
+        waiter = object()
+        waiters = self._api_waiters[api_type]
+        waiters.append(waiter)
+        self._api_admission_changed.set()
+        try:
+            # Let other requests already scheduled in this loop register their lanes.
+            await asyncio.sleep(0)
+            while True:
+                if not await self._active_gate_is_open():
+                    return False
+
+                remaining = 0.0
+                async with self._admission_lock:
+                    self._api_admission_changed.clear()
+                    _selected_lane, selected_index, selected_waiter = self._next_api_waiter()
+                    now = asyncio.get_running_loop().time()
+                    remaining = self._next_request_at - now
+                    if selected_waiter is waiter and remaining <= 0:
+                        if await self._active_gate_is_open():
+                            waiters.pop(0)
+                            self._api_cycle_index = (selected_index + 1) % len(self._API_LANE_CYCLE)
+                            self._next_request_at = now + self._minimum_interval_seconds
+                            self._api_admission_changed.set()
+                            return True
+                        return False
+
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                elif remaining < 0:
+                    await asyncio.sleep(0.05)
+                else:
+                    await self._api_admission_changed.wait()
+        finally:
+            try:
+                waiters.remove(waiter)
+            except ValueError:
+                pass
+            self._api_admission_changed.set()
+
+    def _next_api_waiter(self) -> tuple[str, int, object]:
+        for offset in range(len(self._API_LANE_CYCLE)):
+            index = (self._api_cycle_index + offset) % len(self._API_LANE_CYCLE)
+            lane = self._API_LANE_CYCLE[index]
+            if self._api_waiters[lane]:
+                return lane, index, self._api_waiters[lane][0]
+        raise RuntimeError("API admission scheduler has no waiting lanes.")
 
     @staticmethod
     def _task_succeeded(task: asyncio.Future[object]) -> bool:
@@ -168,6 +233,14 @@ class GateAwareSemaphore:
             yield
         finally:
             self._api_stop_event.reset(token)
+
+    @asynccontextmanager
+    async def api_lane(self, api_type: Literal["threads", "posts", "comments"]) -> AsyncGenerator[None, None]:
+        token = self._api_type.set(api_type)
+        try:
+            yield
+        finally:
+            self._api_type.reset(token)
 
     @asynccontextmanager
     async def bypass_auth_gate(self) -> AsyncGenerator[None, None]:

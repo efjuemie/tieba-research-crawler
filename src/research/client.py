@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
+from aiotieba.const import APP_BASE_HOST
 from aiotieba.enums import BawuType, PostSortType, ReqUInfo, ThreadSortType
 from aiotieba.helper.cache import ForumInfoCache
 from tiebameow.client.tieba_client import Client, RetriableApiError, UnretriableApiError, with_ensure
 from tiebameow.parser import convert_aiotieba_comments, convert_aiotieba_posts, convert_aiotieba_threads
 
+from .zero_comment_evidence import extract_zero_comment_evidence
+
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Generator
 
     from aiotieba.api._classdef.user import UserInfo
     from aiotieba.api.get_bawu_info._classdef import BawuInfo
@@ -33,6 +38,93 @@ class ResearchPage[RawPage, DTOPage]:
     dto: DTOPage
     observed_at: datetime
     source_api: str
+    zero_comment_evidence: dict[int, dict[str, object]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _CapturedGetPostsResponse:
+    body: bytes | None = None
+    matching_response_count: int = 0
+
+
+_GET_POSTS_RESPONSE_CAPTURE: ContextVar[_CapturedGetPostsResponse | None] = ContextVar(
+    "research_get_posts_response_capture", default=None
+)
+
+
+def _is_get_posts_http_request(request: object) -> bool:
+    url = getattr(request, "url", None)
+    if (
+        getattr(request, "method", None) != "POST"
+        or getattr(url, "host", None) != APP_BASE_HOST
+        or getattr(url, "path", None) != "/c/f/pb/page"
+    ):
+        return False
+    query = getattr(url, "query", None)
+    try:
+        return len(query) == 1 and query.getall("cmd", []) == ["302001"]
+    except (AttributeError, TypeError):
+        return False
+
+
+class _GetPostsResponseCapture:
+    """Temporarily wrap one client's NetCore.send without changing transport."""
+
+    def __init__(self, net_core: object) -> None:
+        self._net_core = net_core
+        self._active_captures = 0
+        self._original_send = None
+        self._wrapped_send = None
+
+    @contextmanager
+    def capture(self) -> Generator[_CapturedGetPostsResponse, None, None]:
+        holder = _CapturedGetPostsResponse()
+        if not self._activate():
+            yield holder
+            return
+
+        token = _GET_POSTS_RESPONSE_CAPTURE.set(holder)
+        try:
+            yield holder
+        finally:
+            _GET_POSTS_RESPONSE_CAPTURE.reset(token)
+            self._deactivate()
+
+    def _activate(self) -> bool:
+        if self._active_captures == 0:
+            original_send = getattr(self._net_core, "send", None)
+            if not callable(original_send):
+                return False
+
+            async def capture_send(request: object, *args: object, **kwargs: object) -> bytes:
+                body = await original_send(request, *args, **kwargs)
+                holder = _GET_POSTS_RESPONSE_CAPTURE.get()
+                if holder is not None and _is_get_posts_http_request(request):
+                    holder.matching_response_count += 1
+                    holder.body = body if holder.matching_response_count == 1 and isinstance(body, bytes) else None
+                return body
+
+            try:
+                self._net_core.send = capture_send
+            except (AttributeError, TypeError):
+                return False
+            self._original_send = original_send
+            self._wrapped_send = capture_send
+
+        self._active_captures += 1
+        return True
+
+    def _deactivate(self) -> None:
+        self._active_captures -= 1
+        if self._active_captures:
+            return
+        if getattr(self._net_core, "send", None) is self._wrapped_send:
+            try:
+                self._net_core.send = self._original_send
+            except (AttributeError, TypeError):
+                pass
+        self._original_send = None
+        self._wrapped_send = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +290,15 @@ class ResearchClient(Client):
             kwargs["BDUSS"] = parse_bduss(bduss)
         super().__init__(*args, **kwargs)
         self.research_run_cache = research_run_cache or ResearchRunCache()
+        self._research_get_posts_response_capture: _GetPostsResponseCapture | None = None
+
+    def _get_posts_response_capture(self) -> _GetPostsResponseCapture:
+        net_core = self._http_core.net_core
+        capture = self._research_get_posts_response_capture
+        if capture is None or capture._net_core is not net_core:
+            capture = _GetPostsResponseCapture(net_core)
+            self._research_get_posts_response_capture = capture
+        return capture
 
     async def get_threads_research(
         self,
@@ -240,23 +341,32 @@ class ResearchClient(Client):
         comment_sort_by_agree: bool = True,
         comment_rn: int = 4,
     ) -> ResearchPage[object, PostsDTO]:
-        raw = await self.get_posts(
-            tid,
-            pn,
-            rn=rn,
-            sort=sort,
-            only_thread_author=only_thread_author,
-            with_comments=with_comments,
-            comment_sort_by_agree=comment_sort_by_agree,
-            comment_rn=comment_rn,
-        )
+        capture = self._get_posts_response_capture()
+        with capture.capture() as captured:
+            raw = await self.get_posts(
+                tid,
+                pn,
+                rn=rn,
+                sort=sort,
+                only_thread_author=only_thread_author,
+                with_comments=with_comments,
+                comment_sort_by_agree=comment_sort_by_agree,
+                comment_rn=comment_rn,
+            )
         # aiotieba 4.8.2 Page_p does not expose total_count.
         dto = convert_aiotieba_posts(raw)
+        zero_comment_evidence = extract_zero_comment_evidence(
+            captured.body,
+            requested_tid=tid,
+            source_page=pn,
+            raw_page=raw,
+        )
         return ResearchPage(
             raw=raw,
             dto=dto,
             observed_at=datetime.now(UTC),
             source_api="aiotieba.get_posts",
+            zero_comment_evidence=zero_comment_evidence,
         )
 
     async def get_comments_research(

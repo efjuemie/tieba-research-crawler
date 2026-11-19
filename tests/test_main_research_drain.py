@@ -55,11 +55,14 @@ async def test_backfill_reconciles_after_scheduler_checkpoint_and_detail_drain(m
             assert fids == {7}
             events.append("legacy_scopes_adopted")
 
-        async def iter_pending_research_task_scopes(self, run_id, fids, *, batch_size):
+        async def iter_pending_research_task_scopes(
+            self, run_id, fids, *, batch_size, scope_type=None, status=None
+        ):
             assert run_id == "synthetic-run"
             assert fids == {7}
             assert batch_size == 500
-            events.append("research_scopes_iterated")
+            if status is None:
+                events.append(f"research_scopes_iterated:{scope_type}")
             if False:
                 yield []
 
@@ -114,7 +117,8 @@ async def test_backfill_reconciles_after_scheduler_checkpoint_and_detail_drain(m
         "scheduler_received_datastore",
         "run_created",
         "legacy_scopes_adopted",
-        "research_scopes_iterated",
+        "research_scopes_iterated:thread_replies",
+        "research_scopes_iterated:post_comments",
         "list_scheduler_finished",
         "drain_started",
         "drain_finished",
@@ -270,6 +274,15 @@ async def test_user_stop_stops_api_and_web_without_draining_all_queued_web_work(
 
         async def start_research_run(self, **_kwargs):
             return "synthetic-run"
+
+        async def iter_pending_research_task_scopes(
+            self, _run_id, _fids, *, batch_size, scope_type=None, status=None
+        ):
+            assert batch_size == 500
+            assert scope_type == "post_comments"
+            assert status == "pending"
+            if False:
+                yield []
 
         async def reconcile_research_run_status_after_drain(self, run_id):
             assert run_id == "synthetic-run"

@@ -30,11 +30,17 @@ def test_web_fallback_defaults_are_bounded_and_serialized_in_examples():
         }
 
 
-def test_api_rate_limit_defaults_are_half_rps_with_ten_second_cooldown():
+def test_api_rate_limit_defaults_are_half_rps_with_five_second_cooldown():
     settings = RateLimitConfig()
 
     assert settings.global_rps == 0.5
-    assert settings.cooldown_seconds_429 == 10.0
+    assert settings.cooldown_seconds_429 == 5.0
+
+    root = Path(__file__).resolve().parents[1]
+    for name in ("config.example.toml", "config.docker.example.toml"):
+        with (root / name).open("rb") as stream:
+            sample = tomllib.load(stream)
+        assert sample["rate_limit"]["cooldown_seconds_429"] == 5.0
 
 
 def test_web_fallback_config_keeps_explicit_lower_search_limits():

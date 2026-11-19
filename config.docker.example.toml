@@ -106,7 +106,7 @@ port = 8001
 # 并发数限制
 concurrency = 10
 # 遇 HTTP 429 后的全局冷却时间（秒）
-cooldown_seconds_429 = 10.0
+cooldown_seconds_429 = 5.0
 # All research API requests share this global limit.
 global_rps = 0.5
 # 分接口 RPS 配置

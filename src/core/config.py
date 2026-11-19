@@ -110,7 +110,7 @@ class RateLimitConfig(BaseModel):
     """请求频率限制配置模型"""
 
     concurrency: int = Field(default=10, gt=0)
-    cooldown_seconds_429: float = Field(default=10.0, gt=0)
+    cooldown_seconds_429: float = Field(default=5.0, gt=0)
 
     global_rps: float = Field(default=0.5, gt=0)
     threads_rps: float = Field(default=2.0, gt=0)

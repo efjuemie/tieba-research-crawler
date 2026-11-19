@@ -2,6 +2,7 @@
 
 import json
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -509,3 +510,110 @@ async def test_remove_pending_comment_scan_supports_task_kind_filter():
     )
     assert "DELETE FROM pending_comment_scan" in compiled
     assert "task_kind" in compiled
+
+
+@pytest.mark.asyncio
+async def test_explicit_zero_comment_checkpoint_resumes_as_completed_scope():
+    continuation = {
+        "completion_basis": "parent_api_explicit_zero",
+        "comment_api_called": False,
+    }
+    row = SimpleNamespace(
+        status="completed",
+        scope_status="completed",
+        has_more=None,
+        continuation_json=continuation,
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return row
+
+    class Session:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def execute(self, _statement):
+            return Result()
+
+    container = DummyContainer(DummySession(), DummyRedis())
+    container.async_sessionmaker = Session()
+    datastore = DataStore(cast("Any", container))
+
+    assert await datastore.get_research_resume_state("run", "post_comments:1:2:g3") == (
+        None,
+        "completed",
+        continuation,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "pending_only", "expected"),
+    [
+        ("pending", True, True),
+        ("incomplete", True, False),
+        ("incomplete", False, True),
+        ("paused_auth", False, True),
+        ("paused_rate_limit", False, True),
+        ("completed", False, False),
+        ("blocked", False, False),
+    ],
+)
+async def test_comment_scope_claim_serializes_parent_before_child(monkeypatch, status, pending_only, expected):
+    class Session:
+        def __call__(self):
+            return self
+
+        def begin(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    parent = SimpleNamespace(generation=4)
+    scope = SimpleNamespace(
+        generation=6,
+        scope_type="post_comments",
+        task_type="full_scan_comments",
+        tid=9,
+        parent_pid=100,
+        parent_logical_task_key="thread_replies:9",
+        parent_generation=4,
+        status=status,
+    )
+    locked_keys: list[str] = []
+
+    async def get_scope_for_update(_session, run_id, logical_key):
+        assert run_id == "run"
+        locked_keys.append(logical_key)
+        return parent if logical_key == "thread_replies:9" else scope
+
+    container = DummyContainer(DummySession(), DummyRedis())
+    container.async_sessionmaker = Session()
+    datastore = DataStore(cast("Any", container))
+    monkeypatch.setattr(datastore, "get_research_task_scope_for_update", get_scope_for_update)
+
+    claimed = await datastore.claim_research_comments_scope(
+        run_id="run",
+        logical_task_key="post_comments:9:100",
+        generation=6,
+        parent_logical_task_key="thread_replies:9",
+        parent_generation=4,
+        tid=9,
+        parent_pid=100,
+        pending_only=pending_only,
+    )
+
+    assert claimed is expected
+    assert locked_keys == ["thread_replies:9", "post_comments:9:100"]
+    assert scope.status == ("running" if expected else status)

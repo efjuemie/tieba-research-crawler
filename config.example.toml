@@ -107,7 +107,7 @@ port = 8001
 # 并发数限制
 concurrency = 10
 # 遇 HTTP 429 后的全局冷却时间（秒）
-cooldown_seconds_429 = 10.0
+cooldown_seconds_429 = 5.0
 # 所有 aiotieba HTTP 请求共享的全局上限；研究Client内部每个HTTP请求都会消耗一次
 global_rps = 0.5
 # 分接口 RPS 配置

@@ -9,9 +9,9 @@ from typing import Any
 import pytest
 
 import main as app_main
-from main import _recover_pending_tasks
+from main import _dispatch_pending_comment_scopes, _recover_pending_tasks
 from src.scraper.router import QueueRouter
-from src.scraper.tasks import FullScanCommentsTask, FullScanPostsTask
+from src.scraper.tasks import FullScanCommentsTask, FullScanPostsTask, Priority, Task
 
 
 class _ScopeStore:
@@ -25,13 +25,19 @@ class _ScopeStore:
         assert fids == {7}
         self.events.append("adopted")
 
-    async def iter_pending_research_task_scopes(self, run_id, fids, *, batch_size):
+    async def iter_pending_research_task_scopes(self, run_id, fids, *, batch_size, scope_type=None):
         assert run_id == "run-synthetic"
         assert fids == {7}
         assert batch_size == 500
-        assert self.events[-1] == "adopted"
-        self.events.append("iterated")
-        pending = [scope for scope in self.scopes if scope.status != "completed" and scope.fid in fids]
+        assert self.events[0] == "adopted"
+        self.events.append(f"iterated:{scope_type}")
+        pending = [
+            scope
+            for scope in self.scopes
+            if scope.status != "completed"
+            and scope.fid in fids
+            and (scope_type is None or scope.scope_type == scope_type)
+        ]
         if pending:
             yield pending
 
@@ -66,6 +72,7 @@ def _scope(
         tid=tid,
         parent_pid=parent_pid,
         parent_kind=parent_kind,
+        parent_logical_task_key=None,
         parent_generation=parent_generation,
         backfill=True,
         rn=17,
@@ -99,7 +106,7 @@ async def test_recovery_enqueues_current_generation_without_page_checkpoint():
 
     await _recover_pending_tasks(store, router, {7}, research_run_id="run-synthetic")
 
-    assert store.events == ["adopted", "iterated"]
+    assert store.events == ["adopted", "iterated:thread_replies", "iterated:post_comments"]
     assert store.checkpoints == []
     post_task = next(task.content for task in router.tasks if isinstance(task.content, FullScanPostsTask))
     comment_task = next(task.content for task in router.tasks if isinstance(task.content, FullScanCommentsTask))
@@ -118,6 +125,8 @@ async def test_recovery_enqueues_current_generation_without_page_checkpoint():
         comment_task.parent_generation,
         comment_task.parent_kind,
     ) == ("run-synthetic", 101, 1001, 5, 3, "first_post")
+    assert router.tasks[0].content is post_task
+    assert comment_task.pending_only is False
 
 
 @pytest.mark.asyncio
@@ -157,6 +166,113 @@ async def test_cancelled_enqueue_leaves_current_scope_recoverable():
     assert (recovered.tid, recovered.generation, recovered.run_id) == (202, 4, "run-synthetic")
 
 
+class _CommentScopeStore:
+    def __init__(self, scopes):
+        self.scopes = scopes
+        self.read_count = 0
+        self.read_event = asyncio.Event()
+
+    async def iter_pending_research_task_scopes(
+        self, run_id, fids, *, batch_size, scope_type, status
+    ):
+        assert (run_id, fids, batch_size, scope_type, status) == (
+            "run-synthetic",
+            {7},
+            500,
+            "post_comments",
+            "pending",
+        )
+        self.read_count += 1
+        self.read_event.set()
+        pending = [scope for scope in self.scopes if scope.scope_type == scope_type and scope.status == status]
+        if pending:
+            yield pending
+
+
+@pytest.mark.asyncio
+async def test_comment_dispatcher_finds_late_child_and_waits_for_real_router_idle():
+    store = _CommentScopeStore([])
+    router = QueueRouter(maxsize=1)
+    producers_done = asyncio.Event()
+    scope = _scope(
+        logical_key="post_comments:202:2020",
+        scope_type="post_comments",
+        task_type="full_scan_comments",
+        generation=2,
+        tid=202,
+        parent_pid=2020,
+        parent_kind="reply_post",
+        parent_generation=1,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def consume_one():
+        item = await router.comments_queue.get()
+        assert item.content.pending_only is True
+        started.set()
+        await release.wait()
+        scope.status = "completed"
+        router.comments_queue.task_done(item)
+
+    consumer = asyncio.create_task(consume_one())
+    dispatcher = asyncio.create_task(
+        _dispatch_pending_comment_scopes(store, router, {7}, "run-synthetic", producers_done=producers_done)
+    )
+    await asyncio.wait_for(store.read_event.wait(), timeout=1)
+    store.scopes.append(scope)
+    producers_done.set()
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert router.tracker.pending == 1
+    assert not dispatcher.done()
+    await asyncio.sleep(0.01)
+    assert not dispatcher.done()
+
+    release.set()
+    assert await asyncio.wait_for(dispatcher, timeout=1) is True
+    await consumer
+    assert router.tracker.pending == 0
+    assert store.read_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_comment_dispatcher_cancellation_rolls_back_full_queue_waiter():
+    scope = _scope(
+        logical_key="post_comments:202:2020",
+        scope_type="post_comments",
+        task_type="full_scan_comments",
+        generation=2,
+        tid=202,
+        parent_pid=2020,
+        parent_kind="reply_post",
+        parent_generation=1,
+    )
+    store = _CommentScopeStore([scope])
+    router = QueueRouter(maxsize=1)
+    placeholder = Task(priority=Priority.LOW, content=FullScanCommentsTask(tid=999, pid=9999))
+    router.put_nowait(placeholder)
+    dispatcher = asyncio.create_task(
+        _dispatch_pending_comment_scopes(
+            store,
+            router,
+            {7},
+            "run-synthetic",
+            producers_done=asyncio.Event(),
+        )
+    )
+    await asyncio.wait_for(store.read_event.wait(), timeout=1)
+    await asyncio.sleep(0)
+    dispatcher.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatcher
+
+    assert router.comments_queue.qsize() == 1
+    assert router.comments_queue._unique_set == {placeholder.unique_key}
+    assert router.tracker.pending == 1
+    assert scope.status == "pending"
+
+
 @pytest.mark.asyncio
 async def test_main_cancellation_marks_running_research_run_interrupted(monkeypatch):
     events: list[str] = []
@@ -169,7 +285,7 @@ async def test_main_cancellation_marks_running_research_run_interrupted(monkeypa
         async def adopt_legacy_research_scopes(self, _run_id, _fids):
             return None
 
-        async def iter_pending_research_task_scopes(self, _run_id, _fids, *, batch_size):
+        async def iter_pending_research_task_scopes(self, _run_id, _fids, *, batch_size, scope_type=None):
             assert batch_size == 500
             if False:
                 yield []

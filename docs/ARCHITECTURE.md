@@ -20,7 +20,7 @@ flowchart LR
 
 默认 `consumer.transport = "none"`、`cache.backend = "memory"`。本机运行只需要 PostgreSQL 和访问贴吧 API 的网络；不需要 Docker、Redis、TimescaleDB 或远程数据库。只有用户主动改用 Redis/WebSocket 消费者或 Redis 缓存时才需要相应服务。
 
-研究客户端的 API 全局请求预算默认 `global_rps = 0.5`，通过当前 Container 创建的 `ResearchClient` 请求共用此间隔，包含用户吧内资料查询；`threads_rps`、`posts_rps` 和 `comments_rps` 另有限制各自接口。浏览器网页补采使用独立的 `[web_fallback] rps = 0.2`，不占用 API 预算。API 遇到 429/220034 或连续三次异常空响应时会冷却 10 秒，再按原有次数上限继续；确认的正常空终页不触发冷却。以上配置不是贴吧公布的官方限额，也不限制其他程序自行发出的请求。
+研究客户端的 API 全局请求预算默认 `global_rps = 0.5`，通过当前 Container 创建的 `ResearchClient` 请求共用此间隔，包含用户吧内资料查询；`threads_rps`、`posts_rps` 和 `comments_rps` 另有限制各自接口。API gate 按 `threads → posts → posts → comments` 四槽轮转；三条通道都有等待请求时，机会按 1:2:1 分配，空通道让出槽位。这是请求准入次序，不是整体吞吐倍率。评论 scope 先写入数据库；有界评论队列满时，dispatcher 保留 durable pending scope，并在队列有空位后继续投递。浏览器网页补采使用独立的 `[web_fallback] rps = 0.2`，不占用 API 预算。API 遇到 429/220034 或连续三次异常空响应时会冷却 5 秒，再按原有次数上限继续；确认的正常空终页不触发冷却。以上配置不是贴吧公布的官方限额，也不限制其他程序自行发出的请求。
 
 ## 回溯、周期监控与恢复
 
@@ -86,7 +86,7 @@ thread(tid)
 └── comment(cid, tid, parent_post_pid)：楼中楼
 ```
 
-`get_posts` 返回的附带 comments 有数量限制，不能代替 `get_comments(tid, pid, page)` 独立分页。`reply_to_id` 指向用户，不是被回复评论的 ID；aiotieba 用 `0` 表示无法解析的目标，研究规范将标准化目标设为 `NULL` 并记录缺失原因。首楼楼中楼报告数放在 `research_thread.source_payload_json["first_post"]`，不与主题帖 `reply_count` 混用。
+`get_posts` 返回的附带 comments 有数量限制，通常不能代替 `get_comments(tid, pid, page)` 独立分页。唯一的免请求情况是原始 protobuf 明确包含楼中楼数量为零，且主题、论坛、父楼、作者和页码身份全部匹配；系统才跳过该父楼的 `get_comments`，并在 checkpoint 记录零值证据及其真实父楼 API 来源。缺少原始响应、截断或无法解析、以及身份不匹配时都继续正常请求评论；DTO 默认零值不构成证据。`reply_to_id` 指向用户，不是被回复评论的 ID；aiotieba 用 `0` 表示无法解析的目标，研究规范将标准化目标设为 `NULL` 并记录缺失原因。首楼楼中楼报告数放在 `research_thread.source_payload_json["first_post"]`，不与主题帖 `reply_count` 混用。
 
 作者 IP 字段只在经有限样本检查为非 IP 格式地域文本时保存为 `ip_location_text`，同时标明来源字段路径和响应观察时间。IPv4/IPv6 字面值不会存进研究 payload；评论作者数据模型没有相同字段时保持缺失。地域字段描述一次响应，不代表用户的永久位置。
 

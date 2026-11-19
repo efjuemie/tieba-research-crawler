@@ -119,6 +119,8 @@ async def test_pending_scope_query_filters_run_forum_tid_and_global_limit():
                 _stored_scope("run-a", "post_comments:101:1010", "post_comments", 101, 7),
                 _stored_scope("run-a", "thread_replies:303", "thread_replies", 303, 8),
                 _stored_scope("run-a", "post_comments:404:4040", "post_comments", 404, 7, status="completed"),
+                _stored_scope("run-a", "post_comments:505:5050", "post_comments", 505, 7, status="incomplete"),
+                _stored_scope("run-a", "post_comments:606:6060", "post_comments", 606, 7, status="running"),
                 _stored_scope("run-b", "post_comments:202:2020", "post_comments", 202, 7),
             ]
         )
@@ -140,7 +142,15 @@ async def test_pending_scope_query_filters_run_forum_tid_and_global_limit():
     assert [row.logical_task_key for row in all_pending] == [
         "post_comments:101:1010",
         "post_comments:202:2020",
+        "post_comments:505:5050",
+        "post_comments:606:6060",
         "thread_replies:202",
+    ]
+
+    comment_pending = await collect(scope_type="post_comments", status="pending")
+    assert [row.logical_task_key for row in comment_pending] == [
+        "post_comments:101:1010",
+        "post_comments:202:2020",
     ]
     engine.dispose()
 
@@ -216,18 +226,30 @@ class _ResearchStore:
     async def adopt_legacy_research_scopes(self, *_args):
         pytest.fail("drain-pending must not adopt global legacy pending rows")
 
-    async def iter_pending_research_task_scopes(self, run_id, fids, *, batch_size, tid=None, limit=None):
-        self.selection = (run_id, set(fids), batch_size, tid, limit)
+    async def iter_pending_research_task_scopes(
+        self,
+        run_id,
+        fids,
+        *,
+        batch_size,
+        tid=None,
+        limit=None,
+        scope_type=None,
+        status=None,
+    ):
+        if scope_type is None:
+            self.selection = (run_id, set(fids), batch_size, tid, limit)
         selected = []
-        for scope_type in ("post_comments", "thread_replies"):
+        scope_types = (scope_type,) if scope_type is not None else ("post_comments", "thread_replies")
+        for current_scope_type in scope_types:
             selected.extend(
                 sorted(
                     (
                         scope
                         for (scope_run_id, _), scope in self.scopes.items()
                         if scope_run_id == run_id
-                        and scope.scope_type == scope_type
-                        and scope.status != "completed"
+                        and scope.scope_type == current_scope_type
+                        and (scope.status == status if status is not None else scope.status != "completed")
                         and scope.fid in fids
                         and (tid is None or scope.tid == tid)
                     ),
@@ -492,6 +514,14 @@ def _patch_drain_runtime(monkeypatch, container, router, datastore):
 async def test_drain_pending_uses_real_workers_only_for_selected_run_and_scans_first_floor_comments(monkeypatch):
     thread_scope = _scope("thread_replies:1", "thread_replies", 1, generation=4)
     other_scope = _scope("thread_replies:2", "thread_replies", 2)
+    other_comment_scope = _scope(
+        "post_comments:2:200",
+        "post_comments",
+        2,
+        parent_pid=200,
+        parent_kind="reply_post",
+        parent_generation=0,
+    )
 
     async def get_posts(tid, page_number):
         assert (tid, page_number) == (1, 1)
@@ -519,7 +549,7 @@ async def test_drain_pending_uses_real_workers_only_for_selected_run_and_scans_f
     client = _SyntheticClient(posts=get_posts, comments=get_comments)
     container = _container(client)
     router = QueueRouter(maxsize=1)
-    store = _ResearchStore([thread_scope, other_scope])
+    store = _ResearchStore([thread_scope, other_scope, other_comment_scope])
     _patch_drain_runtime(monkeypatch, container, router, store)
     monkeypatch.setattr("src.research.persistence.persist_research_page", AsyncMock())
 
@@ -535,6 +565,8 @@ async def test_drain_pending_uses_real_workers_only_for_selected_run_and_scans_f
     assert store.scopes[("run-synthetic", "thread_replies:1")].status == "completed"
     assert store.scopes[("run-synthetic", "post_comments:1:100")].status == "completed"
     assert store.scopes[("run-synthetic", "thread_replies:2")].status == "pending"
+    assert other_comment_scope.status == "pending"
+    assert all(pid != 200 for _tid, pid, _page in client.comment_pages)
     assert store.run_status == "incomplete"
 
 
@@ -844,7 +876,7 @@ async def test_drain_web_errors_remain_incomplete_after_api_scope_completes(monk
 
 
 @pytest.mark.asyncio
-async def test_bounded_queue_cancellation_keeps_generated_children_and_is_not_idle(monkeypatch):
+async def test_bounded_queue_cancellation_keeps_generated_children_recoverable(monkeypatch):
     comment_started = asyncio.Event()
     release_comment = asyncio.Event()
     parent_scope = _scope("thread_replies:1", "thread_replies", 1, generation=4)
@@ -892,7 +924,8 @@ async def test_bounded_queue_cancellation_keeps_generated_children_and_is_not_id
         "post_comments:1:103",
     }
     assert router.total_qsize() == 1
-    assert router.tracker.pending >= 3
+    assert router.tracker.pending == 2
+    assert not drain_task.done()
 
     drain_task.cancel()
     await asyncio.sleep(0)
@@ -902,10 +935,6 @@ async def test_bounded_queue_cancellation_keeps_generated_children_and_is_not_id
 
     assert store.run_status == "interrupted"
     assert all(store.scopes[("run-synthetic", key)].status == "pending" for key in child_keys)
-    assert router.total_qsize() == 1
-    assert router.tracker.pending == 1
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(router.wait_idle(), timeout=0.02)
 
 
 @pytest.mark.asyncio

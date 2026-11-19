@@ -20,6 +20,7 @@ import dataclasses
 import random
 import time
 from abc import ABC, abstractmethod
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
 from aiotieba.enums import PostSortType, ThreadSortType
@@ -107,6 +108,73 @@ def _page_first_post_pid(page: Any, raw_thread: Any, expected_tid: int) -> int:
     if len(matching_floor_one) != 1:
         return 0
     return _positive_int_id(getattr(matching_floor_one[0], "pid", None)) or 0
+
+
+def _explicit_zero_evidence_for_post(
+    response: Any,
+    page: Any,
+    post: Any,
+    task: FullScanPostsTask,
+    page_number: int,
+) -> dict[str, object] | None:
+    evidence_by_pid = getattr(response, "zero_comment_evidence", None)
+    pid = getattr(post, "pid", None)
+    tid = getattr(post, "tid", None)
+    fid = getattr(post, "fid", None)
+    author_id = getattr(post, "author_id", None)
+    author = getattr(post, "author", None) or getattr(post, "user", None)
+    author_user_id = getattr(author, "user_id", None)
+    forum = getattr(page, "forum", None)
+    page_data = getattr(page, "page", None)
+    current_page = getattr(page_data, "current_page", None)
+    expected_fid = _positive_int_id(task.fid) or _positive_int_id(getattr(forum, "fid", None))
+    if (
+        not isinstance(evidence_by_pid, dict)
+        or type(pid) is not int
+        or type(tid) is not int
+        or type(fid) is not int
+        or type(author_id) is not int
+        or type(author_user_id) is not int
+        or type(current_page) is not int
+        or pid <= 0
+        or tid != task.tid
+        or fid <= 0
+        or expected_fid is None
+        or fid != expected_fid
+        or author_id <= 0
+        or author_user_id != author_id
+        or current_page != page_number
+        or getattr(response, "source_api", None) != "aiotieba.get_posts"
+        or type(getattr(post, "reply_num", None)) is not int
+        or post.reply_num != 0
+        or bool(getattr(post, "comments", ()) or ())
+    ):
+        return None
+
+    evidence = evidence_by_pid.get(pid)
+    if not isinstance(evidence, dict):
+        return None
+    identities = {
+        "tid": task.tid,
+        "pid": pid,
+        "fid": fid,
+        "author_user_id": author_id,
+        "source_page": page_number,
+    }
+    if any(type(evidence.get(key)) is not int or evidence[key] != value for key, value in identities.items()):
+        return None
+    if (
+        type(evidence.get("reported_count")) is not int
+        or evidence["reported_count"] != 0
+        or evidence.get("count_field_present") is not True
+        or evidence.get("source_api") != "aiotieba.get_posts"
+        or evidence.get("evidence_kind") != "protobuf_wire_explicit_zero"
+        or evidence.get("count_field_path") != "data.post_list.sub_post_number"
+        or type(evidence.get("count_wire_field_number")) is not int
+        or evidence["count_wire_field_number"] != 13
+    ):
+        return None
+    return dict(evidence)
 
 
 def _retry_delay(wait_seconds: float, attempt: int) -> float:
@@ -495,7 +563,11 @@ class TaskHandler(ABC):
             start = time.perf_counter()
             status = "success"
             try:
-                return await method(*args, **kwargs)
+                api_lane = getattr(getattr(self.container, "semaphore", None), "api_lane", None)
+                if api_lane is None:
+                    return await method(*args, **kwargs)
+                async with api_lane(api_type):
+                    return await method(*args, **kwargs)
             except UnretriableApiError as error:
                 status = "error_deleted" if error.code == 4 else f"error_{error.code}"
                 raise
@@ -1554,12 +1626,12 @@ class FullScanPostsTaskHandler(TaskHandler):
             )
             await self.datastore.save_items_in_session(session, post_models)
 
-            for post in posts:
-                comments = list(post.comments)
-                await self.datastore.save_items_in_session(
-                    session,
-                    [Comment.from_dto(comment) for comment in comments],
-                )
+            async def register_comment_scope(
+                post: Any,
+                parent_kind: str,
+                *,
+                allow_zero_evidence: bool = True,
+            ) -> None:
                 fid = int(post.fid or task.fid or 0)
                 fname = post.fname or task.fname or ""
                 child = await self.datastore.ensure_research_task_scope(
@@ -1571,7 +1643,7 @@ class FullScanPostsTaskHandler(TaskHandler):
                     fname=fname,
                     tid=task.tid,
                     parent_pid=post.pid,
-                    parent_kind="reply_post",
+                    parent_kind=parent_kind,
                     backfill=task.backfill,
                     rn=task.rn,
                     parent_logical_task_key=logical_key,
@@ -1582,86 +1654,124 @@ class FullScanPostsTaskHandler(TaskHandler):
                     raise PageIntegrityError(
                         f"Parent generation changed while registering comments for tid={task.tid} pid={post.pid}."
                     )
-                if child.status != "completed":
-                    await self.datastore.add_pending_comment_scan_in_session(
-                        session,
-                        task.tid,
-                        post.pid,
-                        fid=fid,
-                        fname=fname,
-                        backfill=task.backfill,
-                    )
-                    child_tasks.append(
-                        FullScanCommentsTask(
-                            tid=task.tid,
-                            pid=post.pid,
-                            backfill=task.backfill,
-                            parent_kind="reply_post",
+                if child.status != "pending":
+                    return
+
+                zero_evidence = (
+                    _explicit_zero_evidence_for_post(response, page, post, task, page_number)
+                    if allow_zero_evidence
+                    else None
+                )
+                has_checkpoint = getattr(self.datastore, "has_research_checkpoint_in_session", None)
+                if (
+                    child.status == "pending"
+                    and child.parent_generation == task.generation
+                    and child.parent_logical_task_key == logical_key
+                    and zero_evidence is not None
+                    and has_checkpoint is not None
+                ):
+                    comment_task_key = research_comments_task_key(task.tid, post.pid, child.generation)
+                    if not await has_checkpoint(session, run_id, comment_task_key):
+                        observed_at = getattr(response, "observed_at", None)
+                        continuation = {
+                            "checkpoint_kind": "scope_completion",
+                            "completion_basis": "parent_api_explicit_zero",
+                            "comment_api_called": False,
+                            "source_api": zero_evidence["source_api"],
+                            "source_page": zero_evidence["source_page"],
+                            "source_observed_at": observed_at.isoformat()
+                            if hasattr(observed_at, "isoformat")
+                            else None,
+                            "zero_comment_evidence": zero_evidence,
+                        }
+                        committed_zero = await self.datastore.record_research_checkpoint(
                             run_id=run_id,
-                            generation=child.generation,
-                            parent_generation=task.generation,
+                            task_key=comment_task_key,
+                            page_number=1,
+                            task_type="full_scan_comments",
+                            scope_type="post_comments",
                             fid=fid,
                             fname=fname,
-                            rn=task.rn,
+                            tid=task.tid,
+                            parent_pid=post.pid,
+                            parent_kind=parent_kind,
+                            status="completed",
+                            scope_status="completed",
+                            attempts=0,
+                            has_more=None,
+                            next_page=None,
+                            total_pages=None,
+                            reported_count=0,
+                            page_item_count=None,
+                            continuation_json=continuation,
+                            reason="parent_api_explicit_zero",
+                            generation=child.generation,
+                            session=session,
                         )
+                        if committed_zero:
+                            await self.datastore.remove_pending_comment_scan_in_session(
+                                session,
+                                task.tid,
+                                post.pid,
+                                task_kind="full",
+                            )
+                            return
+
+                await self.datastore.add_pending_comment_scan_in_session(
+                    session,
+                    task.tid,
+                    post.pid,
+                    fid=fid,
+                    fname=fname,
+                    backfill=task.backfill,
+                )
+                child_tasks.append(
+                    FullScanCommentsTask(
+                        tid=task.tid,
+                        pid=post.pid,
+                        backfill=task.backfill,
+                        parent_kind=parent_kind,
+                        run_id=run_id,
+                        generation=child.generation,
+                        parent_generation=task.generation,
+                        fid=fid,
+                        fname=fname,
+                        rn=task.rn,
+                        pending_only=True,
                     )
+                )
+
+            for post in posts:
+                comments = list(post.comments)
+                await self.datastore.save_items_in_session(
+                    session,
+                    [Comment.from_dto(comment) for comment in comments],
+                )
+                await register_comment_scope(post, "reply_post")
 
             if first_pid > 0:
-                for post in page_posts:
-                    if _positive_int_id(getattr(post, "pid", None)) != first_pid:
-                        continue
-                    comments = list(post.comments)
+                first_post = next(
+                    (post for post in page.objs if _positive_int_id(getattr(post, "pid", None)) == first_pid),
+                    None,
+                )
+                if first_post is not None:
+                    comments = list(first_post.comments)
                     if comments:
                         await self.datastore.save_items_in_session(
                             session,
                             [Comment.from_dto(comment) for comment in comments],
                         )
-
-            if first_pid > 0:
-                fid = int(getattr(raw_thread, "fid", 0) or task.fid or page.forum.fid or 0)
-                fname = str(getattr(raw_thread, "fname", "") or task.fname or page.forum.fname or "")
-                child = await self.datastore.ensure_research_task_scope(
-                    run_id=run_id,
-                    logical_task_key=research_comments_task_key(task.tid, first_pid),
-                    task_type="full_scan_comments",
-                    scope_type="post_comments",
-                    fid=fid,
-                    fname=fname,
-                    tid=task.tid,
-                    parent_pid=first_pid,
-                    parent_kind="first_post",
-                    backfill=task.backfill,
-                    rn=task.rn,
-                    parent_logical_task_key=logical_key,
-                    parent_generation=task.generation,
-                    session=session,
-                )
-                if child is None:
-                    raise PageIntegrityError(
-                        f"Parent generation changed while registering first-post comments for tid={task.tid}."
+                    await register_comment_scope(first_post, "first_post")
+                else:
+                    fallback_first_post = SimpleNamespace(
+                        pid=first_pid,
+                        fid=task.fid or page.forum.fid,
+                        fname=task.fname or page.forum.fname,
                     )
-                if child.status != "completed":
-                    await self.datastore.add_pending_comment_scan_in_session(
-                        session,
-                        task.tid,
-                        first_pid,
-                        fid=fid,
-                        fname=fname,
-                        backfill=task.backfill,
-                    )
-                    child_tasks.append(
-                        FullScanCommentsTask(
-                            tid=task.tid,
-                            pid=first_pid,
-                            backfill=task.backfill,
-                            parent_kind="first_post",
-                            run_id=run_id,
-                            generation=child.generation,
-                            parent_generation=task.generation,
-                            fid=fid,
-                            fname=fname,
-                            rn=task.rn,
-                        )
+                    await register_comment_scope(
+                        fallback_first_post,
+                        "first_post",
+                        allow_zero_evidence=False,
                     )
 
             has_more = page.page.has_more
@@ -1708,8 +1818,12 @@ class FullScanPostsTaskHandler(TaskHandler):
             for post in posts:
                 await self.datastore.push_object_event("post", post)
         for child_task in child_tasks:
-            if not await self._enqueue_task_unless_stopping(Task(priority=parent_priority, content=child_task)):
+            if self._stop_requested():
                 break
+            try:
+                self.router.put_nowait(Task(priority=parent_priority, content=child_task))
+            except asyncio.QueueFull:
+                continue
         return True, child_tasks
 
     async def handle(self, task_content: FullScanPostsTask):
@@ -2585,6 +2699,34 @@ class FullScanCommentsTaskHandler(TaskHandler):
             return
 
         try:
+            if scope_managed:
+                claim = getattr(self.datastore, "claim_research_comments_scope", None)
+                if claim is not None:
+                    if not await claim(
+                        run_id=run_id,
+                        logical_task_key=logical_key,
+                        generation=generation,
+                        parent_logical_task_key=research_posts_task_key(tid),
+                        parent_generation=task_content.parent_generation,
+                        tid=tid,
+                        parent_pid=pid,
+                        pending_only=task_content.pending_only,
+                    ):
+                        return
+                elif task_content.pending_only:
+                    current_scope = await self.datastore.get_research_task_scope_state(run_id, logical_key)
+                    parent_scope = await self.datastore.get_research_task_scope_state(
+                        run_id, research_posts_task_key(tid)
+                    )
+                    if (
+                        current_scope is None
+                        or current_scope[0] != generation
+                        or current_scope[1] != "pending"
+                        or parent_scope is None
+                        or parent_scope[0] != task_content.parent_generation
+                        or current_scope[2] != parent_scope[0]
+                    ):
+                        return
             while True:
                 if self._stop_requested():
                     return

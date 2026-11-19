@@ -60,7 +60,7 @@ def make_research_container(tb_client):
     container = create_mock_container(tb_client)
     container.config.research_enabled = True
     container.config.research_max_api_retries = 1
-    container.config.cooldown_seconds_429 = 10
+    container.config.cooldown_seconds_429 = 5
     container.research_run_id = "synthetic-run"
     container.wait_for_research_ready = AsyncMock()
     container.wait_for_auth_refresh = AsyncMock()
@@ -162,6 +162,202 @@ async def test_full_scan_comments_keeps_pending_after_unexpected_empty_page():
     await handler.handle(FullScanCommentsTask(tid=1, pid=100, backfill=True))
 
     datastore.remove_pending_comment_scan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_snapshot_skips_scope_that_became_incomplete_before_lock():
+    states = {
+        "post_comments:9:100": iter([(6, "pending", 4), (6, "incomplete", 4)]),
+        "thread_replies:9": iter([(4, "running", None), (4, "running", None)]),
+    }
+
+    async def get_scope_state(_run_id, logical_key):
+        return next(states[logical_key])
+
+    datastore = SimpleNamespace(
+        get_research_task_scope_state=AsyncMock(side_effect=get_scope_state),
+        get_research_resume_state=AsyncMock(return_value=(1, "incomplete", None)),
+        claim_research_comments_scope=AsyncMock(return_value=False),
+    )
+    container = make_research_container(SimpleNamespace())
+    handler = FullScanCommentsTaskHandler(0, container, cast("Any", datastore), QueueRouter())
+    handler.get_comments = AsyncMock()
+
+    await handler.handle(
+        FullScanCommentsTask(
+            tid=9,
+            pid=100,
+            run_id="synthetic-run",
+            generation=6,
+            parent_generation=4,
+            pending_only=True,
+        )
+    )
+
+    handler.get_comments.assert_not_awaited()
+    assert datastore.claim_research_comments_scope.await_args.kwargs["pending_only"] is True
+    container.lock_manager.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_explicit_recovery_can_resume_incomplete_comment_scope():
+    datastore = SimpleNamespace(
+        get_research_task_scope_state=AsyncMock(
+            side_effect=[(6, "incomplete", 4), (4, "running", None)]
+        ),
+        get_research_resume_state=AsyncMock(return_value=(1, "incomplete", None)),
+        claim_research_comments_scope=AsyncMock(return_value=True),
+    )
+    container = make_research_container(SimpleNamespace())
+    handler = FullScanCommentsTaskHandler(0, container, cast("Any", datastore), QueueRouter())
+    handler.get_comments = AsyncMock(side_effect=asyncio.CancelledError)
+
+    with pytest.raises(asyncio.CancelledError):
+        await handler.handle(
+            FullScanCommentsTask(tid=9, pid=100, run_id="synthetic-run", generation=6, parent_generation=4)
+        )
+
+    handler.get_comments.assert_awaited_once_with(9, 100, 1)
+    assert datastore.claim_research_comments_scope.await_args.kwargs["pending_only"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("checkpoint_exists", "include_evidence", "expect_skip"),
+    [(False, True, True), (True, True, False), (False, False, False)],
+)
+async def test_posts_page_completes_only_new_child_with_verified_zero_evidence(
+    monkeypatch, checkpoint_exists, include_evidence, expect_skip
+):
+    post = make_post(pid=101, tid=9, fid=10, floor=2, reply_num=0)
+    evidence = {
+        "tid": 9,
+        "pid": post.pid,
+        "fid": 10,
+        "author_user_id": post.author_id,
+        "reported_count": 0,
+        "count_field_present": True,
+        "source_api": "aiotieba.get_posts",
+        "evidence_kind": "protobuf_wire_explicit_zero",
+        "source_page": 1,
+        "count_field_path": "data.post_list.sub_post_number",
+        "count_wire_field_number": 13,
+    }
+    posts_page = make_posts_response([post], current_page=1, total_page=1)
+    response = ResearchPage(
+        raw=SimpleNamespace(thread=SimpleNamespace(pid=100, tid=9, fid=10, fname="bar")),
+        dto=posts_page,
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
+        zero_comment_evidence={post.pid: evidence} if include_evidence else {},
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def begin(self):
+            return self
+
+    session = Session()
+
+    class DataStore:
+        def async_sessionmaker(self):
+            return session
+
+        def __init__(self):
+            self.checkpoints = []
+            self.removed_pending = []
+            self.added_pending = []
+            self.push_object_event = AsyncMock()
+
+        async def get_research_task_scope_for_update(self, _session, _run_id, logical_key):
+            if logical_key == "thread_replies:9":
+                return SimpleNamespace(generation=4, status="running")
+            return SimpleNamespace(
+                generation=6,
+                status="pending",
+                parent_generation=4,
+                parent_logical_task_key="thread_replies:9",
+            )
+
+        async def save_items_in_session(self, *_args, **_kwargs):
+            return None
+
+        async def ensure_research_task_scope(self, **_kwargs):
+            return SimpleNamespace(
+                generation=6,
+                status="pending",
+                parent_generation=4,
+                parent_logical_task_key="thread_replies:9",
+            )
+
+        async def has_research_checkpoint_in_session(self, *_args):
+            return checkpoint_exists
+
+        async def record_research_checkpoint(self, **values):
+            self.checkpoints.append(values)
+            return True
+
+        async def remove_pending_comment_scan_in_session(self, _session, tid, pid, *, task_kind):
+            self.removed_pending.append((tid, pid, task_kind))
+
+        async def add_pending_comment_scan_in_session(self, _session, tid, pid, **_kwargs):
+            self.added_pending.append((tid, pid))
+
+        async def remove_pending_thread_scan_in_session(self, *_args):
+            return None
+
+    async def persist(_maker, _page, *, session, run_id=None):
+        assert session is datastore.async_sessionmaker()
+        assert run_id == "synthetic-run"
+
+    monkeypatch.setattr("src.research.persistence.persist_research_page", persist)
+    datastore = DataStore()
+    handler = FullScanPostsTaskHandler(
+        0,
+        make_research_container(SimpleNamespace()),
+        cast("Any", datastore),
+        QueueRouter(),
+    )
+    handler.ensure_users = AsyncMock()
+    handler._prepare_research_page = AsyncMock()
+    handler._enqueue_missing_web_targets = AsyncMock()
+
+    committed, children = await handler._commit_research_posts_page(
+        FullScanPostsTask(tid=9, run_id="synthetic-run", generation=4, fid=10, fname="bar"),
+        posts_page,
+        response,
+        page_number=1,
+        cursor={},
+        attempts=1,
+    )
+
+    assert committed is True
+    comment_checkpoints = [item for item in datastore.checkpoints if item["scope_type"] == "post_comments"]
+    if expect_skip:
+        assert children == []
+        assert datastore.added_pending == []
+        assert datastore.removed_pending == [(9, 101, "full")]
+        assert len(comment_checkpoints) == 1
+        checkpoint = comment_checkpoints[0]
+        assert checkpoint["status"] == checkpoint["scope_status"] == "completed"
+        assert checkpoint["attempts"] == 0
+        assert checkpoint["reason"] == "parent_api_explicit_zero"
+        assert checkpoint["has_more"] is None
+        assert checkpoint["next_page"] is None
+        assert checkpoint["total_pages"] is None
+        assert checkpoint["page_item_count"] is None
+        assert checkpoint["continuation_json"]["comment_api_called"] is False
+        assert checkpoint["continuation_json"]["zero_comment_evidence"] == evidence
+    else:
+        assert [(child.pid, child.generation) for child in children] == [(101, 6)]
+        assert datastore.added_pending == [(9, 101)]
+        assert datastore.removed_pending == []
+        assert comment_checkpoints == []
 
 
 @pytest.mark.asyncio
@@ -557,7 +753,12 @@ async def test_managed_page_head_reply_reuses_canonical_first_post_scope(monkeyp
             assert session is self.session
             assert parent_generation == 4
             events.append(("ensure_child", logical_task_key, kwargs["parent_kind"]))
-            return SimpleNamespace(generation=0, status="pending")
+            return SimpleNamespace(
+                generation=0,
+                status="pending",
+                parent_generation=4,
+                parent_logical_task_key="thread_replies:9",
+            )
 
         async def add_pending_comment_scan_in_session(self, session, tid, pid, **_kwargs):
             assert session is self.session
@@ -631,16 +832,25 @@ async def test_managed_page_head_reply_reuses_canonical_first_post_scope(monkeyp
         observed_at=datetime.now(UTC),
         source_api="aiotieba.get_posts",
     )
-    page3_router = QueueRouter()
+    page3_router = QueueRouter(maxsize=1)
+    page3_router.put_nowait(
+        Task(
+            priority=Priority.LOW,
+            content=FullScanCommentsTask(tid=99, pid=999, backfill=True),
+        )
+    )
     handler.router = page3_router
     event_count_before_page3 = len(events)
-    committed_page3, children_page3 = await handler._commit_research_posts_page(
-        task,
-        page3,
-        page3_response,
-        page_number=3,
-        cursor={"last_pid": 200},
-        attempts=1,
+    committed_page3, children_page3 = await asyncio.wait_for(
+        handler._commit_research_posts_page(
+            task,
+            page3,
+            page3_response,
+            page_number=3,
+            cursor={"last_pid": 200},
+            attempts=1,
+        ),
+        timeout=1,
     )
     page3_events = events[event_count_before_page3:]
 
@@ -668,6 +878,8 @@ async def test_managed_page_head_reply_reuses_canonical_first_post_scope(monkeyp
     assert ("ensure_child", "post_comments:9:100", "reply_post") not in page3_events
     assert ("ensure_child", "post_comments:9:100", "first_post") in page3_events
     assert datastore.checkpoint["reported_count_missing_reason"] == "not_provided_by_aiotieba_posts_page"
+    assert len(children_page3) == 1
+    assert page3_router.comments_queue.qsize() == 1
     assert {(child.pid, child.parent_kind) for child in children_page1} == {
         (100, "first_post"),
         (150, "reply_post"),
@@ -683,7 +895,7 @@ async def test_managed_page_head_reply_reuses_canonical_first_post_scope(monkeyp
     )
     assert len(router.comments_queue._q._queue) == 3
     assert [(item.content.pid, item.content.parent_kind) for item in page3_router.comments_queue._q._queue] == [
-        (100, "first_post")
+        (999, None)
     ]
 
 
@@ -928,7 +1140,12 @@ async def test_inflight_old_comment_worker_cannot_erase_refreshed_child_scope(mo
             self.checkpoints = {}
             self.scopes = {
                 "thread_replies:9": {"generation": 0, "status": "running", "parent_generation": None},
-                "post_comments:9:500": {"generation": 0, "status": "running", "parent_generation": 0},
+                "post_comments:9:500": {
+                    "generation": 0,
+                    "status": "running",
+                    "parent_generation": 0,
+                    "parent_logical_task_key": "thread_replies:9",
+                },
             }
             self.async_sessionmaker = FakeSession
 
@@ -957,7 +1174,12 @@ async def test_inflight_old_comment_worker_cannot_erase_refreshed_child_scope(mo
                 return None
             state = self.scopes.setdefault(
                 logical_task_key,
-                {"generation": 0, "status": "pending", "parent_generation": parent_generation},
+                {
+                    "generation": 0,
+                    "status": "pending",
+                    "parent_generation": parent_generation,
+                    "parent_logical_task_key": parent_logical_task_key,
+                },
             )
             return SimpleNamespace(**state)
 
@@ -1169,7 +1391,6 @@ async def test_exhausted_rate_limit_retries_leave_shared_research_network_gate_o
     )
     container = make_research_container(tb_client)
     container.config.research_max_api_retries = 2
-    container.config.cooldown_seconds_429 = 10
     datastore = SimpleNamespace(
         set_research_run_status_if=AsyncMock(return_value=True),
         resume_research_run_if_status=AsyncMock(return_value=True),
@@ -1187,7 +1408,7 @@ async def test_exhausted_rate_limit_retries_leave_shared_research_network_gate_o
     assert error.value.code == error_code
     assert tb_client.get_threads_research.await_count == 2
     assert container.wait_for_rate_limit.await_count == 2
-    container.wait_for_rate_limit.assert_awaited_with(10, run_id="synthetic-run")
+    container.wait_for_rate_limit.assert_awaited_with(5, run_id="synthetic-run")
     container.block_research_network.assert_not_awaited()
     assert datastore.set_research_run_status_if.await_args_list[-1].args[1:3] == (
         {"running", "paused_auth", "paused_rate_limit"},
@@ -1201,7 +1422,7 @@ async def test_user_stop_interrupts_rate_limit_cooldown_without_retry(error_code
     cooldown_started = asyncio.Event()
 
     async def wait_for_cooldown(seconds, *, run_id):
-        assert seconds == 10
+        assert seconds == 5
         assert run_id == "synthetic-run"
         cooldown_started.set()
         await asyncio.Future()
@@ -1233,7 +1454,7 @@ async def test_user_stop_interrupts_rate_limit_cooldown_without_retry(error_code
         await asyncio.wait_for(request, timeout=1)
 
     tb_client.get_posts_research.assert_awaited_once()
-    container.wait_for_rate_limit.assert_awaited_once_with(10, run_id="synthetic-run")
+    container.wait_for_rate_limit.assert_awaited_once_with(5, run_id="synthetic-run")
     datastore.record_research_checkpoint.assert_not_awaited()
     datastore.resume_research_run_if_status.assert_not_awaited()
 
@@ -1249,7 +1470,6 @@ async def test_auth_refresh_frequency_limit_cools_down_without_blocking_network(
         )
     )
     container = make_research_container(tb_client)
-    container.config.cooldown_seconds_429 = 10
 
     async def run_callback(callback, **_kwargs):
         return await callback()
@@ -1270,7 +1490,7 @@ async def test_auth_refresh_frequency_limit_cools_down_without_blocking_network(
         await handler.get_threads("bar", pn=1)
 
     assert error.value.code == 220034
-    container.wait_for_rate_limit.assert_awaited_once_with(10, run_id="synthetic-run")
+    container.wait_for_rate_limit.assert_awaited_once_with(5, run_id="synthetic-run")
     container.block_research_network.assert_not_awaited()
     assert datastore.set_research_run_status_if.await_args_list[-1].args[1:3] == (
         {"paused_auth"},
@@ -1305,7 +1525,6 @@ async def test_empty_terminal_page_resets_shared_suspicious_envelope_streak():
         )
     )
     container = make_research_container(tb_client)
-    container.config.cooldown_seconds_429 = 10
     handler = ThreadsTaskHandler(
         worker_id=0,
         container=container,
@@ -1325,7 +1544,7 @@ async def test_empty_terminal_page_resets_shared_suspicious_envelope_streak():
     assert container.wait_for_rate_limit.await_count == 0
     with pytest.raises(PageIntegrityError, match="missing or has zero page identity"):
         await handler.get_threads("bar", pn=1)
-    container.wait_for_rate_limit.assert_awaited_once_with(10, run_id="synthetic-run")
+    container.wait_for_rate_limit.assert_awaited_once_with(5, run_id="synthetic-run")
 
 
 @pytest.mark.asyncio
@@ -1367,7 +1586,7 @@ async def test_invalid_reply_page_does_not_reset_shared_suspicious_empty_streak(
     with pytest.raises(PageIntegrityError, match="missing or has zero page identity"):
         await handler.get_threads("bar", pn=1)
 
-    container.wait_for_rate_limit.assert_awaited_once_with(10, run_id="synthetic-run")
+    container.wait_for_rate_limit.assert_awaited_once_with(5, run_id="synthetic-run")
 
 
 @pytest.mark.asyncio
@@ -1385,7 +1604,6 @@ async def test_empty_page_missing_requested_forum_identity_counts_as_suspicious(
         )
     )
     container = make_research_container(tb_client)
-    container.config.cooldown_seconds_429 = 10
     handler = ThreadsTaskHandler(
         worker_id=0,
         container=container,

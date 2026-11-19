@@ -205,6 +205,7 @@ class FullScanCommentsTask:
     fid: int | None = None
     fname: str | None = None
     rn: int = 30
+    pending_only: bool = False
 
     @property
     def unique_key(self) -> object:

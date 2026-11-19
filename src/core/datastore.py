@@ -659,6 +659,19 @@ class DataStore:
                 generation=generation,
             )
 
+    async def has_research_checkpoint_in_session(
+        self,
+        session: AsyncSession,
+        run_id: str,
+        task_key: str,
+    ) -> bool:
+        result = await session.execute(
+            select(ResearchCheckpoint.page_number)
+            .where(ResearchCheckpoint.run_id == run_id, ResearchCheckpoint.task_key == task_key)
+            .limit(1)
+        )
+        return result.first() is not None
+
     async def _record_research_checkpoint_in_session(
         self,
         session: AsyncSession,
@@ -731,6 +744,50 @@ class DataStore:
             )
             row = result.one_or_none()
         return None if row is None else (row.generation, row.status, row.parent_generation)
+
+    async def claim_research_comments_scope(
+        self,
+        *,
+        run_id: str,
+        logical_task_key: str,
+        generation: int,
+        parent_logical_task_key: str,
+        parent_generation: int,
+        tid: int,
+        parent_pid: int,
+        pending_only: bool,
+    ) -> bool:
+        """Atomically claim one comment scope after locking its parent first."""
+        async with self.async_sessionmaker() as session, session.begin():
+            parent = await self.get_research_task_scope_for_update(
+                session,
+                run_id,
+                parent_logical_task_key,
+            )
+            if parent is None or parent.generation != parent_generation:
+                return False
+            scope = await self.get_research_task_scope_for_update(session, run_id, logical_task_key)
+            if (
+                scope is None
+                or scope.generation != generation
+                or scope.scope_type != "post_comments"
+                or scope.task_type != "full_scan_comments"
+                or scope.tid != tid
+                or scope.parent_pid != parent_pid
+                or scope.parent_logical_task_key != parent_logical_task_key
+                or scope.parent_generation != parent_generation
+                or scope.status in {"completed", "blocked"}
+                or (pending_only and scope.status != "pending")
+                or (
+                    not pending_only
+                    and scope.status
+                    not in {"pending", "running", "incomplete", "paused_auth", "paused_rate_limit"}
+                )
+            ):
+                return False
+            scope.status = "running"
+            scope.last_checked = datetime.now(UTC)
+            return True
 
     async def ensure_research_task_scope(
         self,
@@ -888,12 +945,15 @@ class DataStore:
         batch_size: int = 500,
         tid: int | None = None,
         limit: int | None = None,
+        scope_type: Literal["post_comments", "thread_replies"] | None = None,
+        status: str | None = None,
     ) -> AsyncIterator[list[ResearchTaskScope]]:
-        """Yield current non-completed detail scopes in bounded, comments-first batches.
+        """Yield current detail scopes in bounded, comments-first batches.
 
         Optional ``tid`` and ``limit`` filters are applied by SQL. ``limit`` is
         shared across both scope types and preserves the existing comments-first
-        ordering.
+        ordering. Without ``status``, all non-completed scopes are returned for
+        startup recovery; a supplied status selects only that state.
         """
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -904,7 +964,8 @@ class DataStore:
         if not responsible_fids:
             return
         yielded = 0
-        for scope_type in ("post_comments", "thread_replies"):
+        scope_types = (scope_type,) if scope_type is not None else ("post_comments", "thread_replies")
+        for current_scope_type in scope_types:
             if limit is not None and yielded >= limit:
                 break
             last_key = ""
@@ -913,11 +974,15 @@ class DataStore:
                 async with self.async_sessionmaker() as session:
                     filters = [
                         ResearchTaskScope.run_id == run_id,
-                        ResearchTaskScope.scope_type == scope_type,
-                        ResearchTaskScope.status != "completed",
+                        ResearchTaskScope.scope_type == current_scope_type,
                         ResearchTaskScope.fid.in_(responsible_fids),
                         ResearchTaskScope.logical_task_key > last_key,
                     ]
+                    filters.append(
+                        ResearchTaskScope.status == status
+                        if status is not None
+                        else ResearchTaskScope.status != "completed"
+                    )
                     if tid is not None:
                         filters.append(ResearchTaskScope.tid == tid)
                     result = await session.execute(
@@ -1345,6 +1410,10 @@ class DataStore:
             row = result.scalar_one_or_none()
         if row is None:
             return 1, None, None
+        if row.status == "completed" and (row.continuation_json or {}).get("completion_basis") == (
+            "parent_api_explicit_zero"
+        ):
+            return None, row.scope_status or "completed", row.continuation_json
         if row.status == "completed" and row.has_more is False:
             return None, row.scope_status or "completed", row.continuation_json
         if row.status == "completed":

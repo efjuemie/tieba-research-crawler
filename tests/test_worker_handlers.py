@@ -164,7 +164,7 @@ async def test_user_forum_frequency_limit_cools_down_without_blocking_network(mo
             fetch_user_forum_info=True,
             research_max_api_retries=1,
             research_retry_wait_seconds=0,
-            cooldown_seconds_429=10,
+            cooldown_seconds_429=5,
         ),
     )
     container.async_sessionmaker = object()
@@ -192,7 +192,7 @@ async def test_user_forum_frequency_limit_cools_down_without_blocking_network(mo
 
     assert error.value.code == 220034
     assert persisted == [("aiotieba.get_user_forum_info", None)]
-    container.wait_for_rate_limit.assert_awaited_once_with(10, run_id="synthetic-run")
+    container.wait_for_rate_limit.assert_awaited_once_with(5, run_id="synthetic-run")
     datastore.set_research_run_status_if.assert_awaited_once()
     assert datastore.set_research_run_status_if.await_args.args[2] == "paused_rate_limit"
     datastore.resume_research_run_if_status.assert_awaited_once_with("synthetic-run", "paused_rate_limit")

@@ -139,7 +139,9 @@ uv run python -m src.research web-audit --run-id YOUR_RUN_ID --target-type post 
 uv run python -m src.research export --entity-scope completed-threads
 ```
 
-网页任务默认每个目标只访问一个直接定位页面，最多自然展开十次，单目标超时 90 秒（允许配置上限 120 秒）。`[web_fallback]` 中显式配置较低的 `max_expansions` 或 `timeout_seconds` 会保留低值。API 默认 0.5 次请求机会/秒，WEB 浏览器独立使用 0.2 次/秒；API 遇到 429/220034 或连续三次异常空响应会冷却 10 秒后按次数上限继续。每个持久网页目标最多尝试三次，失败或部分完成后的等待为 3 秒、5 秒，耗尽后仍保留数据库记录。网页端登录／验证需按提示人工确认，浏览器端遇到 429 不自动恢复。执行前运行 `uv sync` 和 `uv run playwright install chromium`；正式 `field-backfill` 在去掉 `--dry-run` 后也需传专用 `--browser-profile`；需要手工验证时加 `--headed --wait-for-login`。登录在当前官方页面完成，不复制 Cookie。等待计入命令运行时限。
+网页任务默认每个目标只访问一个直接定位页面，最多自然展开十次，单目标超时 90 秒（允许配置上限 120 秒）。`[web_fallback]` 中显式配置较低的 `max_expansions` 或 `timeout_seconds` 会保留低值。API 默认 0.5 次请求机会/秒，按 `threads → posts → posts → comments` 轮转；三条通道都有请求时按 1:2:1 分配，空通道让位。评论队列满时，数据库中的 pending scope 会保留并由 dispatcher 在有空位后继续投递。WEB 浏览器独立使用 0.2 次/秒；API 遇到 429/220034 或连续三次异常空响应会冷却 5 秒后按次数上限继续。每个持久网页目标最多尝试三次，失败或部分完成后的等待为 3 秒、5 秒，耗尽后仍保留数据库记录。网页端登录／验证需按提示人工确认，浏览器端遇到 429 不自动恢复。执行前运行 `uv sync` 和 `uv run playwright install chromium`；正式 `field-backfill` 在去掉 `--dry-run` 后也需传专用 `--browser-profile`；需要手工验证时加 `--headed --wait-for-login`。登录在当前官方页面完成，不复制 Cookie。等待计入命令运行时限。
+
+`get_posts` 附带评论通常仍通过 `get_comments` 独立分页。只有原始 protobuf 明确报告楼中楼数为零，且主题、论坛、父楼、作者和页码身份匹配时，程序才跳过该父楼的评论请求，并把证据来源写入 checkpoint；没有原始响应、数据不完整或身份不匹配时仍正常请求评论。
 
 `drain-pending` 不发现新主题。`field-backfill` 通常等待 API 详情范围完成；有当前 run／generation、精确身份、水位和类型化完整内容标记的目标可在 scope 完成前补采元数据。列表来源主题仅在 TID/FID、作者 UID 和首楼证据明确时开放作者元数据补采；未经验证的 legacy 记录仍不可跳过 API 详情。当前用户资料可使用 `user-backfill --profile --forum --bawu` 单独补充，不能倒填为历史发表属性。完整条件、参数和数据范围见 [README](../README.md) 与[架构说明](ARCHITECTURE.md)。
 
