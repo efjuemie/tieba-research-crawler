@@ -28,6 +28,7 @@ from tiebameow.client.tieba_client import RetriableApiError, UnretriableApiError
 from tiebameow.models.orm import Comment, Post, User
 from tiebameow.utils.logger import logger
 
+from ..core.error_codes import normalize_checkpoint_error_code
 from ..core.metrics import (
     ACTIVE_WORKERS,
     API_REQUEST_DURATION,
@@ -907,6 +908,39 @@ class TaskHandler(ABC):
             comment_ids=comment_ids,
         )
 
+    async def _enqueue_missing_web_targets_after_commit(
+        self,
+        run_id: str | None,
+        *,
+        task_type: str,
+        tid: int,
+        page_number: int,
+        parent_pid: int | None = None,
+        thread_ids: Sequence[int] = (),
+        post_ids: Sequence[int] = (),
+        comment_ids: Sequence[int] = (),
+    ) -> None:
+        try:
+            await self._enqueue_missing_web_targets(
+                run_id,
+                thread_ids=thread_ids,
+                post_ids=post_ids,
+                comment_ids=comment_ids,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.log.warning(
+                "WEB enqueue failed after committed API page; canonical missing-target discovery can recover it "
+                "(run_id={} task_type={} tid={} parent_pid={} page={} error_type={})",
+                run_id,
+                task_type,
+                tid,
+                parent_pid,
+                page_number,
+                type(error).__name__,
+            )
+
     @staticmethod
     def _continuation_from_page(
         page_ids: list[int], previous: dict[str, object] | None, *, has_more: bool
@@ -965,31 +999,51 @@ class TaskHandler(ABC):
         generation: int | None = None,
     ) -> None:
         if run_id:
-            error_code = getattr(error, "code", None)
+            error_code = normalize_checkpoint_error_code(getattr(error, "code", None))
+            self.log.error(
+                "Original operation failed (type={} numeric_error_code={} "
+                "run_id={} task_type={} scope_type={} page={})",
+                type(error).__name__,
+                error_code,
+                run_id,
+                task_type,
+                scope_type,
+                page_number,
+            )
             status = {
                 4011: "paused_auth",
                 429: "failed",
                 220034: "failed",
             }.get(error_code, "blocked" if error_code == 4 else "failed")
             scope_status = status if status in {"paused_auth", "paused_rate_limit", "blocked"} else "incomplete"
-            current_generation = await self.datastore.record_research_checkpoint(
-                run_id=run_id,
-                task_key=task_key,
-                page_number=page_number,
-                task_type=task_type,
-                scope_type=scope_type,
-                tid=tid,
-                parent_pid=parent_pid,
-                parent_kind=parent_kind,
-                status=status,
-                scope_status=scope_status,
-                next_page=page_number,
-                error_type=type(error).__name__,
-                error_code=error_code,
-                reason="content_unavailable" if error_code == 4 else type(error).__name__,
-                continuation_json=continuation_json,
-                generation=generation,
-            )
+            try:
+                current_generation = await self.datastore.record_research_checkpoint(
+                    run_id=run_id,
+                    task_key=task_key,
+                    page_number=page_number,
+                    task_type=task_type,
+                    scope_type=scope_type,
+                    tid=tid,
+                    parent_pid=parent_pid,
+                    parent_kind=parent_kind,
+                    status=status,
+                    scope_status=scope_status,
+                    next_page=page_number,
+                    error_type=type(error).__name__,
+                    error_code=error_code,
+                    reason="content_unavailable" if error_code == 4 else type(error).__name__,
+                    continuation_json=continuation_json,
+                    generation=generation,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as checkpoint_error:
+                self.log.error(
+                    "Failure checkpoint persistence failed (original_type={} checkpoint_type={})",
+                    type(error).__name__,
+                    type(checkpoint_error).__name__,
+                )
+                raise
             if generation is not None and not current_generation:
                 return
             if error_code not in {4011, 429, 220034}:
@@ -1806,8 +1860,11 @@ class FullScanPostsTaskHandler(TaskHandler):
             if committed and not has_more:
                 await self.datastore.remove_pending_thread_scan_in_session(session, task.tid)
 
-        await self._enqueue_missing_web_targets(
+        await self._enqueue_missing_web_targets_after_commit(
             run_id,
+            task_type="posts",
+            tid=task.tid,
+            page_number=page_number,
             thread_ids=(task.tid,) if first_pid > 0 else (),
             post_ids=tuple(post.pid for post in posts),
         )
@@ -2634,8 +2691,12 @@ class FullScanCommentsTaskHandler(TaskHandler):
                     session, task.tid, task.pid, task_kind="full"
                 )
 
-        await self._enqueue_missing_web_targets(
+        await self._enqueue_missing_web_targets_after_commit(
             run_id,
+            task_type="comments",
+            tid=task.tid,
+            parent_pid=task.pid,
+            page_number=page_number,
             comment_ids=tuple(comment.cid for comment in page.objs),
         )
         return committed

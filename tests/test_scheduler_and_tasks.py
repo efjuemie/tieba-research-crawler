@@ -314,6 +314,97 @@ async def test_scheduler_preserves_rate_limit_pause_when_stream_fails():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sort_mode", "raw_code", "expected_error_code", "expected_status", "expected_scope_status"),
+    [
+        ("create", "rvf5", None, "failed", "incomplete"),
+        ("reply", [], None, "failed", "incomplete"),
+        ("create", 4011, 4011, "paused_auth", "paused_auth"),
+        ("reply", 429, 429, "paused_rate_limit", "paused_rate_limit"),
+        ("create", 220034, 220034, "blocked", "blocked"),
+        ("reply", 4, 4, "failed", "incomplete"),
+    ],
+)
+async def test_scheduler_normalizes_checkpoint_error_code_without_changing_api_status_mapping(
+    sort_mode, raw_code, expected_error_code, expected_status, expected_scope_status
+):
+    class CodedError(Exception):
+        code = raw_code
+
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(
+        config=DummyConfig(mode="backfill", max_backfill_pages=0),
+        forums=[DummyForum(1, "synthetic")],
+    )
+    container.config.research_enabled = True
+    container.research_run_id = "synthetic-run"
+    checkpoints = []
+    datastore = SimpleNamespace(
+        get_research_list_checkpoint_states=AsyncMock(return_value={}),
+        record_research_checkpoint=AsyncMock(side_effect=lambda **kwargs: checkpoints.append(kwargs)),
+        set_research_run_status_if=AsyncMock(return_value=True),
+    )
+    scheduler = Scheduler(router, container, cast("Any", datastore), backfill_sort=sort_mode)  # type: ignore[arg-type]
+
+    async def fail_page(*_args, **_kwargs):
+        raise CodedError("synthetic list failure")
+
+    scheduler._scan_backfill_page = fail_page  # type: ignore[method-assign]
+    with pytest.raises(BackfillIncompleteError):
+        await scheduler._run_backfill()
+
+    checkpoint = checkpoints[0]
+    assert checkpoint["error_code"] == expected_error_code
+    assert checkpoint["status"] == expected_status
+    assert checkpoint["scope_status"] == expected_scope_status
+    assert checkpoint["sort_mode"] == sort_mode
+    assert checkpoint["task_key"] == research_thread_list_task_key(
+        1,
+        False,
+        sort_mode,
+        100 if sort_mode == "reply" else 30,
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reads_exception_code_once_for_classification_and_checkpoint():
+    class ChangingCodeError(Exception):
+        def __init__(self):
+            self.reads = 0
+
+        @property
+        def code(self):
+            self.reads += 1
+            return "rvf5" if self.reads == 1 else 429
+
+    error = ChangingCodeError()
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(
+        config=DummyConfig(mode="backfill", max_backfill_pages=0),
+        forums=[DummyForum(1, "synthetic")],
+    )
+    container.research_run_id = "synthetic-run"
+    checkpoints = []
+    datastore = SimpleNamespace(
+        get_research_list_checkpoint_states=AsyncMock(return_value={}),
+        record_research_checkpoint=AsyncMock(side_effect=lambda **kwargs: checkpoints.append(kwargs)),
+        set_research_run_status_if=AsyncMock(return_value=True),
+    )
+    scheduler = Scheduler(router, container, cast("Any", datastore))  # type: ignore[arg-type]
+
+    async def fail_page(*_args, **_kwargs):
+        raise error
+
+    scheduler._scan_backfill_page = fail_page  # type: ignore[method-assign]
+    with pytest.raises(BackfillIncompleteError):
+        await scheduler._run_backfill()
+
+    assert error.reads == 1
+    assert checkpoints[0]["error_code"] is None
+    assert checkpoints[0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_scheduler_leaves_run_resumable_after_list_pages_before_detail_drain():
     router = QueueRouter(maxsize=1)
     container = DummyContainer(config=DummyConfig(mode="backfill", max_backfill_pages=0), forums=[DummyForum(1, "bar")])

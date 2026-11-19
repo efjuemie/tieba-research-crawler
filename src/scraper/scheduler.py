@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Literal
 
 from tiebameow.utils.logger import logger
 
+from ..core.error_codes import normalize_checkpoint_error_code
 from ..core.metrics import BACKFILL_FORUMS_COUNT, PERIODIC_FORUMS_COUNT
 from ..core.models import (
     REPLY_BACKFILL_CONTRACT_VERSION,
@@ -383,7 +384,7 @@ class Scheduler:
                     failure = f"forum={forum.fname} is_good={is_good} pn={pn} error={type(exc).__name__}"
                     failures.append(failure)
                     logger.error("Backfill list stream paused: {}", failure)
-                    error_code = getattr(exc, "code", None)
+                    error_code = normalize_checkpoint_error_code(getattr(exc, "code", None))
                     pause_status = {4011: "paused_auth", 429: "paused_rate_limit", 220034: "blocked"}.get(error_code)
                     if run_id and self.datastore is not None:
                         checkpoint_cursor = {
@@ -415,7 +416,7 @@ class Scheduler:
                             scope_status=pause_status or "incomplete",
                             next_page=pn,
                             error_type=type(exc).__name__,
-                            error_code=getattr(exc, "code", None),
+                            error_code=error_code,
                             reason=type(exc).__name__,
                             continuation_json=checkpoint_cursor,
                         )

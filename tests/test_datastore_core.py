@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 from conftest import make_thread
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import InterfaceError
 from tiebameow.models.dto import BaseThreadDTO, ThreadDTO, ThreadUserDTO
 
 from src.core.config import ConsumerConfig
@@ -617,3 +618,118 @@ async def test_comment_scope_claim_serializes_parent_before_child(monkeypatch, s
     assert claimed is expected
     assert locked_keys == ["thread_replies:9", "post_comments:9:100"]
     assert scope.status == ("running" if expected else status)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw_code",
+    [
+        "rvf5",
+        "429",
+        True,
+        429.0,
+        [],
+        {},
+        2**31,
+        -(2**31) - 1,
+    ],
+    ids=["sqlalchemy-doc-code", "numeric-string", "bool", "float", "list", "mapping", "overflow", "underflow"],
+)
+@pytest.mark.parametrize("caller_owned", [False, True], ids=["owned-session", "caller-session"])
+async def test_record_checkpoint_normalizes_invalid_error_code_before_persistence(
+    monkeypatch, raw_code, caller_owned
+):
+    datastore = DataStore.__new__(DataStore)
+    values_seen = []
+
+    async def record(_session, *, values, **_kwargs):
+        values_seen.append(values)
+        return True
+
+    monkeypatch.setattr(datastore, "_record_research_checkpoint_in_session", record)
+
+    class Session:
+        def __init__(self):
+            self.entered = 0
+            self.exited = 0
+            self.begin_called = 0
+            self.commit_called = 0
+            self.rollback_called = 0
+
+        def __call__(self):
+            return self
+
+        def begin(self):
+            self.begin_called += 1
+            return self
+
+        async def __aenter__(self):
+            self.entered += 1
+            return self
+
+        async def __aexit__(self, *_args):
+            self.exited += 1
+            return False
+
+        async def commit(self):
+            self.commit_called += 1
+
+        async def rollback(self):
+            self.rollback_called += 1
+
+    owned_session = Session()
+    datastore.async_sessionmaker = owned_session
+    caller_session = object()
+    result = await datastore.record_research_checkpoint(
+        run_id="synthetic-run",
+        task_key="post_comments:9:100:g2",
+        page_number=1,
+        task_type="full_scan_comments",
+        scope_type="post_comments",
+        status="failed",
+        scope_status="incomplete",
+        error_type="InterfaceError",
+        error_code=raw_code,
+        generation=2,
+        session=caller_session if caller_owned else None,
+    )
+
+    assert result is True
+    assert values_seen[0]["error_code"] is None
+    assert values_seen[0]["error_type"] == "InterfaceError"
+    assert owned_session.commit_called == owned_session.rollback_called == 0
+    if caller_owned:
+        assert owned_session.entered == owned_session.exited == owned_session.begin_called == 0
+    else:
+        assert owned_session.entered == owned_session.exited == 2
+        assert owned_session.begin_called == 1
+
+
+@pytest.mark.asyncio
+async def test_real_sqlalchemy_interface_error_code_is_not_passed_to_checkpoint_as_string(monkeypatch):
+    error = InterfaceError("UPDATE research_checkpoint", {}, RuntimeError("synthetic"), code="rvf5")
+    assert error.code == "rvf5"
+
+    datastore = DataStore.__new__(DataStore)
+    values_seen = []
+
+    async def record(_session, *, values, **_kwargs):
+        values_seen.append(values)
+        return True
+
+    monkeypatch.setattr(datastore, "_record_research_checkpoint_in_session", record)
+    await datastore.record_research_checkpoint(
+        run_id="synthetic-run",
+        task_key="post_comments:9:100:g2",
+        page_number=3,
+        task_type="full_scan_comments",
+        scope_type="post_comments",
+        status="failed",
+        scope_status="incomplete",
+        error_type=type(error).__name__,
+        error_code=error.code,
+        session=object(),
+    )
+
+    assert values_seen[0]["error_type"] == "InterfaceError"
+    assert values_seen[0]["error_code"] is None

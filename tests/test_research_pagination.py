@@ -226,8 +226,9 @@ async def test_explicit_recovery_can_resume_incomplete_comment_scope():
     ("checkpoint_exists", "include_evidence", "expect_skip"),
     [(False, True, True), (True, True, False), (False, False, False)],
 )
+@pytest.mark.parametrize("enqueue_fails", [False, True])
 async def test_posts_page_completes_only_new_child_with_verified_zero_evidence(
-    monkeypatch, checkpoint_exists, include_evidence, expect_skip
+    monkeypatch, checkpoint_exists, include_evidence, expect_skip, enqueue_fails
 ):
     post = make_post(pid=101, tid=9, fid=10, floor=2, reply_num=0)
     evidence = {
@@ -325,7 +326,9 @@ async def test_posts_page_completes_only_new_child_with_verified_zero_evidence(
     )
     handler.ensure_users = AsyncMock()
     handler._prepare_research_page = AsyncMock()
-    handler._enqueue_missing_web_targets = AsyncMock()
+    handler._enqueue_missing_web_targets = AsyncMock(
+        side_effect=RuntimeError("synthetic postcommit enqueue error") if enqueue_fails else None
+    )
 
     committed, children = await handler._commit_research_posts_page(
         FullScanPostsTask(tid=9, run_id="synthetic-run", generation=4, fid=10, fname="bar"),
@@ -337,6 +340,7 @@ async def test_posts_page_completes_only_new_child_with_verified_zero_evidence(
     )
 
     assert committed is True
+    handler._enqueue_missing_web_targets.assert_awaited_once()
     comment_checkpoints = [item for item in datastore.checkpoints if item["scope_type"] == "post_comments"]
     if expect_skip:
         assert children == []

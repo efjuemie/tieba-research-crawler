@@ -21,6 +21,7 @@ from sqlalchemy.orm import aliased
 from tiebameow.models.orm import Comment, Forum, Post, Thread, User
 from tiebameow.utils.logger import logger
 
+from .error_codes import normalize_checkpoint_error_code
 from .metrics import CACHE_HITS, CACHE_MISSES, DB_OPERATIONS
 from .models import (
     REPLY_BACKFILL_CONTRACT_VERSION,
@@ -606,7 +607,7 @@ class DataStore:
         page_item_count: int | None = None,
         continuation_json: dict[str, object] | None = None,
         error_type: str | None = None,
-        error_code: int | None = None,
+        error_code: object = None,
         reason: str | None = None,
         generation: int | None = None,
         session: AsyncSession | None = None,
@@ -614,6 +615,13 @@ class DataStore:
         """Idempotently record one page state; all key columns are non-null."""
         if page_number < 1:
             raise ValueError("Checkpoint page_number must be positive.")
+        raw_error_code = error_code
+        error_code = normalize_checkpoint_error_code(raw_error_code)
+        if raw_error_code is not None and error_code is None:
+            logger.warning(
+                "Discarding invalid checkpoint error code (type={})",
+                type(raw_error_code).__name__,
+            )
         values = {
             "task_type": task_type,
             "scope_type": scope_type,

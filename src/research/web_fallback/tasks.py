@@ -10,7 +10,8 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from sqlalchemy import and_, select, text
+from sqlalchemy import and_, any_, bindparam, select, text
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -89,6 +90,13 @@ _THREAD_LIST_METADATA_FIELDS = frozenset(
         "ip_location_text",
     }
 )
+
+
+def _membership_predicate(column: Any, values: Any, *, use_postgres_array: bool) -> Any:
+    if use_postgres_array:
+        return column == any_(bindparam(None, value=list(values), type_=ARRAY(column.type)))
+    return column.in_(values)
+
 
 _TARGET_FIELDS: dict[str, frozenset[str]] = {
     "thread": frozenset(
@@ -599,6 +607,7 @@ async def enqueue_web_enrichment_tasks(
         run = await session.get(ResearchRun, run_id)
         if run is None:
             raise ValueError(f"Unknown research run: {run_id}.")
+        use_postgres_array = session.get_bind().dialect.name == "postgresql"
 
         scope_rows = (
             await session.scalars(
@@ -636,18 +645,26 @@ async def enqueue_web_enrichment_tasks(
             valid_tids = sorted(thread_scopes)
             stmt = None
             if current_type == "thread":
-                stmt = select(ResearchThread).where(ResearchThread.tid.in_(valid_tids))
+                stmt = select(ResearchThread).where(
+                    _membership_predicate(ResearchThread.tid, valid_tids, use_postgres_array=use_postgres_array)
+                )
                 if ids is not None:
-                    stmt = stmt.where(ResearchThread.tid.in_(ids))
+                    stmt = stmt.where(
+                        _membership_predicate(ResearchThread.tid, ids, use_postgres_array=use_postgres_array)
+                    )
                 if tid_filter is not None:
                     stmt = stmt.where(ResearchThread.tid == tid_filter)
                 if fid is not None:
                     stmt = stmt.where(ResearchThread.fid == fid)
                 stmt = stmt.order_by(ResearchThread.tid)
             elif current_type == "post":
-                stmt = select(ResearchPost).where(ResearchPost.tid.in_(valid_tids))
+                stmt = select(ResearchPost).where(
+                    _membership_predicate(ResearchPost.tid, valid_tids, use_postgres_array=use_postgres_array)
+                )
                 if ids is not None:
-                    stmt = stmt.where(ResearchPost.pid.in_(ids))
+                    stmt = stmt.where(
+                        _membership_predicate(ResearchPost.pid, ids, use_postgres_array=use_postgres_array)
+                    )
                 if tid_filter is not None:
                     stmt = stmt.where(ResearchPost.tid == tid_filter)
                 if fid is not None:
@@ -663,11 +680,17 @@ async def enqueue_web_enrichment_tasks(
                 tids = sorted({scope.tid for scope in possible_parent_scopes})
                 pids = sorted({scope.parent_pid for scope in possible_parent_scopes if scope.parent_pid is not None})
                 stmt = select(ResearchComment).where(
-                    ResearchComment.tid.in_(tids),
-                    ResearchComment.parent_post_pid.in_(pids),
+                    _membership_predicate(ResearchComment.tid, tids, use_postgres_array=use_postgres_array),
+                    _membership_predicate(
+                        ResearchComment.parent_post_pid,
+                        pids,
+                        use_postgres_array=use_postgres_array,
+                    ),
                 )
                 if ids is not None:
-                    stmt = stmt.where(ResearchComment.cid.in_(ids))
+                    stmt = stmt.where(
+                        _membership_predicate(ResearchComment.cid, ids, use_postgres_array=use_postgres_array)
+                    )
                 if tid_filter is not None:
                     stmt = stmt.where(ResearchComment.tid == tid_filter)
                 if fid is not None:
@@ -687,7 +710,11 @@ async def enqueue_web_enrichment_tasks(
                     await session.scalars(
                         select(ResearchContentObservation).where(
                             ResearchContentObservation.owner_type == marker_owner_type,
-                            ResearchContentObservation.owner_id.in_(entity_ids),
+                            _membership_predicate(
+                                ResearchContentObservation.owner_id,
+                                entity_ids,
+                                use_postgres_array=use_postgres_array,
+                            ),
                         )
                     )
                 ).all()
