@@ -193,6 +193,7 @@ async def test_posts_research_accepts_aiotieba_page_without_total_count(monkeypa
         has_prev=True,
     )
     assert page.source_api == "aiotieba.get_posts"
+    assert page.zero_comment_evidence == {}
     assert observed_before <= page.observed_at <= observed_after
     assert page.observed_at.tzinfo is UTC
     assert converter_calls == [raw]

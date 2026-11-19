@@ -292,9 +292,12 @@ class ResearchClient(Client):
         self.research_run_cache = research_run_cache or ResearchRunCache()
         self._research_get_posts_response_capture: _GetPostsResponseCapture | None = None
 
-    def _get_posts_response_capture(self) -> _GetPostsResponseCapture:
-        net_core = self._http_core.net_core
-        capture = self._research_get_posts_response_capture
+    def _get_posts_response_capture(self) -> _GetPostsResponseCapture | None:
+        http_core = getattr(self, "_http_core", None)
+        net_core = getattr(http_core, "net_core", None)
+        if not callable(getattr(net_core, "send", None)):
+            return None
+        capture = getattr(self, "_research_get_posts_response_capture", None)
         if capture is None or capture._net_core is not net_core:
             capture = _GetPostsResponseCapture(net_core)
             self._research_get_posts_response_capture = capture
@@ -342,21 +345,27 @@ class ResearchClient(Client):
         comment_rn: int = 4,
     ) -> ResearchPage[object, PostsDTO]:
         capture = self._get_posts_response_capture()
-        with capture.capture() as captured:
-            raw = await self.get_posts(
-                tid,
-                pn,
-                rn=rn,
-                sort=sort,
-                only_thread_author=only_thread_author,
-                with_comments=with_comments,
-                comment_sort_by_agree=comment_sort_by_agree,
-                comment_rn=comment_rn,
-            )
+        request = self.get_posts(
+            tid,
+            pn,
+            rn=rn,
+            sort=sort,
+            only_thread_author=only_thread_author,
+            with_comments=with_comments,
+            comment_sort_by_agree=comment_sort_by_agree,
+            comment_rn=comment_rn,
+        )
+        captured_body = None
+        if capture is None:
+            raw = await request
+        else:
+            with capture.capture() as captured:
+                raw = await request
+            captured_body = captured.body
         # aiotieba 4.8.2 Page_p does not expose total_count.
         dto = convert_aiotieba_posts(raw)
         zero_comment_evidence = extract_zero_comment_evidence(
-            captured.body,
+            captured_body,
             requested_tid=tid,
             source_page=pn,
             raw_page=raw,
