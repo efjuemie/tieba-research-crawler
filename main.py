@@ -1150,6 +1150,7 @@ async def main(
     backfill_sort: Literal["create", "reply"] | None = None,
     resume: bool = False,
     run_id: str | None = None,
+    revalidate_failed_comment_page_zero: bool = False,
 ):
     """统一入口，根据模式启动应用。
 
@@ -1160,7 +1161,10 @@ async def main(
     selected_backfill_sort = backfill_sort or "create"
     if backfill_sort is not None and mode != "backfill":
         raise ValueError("--backfill-sort can only be used with --mode backfill.")
+    if revalidate_failed_comment_page_zero and not resume:
+        raise ValueError("--revalidate-failed-comment-page-zero requires --resume.")
     container, router = await initialize_application(mode=mode)
+    container.revalidate_failed_comment_page_zero = revalidate_failed_comment_page_zero
 
     shutdown_event = asyncio.Event()
     restore_signal_handlers = _install_shutdown_signal_handlers(shutdown_event)
@@ -1590,6 +1594,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--resume", action="store_true", help="resume the latest compatible research run")
     parser.add_argument("--run-id", help="resume this exact run with --resume or drain-pending")
+    parser.add_argument(
+        "--revalidate-failed-comment-page-zero",
+        action="store_true",
+        help="on resume, recheck one stored parent page after a page-one comment identity failure",
+    )
     parser.add_argument("--tid", type=positive_int, help="limit drain-pending to this thread ID")
     parser.add_argument(
         "--limit",
@@ -1611,11 +1620,15 @@ if __name__ == "__main__":
             parser.error("--mode cannot be combined with drain-pending")
         if args.backfill_sort is not None:
             parser.error("--backfill-sort cannot be combined with drain-pending")
+        if args.revalidate_failed_comment_page_zero:
+            parser.error("--revalidate-failed-comment-page-zero cannot be combined with drain-pending")
     else:
         if args.run_id and not args.resume:
             parser.error("--run-id requires --resume")
         if args.backfill_sort is not None and args.mode != "backfill":
             parser.error("--backfill-sort can only be used with --mode backfill")
+        if args.revalidate_failed_comment_page_zero and not args.resume:
+            parser.error("--revalidate-failed-comment-page-zero requires --resume")
         if args.tid is not None or args.limit is not None or args.max_seconds is not None:
             parser.error("--tid, --limit, and --max-seconds are only valid with drain-pending")
 
@@ -1635,6 +1648,7 @@ if __name__ == "__main__":
                 backfill_sort=args.backfill_sort,
                 resume=args.resume,
                 run_id=args.run_id,
+                revalidate_failed_comment_page_zero=args.revalidate_failed_comment_page_zero,
             )
         if loop_factory is not None:
             with asyncio.Runner(loop_factory=loop_factory) as runner:

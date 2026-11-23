@@ -40,6 +40,46 @@ _TRANSPORT_ERRORS = (ConnectionResetError, BrokenPipeError, EOFError, asyncio.In
 _COMMENT_GROWTH_HYDRATION_WAIT_SECONDS = 2.0
 _COMMENT_GROWTH_HYDRATION_POLL_SECONDS = 0.05
 _MAX_COMMENT_GROWTH_HOVERS = 3
+_PAGE_READINESS_DIAGNOSTIC_TIMEOUT_SECONDS = 0.75
+_PAGE_READINESS_DIAGNOSTIC_GRACE_SECONDS = 1.0
+_PAGE_READINESS_BLOCK_NOTICE_TIMEOUT_SECONDS = 0.2
+
+_THREAD_READINESS_SELECTORS = (
+    ("first_floor_interactive", ".pc-pb-first-floor-interactive"),
+    ("image_text_owner", ".image-text"),
+    ("pb_content_wrap", ".pb-content-wrap"),
+    ("richtext_item", ".richtext-item"),
+    ("l_post", ".l_post"),
+    ("data_field", "[data-field]"),
+    ("data_pid", "[data-pid]"),
+    ("identity", "[tid][fid][index]"),
+)
+_POST_READINESS_SELECTORS = (
+    ("comment_owner", ".pb-comment-item[data-id]"),
+    ("l_post", ".l_post"),
+    ("data_field", "[data-field]"),
+    ("data_pid", "[data-pid]"),
+)
+_COMMENT_READINESS_SELECTORS = (
+    ("comment_owner", ".pb-comment-item[data-id]"),
+    ("comment_content", ".comment-content"),
+    ("lzl_wrapper", ".lzl-wrapper"),
+    ("show_more_lzl", ".show-more-lzl"),
+    ("nested_owner", ".pb-lzl-item"),
+)
+_PAGE_READINESS_DIAGNOSTIC_SCRIPT = """(selectors) => {
+  const visible = (node) => {
+    const rect = node.getBoundingClientRect();
+    const style = getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const counts = {};
+  for (const [key, selector] of selectors) {
+    const nodes = Array.from(document.querySelectorAll(selector));
+    counts[key] = {count: nodes.length, visible: nodes.filter(visible).length};
+  }
+  return {readyState: document.readyState, selectors: counts};
+}"""
 
 _COMMENT_GROWTH_HOVER_POINTS_SCRIPT = r"""({parentPid, portrait, limit}) => {
   const parent = Array.from(document.querySelectorAll('.pb-comment-item[data-id]'))
@@ -202,6 +242,9 @@ class PlaywrightWebFallbackProvider:
         self._active_collect_task: asyncio.Task | None = None
         self._close_task: asyncio.Task | None = None
         self._close_deferred = False
+        self._collect_timeout = contextvars.ContextVar(
+            f"web_fallback_timeout_{id(self)}", default=None
+        )
         self._callback_context = contextvars.ContextVar(
             f"web_fallback_callback_{id(self)}", default=False
         )
@@ -257,8 +300,10 @@ class PlaywrightWebFallbackProvider:
     async def _collect_worker(
         self, target: Target, state: dict[str, Any], deadline: float
     ) -> BrowserRunResult:
+        timeout_scope = asyncio.timeout(self._timeout_seconds)
+        timeout_token = self._collect_timeout.set(timeout_scope)
         try:
-            async with asyncio.timeout(self._timeout_seconds):
+            async with timeout_scope:
                 async with self._target_semaphore:
                     if self._closed:
                         raise RuntimeError("provider is closed")
@@ -286,6 +331,8 @@ class PlaywrightWebFallbackProvider:
             if not state.get("transport_error_type"):
                 _record_transport_error(state, error, "browser_worker_cleanup")
             return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
+        finally:
+            self._collect_timeout.reset(timeout_token)
 
     async def _finish_deferred_close(self) -> None:
         if not self._close_deferred:
@@ -493,6 +540,36 @@ class PlaywrightWebFallbackProvider:
                 task = asyncio.create_task(capture_response(response))
                 response_tasks.add(task)
 
+        async def readiness_timeout_result(page) -> BrowserRunResult:
+            self._cached_parent_snapshot = None
+            state.update(
+                await _page_readiness_diagnostics(
+                    page,
+                    target,
+                    state,
+                    headless=self._headless,
+                    max_pages=self._max_pages,
+                    max_expansions=self._max_expansions,
+                )
+            )
+            if state.get("blocked_reason") == "http_429":
+                return BrowserRunResult("blocked", "http_429", (), dict(state))
+            gate_reason = state.get("readiness_gate_reason")
+            if gate_reason in {"needs_login", "blocked", "security_verification"}:
+                state["blocked_reason"] = gate_reason
+                state["manual_gate_detected"] = True
+                try:
+                    async with asyncio.timeout(_PAGE_READINESS_BLOCK_NOTICE_TIMEOUT_SECONDS):
+                        await notify_blocked_once(gate_reason)
+                except TimeoutError:
+                    pass
+                if state.get("blocked_reason") == "http_429":
+                    return BrowserRunResult("blocked", "http_429", (), dict(state))
+                return BrowserRunResult("blocked", gate_reason, (), dict(state))
+            if state.get("blocked_reason") == "http_auth_or_verification":
+                return BrowserRunResult("blocked", "http_auth_or_verification", (), dict(state))
+            return BrowserRunResult("timeout", "browser_task_timeout", (), dict(state))
+
         page.on("request", on_request)
         page.on("response", on_response)
         dom_result: DOMExtractionResult | None = None
@@ -543,6 +620,9 @@ class PlaywrightWebFallbackProvider:
                         wait_until="domcontentloaded",
                         timeout=self._remaining_ms(deadline),
                     )
+                if response is not None and _is_document_request(response.request):
+                    status = response.status
+                    state["main_document_status"] = status if type(status) is int else None
                 if response is not None and response.status == 429:
                     state["blocked_reason"] = "http_429"
                     await notify_blocked_once("http_429")
@@ -566,15 +646,21 @@ class PlaywrightWebFallbackProvider:
                 remaining = max(0.0, deadline - loop.time())
                 page_deadline = loop.time() + remaining / pages_left
                 state["operation_phase"] = "page_readiness"
-                readiness = await self._wait_for_target(
-                    page,
-                    target,
-                    page_deadline,
-                    deadline,
-                    state,
-                    page_network_results,
-                    page_number,
-                )
+                try:
+                    readiness = await self._wait_for_target(
+                        page,
+                        target,
+                        page_deadline,
+                        deadline,
+                        state,
+                        page_network_results,
+                        page_number,
+                    )
+                except asyncio.CancelledError:
+                    timeout_scope = self._collect_timeout.get()
+                    if timeout_scope is None or not timeout_scope.expired():
+                        raise
+                    return await readiness_timeout_result(page)
                 if readiness in {"needs_login", "blocked", "security_verification"}:
                     if state.get("blocked_reason") != "http_429":
                         state["blocked_reason"] = readiness
@@ -582,10 +668,15 @@ class PlaywrightWebFallbackProvider:
                         await notify_blocked_once(readiness)
                     break
                 if readiness == "timeout":
-                    self._cached_parent_snapshot = None
-                    if state.get("blocked_reason") == "http_429":
-                        return BrowserRunResult("blocked", "http_429", (), dict(state))
-                    return BrowserRunResult("timeout", "browser_task_timeout", (), dict(state))
+                    timeout_scope = self._collect_timeout.get()
+                    if timeout_scope is not None and not timeout_scope.expired():
+                        try:
+                            timeout_scope.reschedule(
+                                loop.time() + _PAGE_READINESS_DIAGNOSTIC_GRACE_SECONDS
+                            )
+                        except RuntimeError:
+                            pass
+                    return await readiness_timeout_result(page)
                 if readiness in {"network_ready", "network_invalid"}:
                     dom_result = (
                         await _extract_post_dom_with_scroll(page, target, deadline, state)
@@ -977,10 +1068,13 @@ class PlaywrightWebFallbackProvider:
                 ):
                     return "ready"
             if target.target_type in {"thread", "post"}:
+                state["readiness_step"] = "content_snapshot"
                 html_text = await page.content()
+                state["readiness_step"] = "target_check"
                 if target_dom_structure_ready(target, page.url, html_text):
                     return "ready"
             else:
+                state["readiness_step"] = "selector_wait"
                 owner = page.locator(f'.pb-comment-item[data-id="{target.parent_post_pid}"]')
                 if await owner.count() == 1:
                     wrapper = owner.locator(":scope > .comment-content > .lzl-wrapper")
@@ -1599,6 +1693,127 @@ async def _page_gate_reason(page) -> str | None:
     if title in {"百度安全验证", "安全验证", "百度安全中心验证"}:
         return "security_verification"
     return None
+
+
+def _page_url_class(page_url: str) -> str:
+    try:
+        parsed = urlparse(page_url)
+        host = (parsed.hostname or "").lower()
+    except Exception:
+        return "other"
+    if parsed.scheme.lower() != "https" or host not in {
+        "tieba.baidu.com",
+        "www.tieba.baidu.com",
+        "passport.baidu.com",
+        "wappass.baidu.com",
+    }:
+        return "other"
+    path = parsed.path.lower()
+    if host in {"passport.baidu.com", "wappass.baidu.com"} or any(
+        marker in path for marker in ("verify", "captcha", "appeal")
+    ):
+        return "official_gate"
+    parts = path.strip("/").split("/")
+    if (
+        host in {"tieba.baidu.com", "www.tieba.baidu.com"}
+        and len(parts) == 2
+        and parts[0] == "p"
+        and parts[1].isdigit()
+    ):
+        return "official_thread"
+    return "other"
+
+
+async def _page_readiness_diagnostics(
+    page,
+    target: Target,
+    state: dict[str, Any],
+    *,
+    headless: bool,
+    max_pages: int,
+    max_expansions: int,
+) -> dict[str, Any]:
+    selectors = {
+        "thread": _THREAD_READINESS_SELECTORS,
+        "post": _POST_READINESS_SELECTORS,
+        "comment": _COMMENT_READINESS_SELECTORS,
+    }[target.target_type]
+    page_count = state.get("pages", 0)
+    expansion_count = state.get("expansions", 0)
+    diagnostics: dict[str, Any] = {
+        "readiness_diagnostic_status": "unavailable",
+        "readiness_url_class": "other",
+        "readiness_document_state": "unknown",
+        "readiness_step": state.get("readiness_step")
+        if state.get("readiness_step") in {"content_snapshot", "target_check", "selector_wait"}
+        else "unknown",
+        "readiness_headed": not headless,
+        "readiness_main_document_status_known": False,
+        "readiness_budget_pages_limit": max_pages,
+        "readiness_budget_pages_exhausted": page_count >= max_pages,
+        "readiness_budget_expansions_limit": max_expansions,
+        "readiness_budget_expansions_exhausted": expansion_count >= max_expansions,
+        "readiness_resource_request_budget": "unknown",
+    }
+    status = state.get("main_document_status")
+    if type(status) is int and 100 <= status <= 599:
+        diagnostics["readiness_main_document_status"] = status
+        diagnostics["readiness_main_document_status_known"] = True
+    for name in (
+        "requests",
+        "observed_subresource_requests",
+        "page_pc_requests",
+        "nested_floor_requests",
+        "user_card_requests",
+        "budgeted_actions",
+    ):
+        value = state.get(name)
+        if type(value) is int and value >= 0:
+            diagnostics[f"readiness_{name}"] = value
+
+    try:
+        page_url = page.url
+        diagnostics["readiness_url_class"] = _page_url_class(page_url)
+    except Exception:
+        page_url = ""
+
+    try:
+        async with asyncio.timeout(_PAGE_READINESS_DIAGNOSTIC_TIMEOUT_SECONDS):
+            gate_reason = await _page_gate_reason(page)
+            if gate_reason:
+                diagnostics["readiness_url_class"] = "official_gate"
+                diagnostics["readiness_diagnostic_status"] = "gate"
+                diagnostics["readiness_gate_reason"] = gate_reason
+                return diagnostics
+            result = await page.evaluate(
+                _PAGE_READINESS_DIAGNOSTIC_SCRIPT,
+                list(selectors),
+            )
+            if not isinstance(result, dict):
+                return diagnostics
+            ready_state = result.get("readyState")
+            if ready_state in {"loading", "interactive", "complete"}:
+                diagnostics["readiness_document_state"] = ready_state
+            selector_results = result.get("selectors")
+            if isinstance(selector_results, dict):
+                for key, _selector in selectors:
+                    counts = selector_results.get(key)
+                    if not isinstance(counts, dict):
+                        continue
+                    for metric in ("count", "visible"):
+                        value = counts.get(metric)
+                        if type(value) is int and value >= 0:
+                            diagnostics[f"readiness_{key}_{metric}"] = value
+            gate_reason = await _page_gate_reason(page)
+            if gate_reason:
+                diagnostics["readiness_url_class"] = "official_gate"
+                diagnostics["readiness_diagnostic_status"] = "gate"
+                diagnostics["readiness_gate_reason"] = gate_reason
+            else:
+                diagnostics["readiness_diagnostic_status"] = "ok"
+    except Exception:
+        return diagnostics
+    return diagnostics
 
 
 def _looks_like_timeout(error: Exception) -> bool:

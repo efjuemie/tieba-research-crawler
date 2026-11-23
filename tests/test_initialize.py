@@ -5,6 +5,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 import src.core.initialize as initialize_module
+from src.core.container import Container
+
+
+def test_failed_comment_page_zero_revalidation_defaults_off():
+    container = Container(SimpleNamespace())
+
+    assert container.revalidate_failed_comment_page_zero is False
 
 
 @pytest.mark.asyncio

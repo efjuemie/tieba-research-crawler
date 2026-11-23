@@ -514,10 +514,13 @@ async def test_remove_pending_comment_scan_supports_task_kind_filter():
 
 
 @pytest.mark.asyncio
-async def test_explicit_zero_comment_checkpoint_resumes_as_completed_scope():
+@pytest.mark.parametrize("basis", ["parent_api_explicit_zero", "fresh_parent_api_explicit_zero"])
+async def test_explicit_zero_comment_checkpoint_resumes_as_completed_scope(basis):
     continuation = {
-        "completion_basis": "parent_api_explicit_zero",
-        "comment_api_called": False,
+        "completion_basis": basis,
+        "checkpoint_kind": "scope_completion" if basis.startswith("fresh_") else "page",
+        "comment_api_called": basis == "fresh_parent_api_explicit_zero",
+        "previous_failure": {"status": "failed", "error_type": "PageIntegrityError"},
     }
     row = SimpleNamespace(
         status="completed",
@@ -552,6 +555,7 @@ async def test_explicit_zero_comment_checkpoint_resumes_as_completed_scope():
         "completed",
         continuation,
     )
+    assert json.dumps(continuation)
 
 
 @pytest.mark.asyncio

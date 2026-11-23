@@ -2701,6 +2701,76 @@ class FullScanCommentsTaskHandler(TaskHandler):
         )
         return committed
 
+    async def _revalidate_failed_comment_page_from_parent_zero(
+        self,
+        task: FullScanCommentsTask,
+        error: Exception,
+        *,
+        run_id: str,
+        task_key: str,
+    ) -> bool:
+        if (
+            type(error) is not PageIntegrityError
+            or str(error) != "Comment detail empty response is missing or has zero page identity for page 1."
+            or not getattr(self.container, "revalidate_failed_comment_page_zero", False)
+            or task.parent_generation is None
+        ):
+            return False
+        get_hint = getattr(self.datastore, "get_research_comment_parent_page_hint", None)
+        complete = getattr(self.datastore, "complete_failed_comment_scope_from_parent_zero", None)
+        if get_hint is None or complete is None:
+            return False
+        hint = await get_hint(
+            run_id,
+            task_key,
+            task.tid,
+            task.pid,
+            task.generation,
+            task.parent_generation,
+        )
+        if hint is None:
+            return False
+        parent_floor, parent_rn = hint
+        if type(parent_floor) is not int or parent_floor < 1 or type(parent_rn) is not int or parent_rn < 1:
+            return False
+        parent_page = (parent_floor - 1) // parent_rn + 1
+        fetched = await self.get_posts(task.tid, parent_page, rn=parent_rn, with_comments=False)
+        page = self._dto(fetched.response)
+        matches = [post for post in page.objs if post.pid == task.pid]
+        if len(matches) != 1:
+            return False
+        evidence = _explicit_zero_evidence_for_post(
+            fetched.response,
+            page,
+            matches[0],
+            task,
+            parent_page,
+        )
+        if evidence is None:
+            return False
+        observed_at = getattr(fetched.response, "observed_at", None)
+        isoformat = getattr(observed_at, "isoformat", None)
+        if isoformat is None:
+            return False
+        source_observed_at = isoformat()
+        if not isinstance(source_observed_at, str) or not source_observed_at:
+            return False
+        return await complete(
+            run_id=run_id,
+            task_key=task_key,
+            tid=task.tid,
+            parent_pid=task.pid,
+            generation=task.generation,
+            parent_generation=task.parent_generation,
+            fid=matches[0].fid,
+            parent_floor=parent_floor,
+            parent_rn=parent_rn,
+            parent_page=parent_page,
+            source_observed_at=source_observed_at,
+            current_failure={"error_type": type(error).__name__, "reason": str(error)},
+            evidence=evidence,
+        )
+
     async def handle(self, task_content: FullScanCommentsTask):
         tid = task_content.tid
         pid = task_content.pid
@@ -2905,6 +2975,41 @@ class FullScanCommentsTaskHandler(TaskHandler):
             )
             self.log.debug("Finished comment scan for pid={} in tid={}.", pid, tid)
         except Exception as e:
+            failure_error = e
+            failure_continuation = cursor
+            if scope_managed and pn == 1:
+                try:
+                    completed_from_parent_zero = await self._revalidate_failed_comment_page_from_parent_zero(
+                        task_content,
+                        e,
+                        run_id=run_id,
+                        task_key=task_key,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as fallback_error:
+                    completed_from_parent_zero = False
+                    failure_error = fallback_error
+                    failure_continuation = {
+                        **cursor,
+                        "comment_page_identity_failure": {
+                            "error_type": type(e).__name__,
+                            "reason": str(e),
+                        },
+                    }
+                    self.log.warning(
+                        "Parent-page zero revalidation did not complete scope tid={} parent_pid={} error_type={}",
+                        tid,
+                        pid,
+                        type(fallback_error).__name__,
+                    )
+                if completed_from_parent_zero:
+                    self.log.info(
+                        "Completed comment scope from fresh parent wire-zero evidence tid={} parent_pid={}",
+                        tid,
+                        pid,
+                    )
+                    return
             await self._record_detail_failure(
                 run_id=run_id,
                 task_key=task_key,
@@ -2914,11 +3019,13 @@ class FullScanCommentsTaskHandler(TaskHandler):
                 tid=tid,
                 parent_pid=pid,
                 parent_kind=parent_kind,
-                error=e,
-                continuation_json=cursor,
+                error=failure_error,
+                continuation_json=failure_continuation,
                 generation=generation if scope_managed else None,
             )
-            error_detail = str(e) if isinstance(e, PageIntegrityError) else type(e).__name__
+            error_detail = (
+                str(failure_error) if isinstance(failure_error, PageIntegrityError) else type(failure_error).__name__
+            )
             self.log.error(
                 "Failed to process comment pages for tid={} parent_pid={} pn={} error={}",
                 tid,

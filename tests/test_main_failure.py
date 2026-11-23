@@ -2,12 +2,24 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 import main as app_main
 from src.scraper.router import QueueRouter
 from src.scraper.scheduler import BackfillIncompleteError
+
+
+@pytest.mark.asyncio
+async def test_parent_zero_revalidation_flag_requires_resume_before_initialization(monkeypatch):
+    initialize = AsyncMock()
+    monkeypatch.setattr(app_main, "initialize_application", initialize)
+
+    with pytest.raises(ValueError, match="--revalidate-failed-comment-page-zero requires --resume"):
+        await app_main.main(revalidate_failed_comment_page_zero=True)
+
+    initialize.assert_not_awaited()
 
 
 @pytest.mark.asyncio

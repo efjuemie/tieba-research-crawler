@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -23,6 +25,7 @@ from src.core.models import (
     research_comments_task_key,
     research_posts_task_key,
 )
+from src.research.models import ResearchComment, ResearchPost
 from src.scraper.tasks import FullScanCommentsTask
 from src.scraper.worker import FullScanCommentsTaskHandler
 
@@ -480,6 +483,363 @@ async def test_postgres_worker_commit_then_refresh_reopens_child_generation(monk
                 ResearchTaskScope.__table__.delete().where(ResearchTaskScope.run_id == run_id)
             )
             await session.execute(ResearchRun.__table__.delete().where(ResearchRun.run_id == run_id))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_postgres_fresh_parent_zero_completion_preserves_failure_and_fences_generation():
+    raw_url = os.environ.get("TIEBA_RESEARCH_SCOPE_TEST_DATABASE_URL")
+    if not raw_url:
+        pytest.skip("Set TIEBA_RESEARCH_SCOPE_TEST_DATABASE_URL to run this transaction test.")
+    try:
+        configured_url = make_url(raw_url)
+    except Exception:
+        pytest.fail("TIEBA_RESEARCH_SCOPE_TEST_DATABASE_URL is not a valid SQLAlchemy URL.", pytrace=False)
+    if configured_url.database != TEST_DATABASE_NAME:
+        pytest.fail("The scope test URL must target its dedicated synthetic database.", pytrace=False)
+
+    await _ensure_test_database(configured_url)
+    engine = create_async_engine(configured_url.set(drivername="postgresql+asyncpg"), echo=False)
+    sessions = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = sessions
+    run_ids = [str(uuid4()) for _ in range(5)]
+    records: list[tuple[str, int, int, int, int]] = []
+    now = datetime.now(UTC)
+
+    async def seed_scope(
+        run_id: str,
+        *,
+        live_parent_generation: int,
+        child_status: str = "running",
+        checkpoint_status: str = "failed",
+        later_page: bool = False,
+        existing_comment: bool = False,
+    ) -> tuple[str, str, int, int, int]:
+        tid = 8_000_000_000_000_000_000 + uuid4().int % 500_000_000_000_000_000
+        pid = tid + 1
+        parent_key = research_posts_task_key(tid)
+        child_key = research_comments_task_key(tid, pid)
+        async with sessions() as session, session.begin():
+            session.add_all(
+                [
+                    ResearchRun(
+                        run_id=run_id,
+                        mode="backfill",
+                        scope_key="synthetic-parent-zero",
+                        forums_json=[[77, "synthetic-forum"]],
+                        status="running",
+                    ),
+                    ResearchTaskScope(
+                        run_id=run_id,
+                        logical_task_key=parent_key,
+                        generation=live_parent_generation,
+                        task_type="full_scan_posts",
+                        scope_type="thread_replies",
+                        fid=77,
+                        fname="synthetic-forum",
+                        tid=tid,
+                        rn=30,
+                        status="completed",
+                    ),
+                    ResearchTaskScope(
+                        run_id=run_id,
+                        logical_task_key=child_key,
+                        generation=6,
+                        task_type="full_scan_comments",
+                        scope_type="post_comments",
+                        fid=77,
+                        fname="synthetic-forum",
+                        tid=tid,
+                        parent_pid=pid,
+                        parent_kind="reply_post",
+                        parent_logical_task_key=parent_key,
+                        parent_generation=4,
+                        status=child_status,
+                    ),
+                    ResearchCheckpoint(
+                        run_id=run_id,
+                        task_key=research_comments_task_key(tid, pid, 6),
+                        page_number=1,
+                        task_type="full_scan_comments",
+                        scope_type="post_comments",
+                        fid=77,
+                        fname="synthetic-forum",
+                        tid=tid,
+                        parent_pid=pid,
+                        parent_kind="reply_post",
+                        status=checkpoint_status,
+                        scope_status="incomplete" if checkpoint_status == "failed" else "completed",
+                        attempts=2,
+                        next_page=1,
+                        continuation_json={"cursor": "preserved"},
+                        error_type="PageIntegrityError",
+                        reason="PageIntegrityError",
+                    ),
+                    ResearchPost(
+                        pid=pid,
+                        tid=tid,
+                        fid=77,
+                        floor=2,
+                        source_api="aiotieba.get_posts",
+                        observed_at=now,
+                    ),
+                    PendingCommentScan(
+                        tid=tid,
+                        pid=pid,
+                        fid=77,
+                        fname="synthetic-forum",
+                        backfill=True,
+                        task_kind="full",
+                    ),
+                ]
+            )
+            if later_page:
+                session.add(
+                    ResearchCheckpoint(
+                        run_id=run_id,
+                        task_key=research_comments_task_key(tid, pid, 6),
+                        page_number=2,
+                        task_type="full_scan_comments",
+                        scope_type="post_comments",
+                        fid=77,
+                        fname="synthetic-forum",
+                        tid=tid,
+                        parent_pid=pid,
+                        status="completed",
+                        scope_status="completed",
+                        has_more=False,
+                    )
+                )
+            if existing_comment:
+                session.add(
+                    ResearchComment(
+                        cid=pid + 1000,
+                        tid=tid,
+                        parent_post_pid=pid,
+                        fid=77,
+                        source_api="aiotieba.get_comments",
+                        observed_at=now,
+                    )
+                )
+        records.append((run_id, tid, pid, 6, 4))
+        return parent_key, child_key, tid, pid, 77
+
+    async def cleanup() -> None:
+        async with sessions() as session, session.begin():
+            for run_id, tid, pid, _generation, _parent_generation in records:
+                pending = await session.get(PendingCommentScan, (tid, pid))
+                if pending is not None:
+                    await session.delete(pending)
+                await session.execute(
+                    ResearchComment.__table__.delete().where(
+                        ResearchComment.tid == tid, ResearchComment.parent_post_pid == pid
+                    )
+                )
+                await session.execute(ResearchPost.__table__.delete().where(ResearchPost.tid == tid))
+                await session.execute(
+                    ResearchCheckpoint.__table__.delete().where(ResearchCheckpoint.run_id == run_id)
+                )
+                await session.execute(
+                    ResearchTaskScope.__table__.delete().where(ResearchTaskScope.run_id == run_id)
+                )
+                await session.execute(ResearchRun.__table__.delete().where(ResearchRun.run_id == run_id))
+
+    try:
+        async with engine.begin() as connection:
+            for table in (
+                ResearchRun.__table__,
+                ResearchTaskScope.__table__,
+                ResearchCheckpoint.__table__,
+                PendingCommentScan.__table__,
+                ResearchPost.__table__,
+                ResearchComment.__table__,
+            ):
+                await connection.run_sync(
+                    lambda sync_connection, table=table: table.create(sync_connection, checkfirst=True)
+                )
+
+        parent_key, child_key, tid, pid, fid = await seed_scope(run_ids[0], live_parent_generation=4)
+        hint = await store.get_research_comment_parent_page_hint(
+            run_ids[0], research_comments_task_key(tid, pid, 6), tid, pid, 6, 4
+        )
+        assert hint == (2, 30)
+        evidence = {
+            "tid": tid,
+            "pid": pid,
+            "fid": fid,
+            "author_user_id": 55,
+            "source_page": 1,
+            "reported_count": 0,
+            "count_field_present": True,
+            "source_api": "aiotieba.get_posts",
+            "evidence_kind": "protobuf_wire_explicit_zero",
+            "count_field_path": "data.post_list.sub_post_number",
+            "count_wire_field_number": 13,
+        }
+        for invalid_evidence in (
+            {**evidence, "count_field_present": False},
+            {**evidence, "reported_count": 5},
+            {**evidence, "tid": tid + 1},
+        ):
+            assert (
+                await store.complete_failed_comment_scope_from_parent_zero(
+                    run_id=run_ids[0],
+                    task_key=research_comments_task_key(tid, pid, 6),
+                    tid=tid,
+                    parent_pid=pid,
+                    generation=6,
+                    parent_generation=4,
+                    fid=fid,
+                    parent_floor=2,
+                    parent_rn=30,
+                    parent_page=1,
+                    source_observed_at=now.isoformat(),
+                    current_failure={
+                        "error_type": "PageIntegrityError",
+                        "reason": "Comment detail empty response is missing or has zero page identity for page 1.",
+                    },
+                    evidence=invalid_evidence,
+                )
+                is False
+            )
+        complete = await store.complete_failed_comment_scope_from_parent_zero(
+            run_id=run_ids[0],
+            task_key=research_comments_task_key(tid, pid, 6),
+            tid=tid,
+            parent_pid=pid,
+            generation=6,
+            parent_generation=4,
+            fid=fid,
+            parent_floor=2,
+            parent_rn=30,
+            parent_page=1,
+            source_observed_at=now.isoformat(),
+            current_failure={
+                "error_type": "PageIntegrityError",
+                "reason": "Comment detail empty response is missing or has zero page identity for page 1.",
+            },
+            evidence=evidence,
+        )
+        assert complete is True
+        resume = await store.get_research_resume_state(
+            run_ids[0], research_comments_task_key(tid, pid, 6)
+        )
+        assert resume[0] is None
+        assert resume[1] == "completed"
+        continuation = resume[2]
+        assert continuation is not None
+        assert continuation["completion_basis"] == "fresh_parent_api_explicit_zero"
+        assert continuation["checkpoint_kind"] == "scope_completion"
+        assert continuation["comment_api_called"] is True
+        assert continuation["previous_failure"]["status"] == "failed"
+        assert continuation["previous_failure"]["continuation_json"] == {"cursor": "preserved"}
+        assert continuation["current_failure"]["error_type"] == "PageIntegrityError"
+        assert continuation["source_observed_at"] == now.isoformat()
+        assert json.dumps(continuation)
+        async with sessions() as session:
+            checkpoint = await session.get(
+                ResearchCheckpoint, (run_ids[0], research_comments_task_key(tid, pid, 6), 1)
+            )
+            scope = await session.get(ResearchTaskScope, (run_ids[0], child_key))
+            pending = await session.get(PendingCommentScan, (tid, pid))
+            assert checkpoint is not None
+            assert checkpoint.status == "completed"
+            assert checkpoint.error_type is None
+            assert checkpoint.reported_count is None
+            assert scope is not None
+            assert scope.status == "completed"
+            assert pending is None
+
+        _parent_key, _child_key, stale_tid, stale_pid, stale_fid = await seed_scope(
+            run_ids[1], live_parent_generation=5
+        )
+        stale_evidence = {**evidence, "tid": stale_tid, "pid": stale_pid, "fid": stale_fid}
+        stale_complete = await store.complete_failed_comment_scope_from_parent_zero(
+            run_id=run_ids[1],
+            task_key=research_comments_task_key(stale_tid, stale_pid, 6),
+            tid=stale_tid,
+            parent_pid=stale_pid,
+            generation=6,
+            parent_generation=4,
+            fid=stale_fid,
+            parent_floor=2,
+            parent_rn=30,
+            parent_page=1,
+            source_observed_at=now.isoformat(),
+            current_failure={
+                "error_type": "PageIntegrityError",
+                "reason": "Comment detail empty response is missing or has zero page identity for page 1.",
+            },
+            evidence=stale_evidence,
+        )
+        assert stale_complete is False
+        stale_hint = await store.get_research_comment_parent_page_hint(
+            run_ids[1], research_comments_task_key(stale_tid, stale_pid, 6), stale_tid, stale_pid, 6, 4
+        )
+        assert stale_hint is None
+        async with sessions() as session:
+            stale_checkpoint = await session.get(
+                ResearchCheckpoint,
+                (run_ids[1], research_comments_task_key(stale_tid, stale_pid, 6), 1),
+            )
+            stale_scope_key = research_comments_task_key(stale_tid, stale_pid)
+            stale_scope = await session.get(ResearchTaskScope, (run_ids[1], stale_scope_key))
+            assert stale_checkpoint is not None
+            assert stale_checkpoint.status == "failed"
+            assert stale_scope is not None
+            assert stale_scope.status == "running"
+
+        guard_cases = (
+            (run_ids[2], {"checkpoint_status": "completed", "child_status": "completed"}),
+            (run_ids[3], {"later_page": True}),
+            (run_ids[4], {"existing_comment": True}),
+        )
+        for guard_run_id, options in guard_cases:
+            _parent_key, guard_child_key, guard_tid, guard_pid, guard_fid = await seed_scope(
+                guard_run_id,
+                live_parent_generation=4,
+                **options,
+            )
+            guard_task_key = research_comments_task_key(guard_tid, guard_pid, 6)
+            assert (
+                await store.get_research_comment_parent_page_hint(
+                    guard_run_id, guard_task_key, guard_tid, guard_pid, 6, 4
+                )
+                is None
+            )
+            guard_evidence = {**evidence, "tid": guard_tid, "pid": guard_pid, "fid": guard_fid}
+            assert (
+                await store.complete_failed_comment_scope_from_parent_zero(
+                    run_id=guard_run_id,
+                    task_key=guard_task_key,
+                    tid=guard_tid,
+                    parent_pid=guard_pid,
+                    generation=6,
+                    parent_generation=4,
+                    fid=guard_fid,
+                    parent_floor=2,
+                    parent_rn=30,
+                    parent_page=1,
+                    source_observed_at=now.isoformat(),
+                    current_failure={
+                        "error_type": "PageIntegrityError",
+                        "reason": "Comment detail empty response is missing or has zero page identity for page 1.",
+                    },
+                    evidence=guard_evidence,
+                )
+                is False
+            )
+            async with sessions() as session:
+                guard_checkpoint = await session.get(ResearchCheckpoint, (guard_run_id, guard_task_key, 1))
+                guard_scope = await session.get(ResearchTaskScope, (guard_run_id, guard_child_key))
+                assert guard_checkpoint is not None
+                assert guard_checkpoint.status == options.get("checkpoint_status", "failed")
+                assert guard_scope is not None
+                assert guard_scope.status == options.get("child_status", "running")
+    finally:
+        if records:
+            await cleanup()
         await engine.dispose()
 
 

@@ -15,6 +15,7 @@ from src.research.web_fallback.browser import (
     BrowserProviderConfigurationError,
     PlaywrightWebFallbackProvider,
 )
+from src.research.web_fallback.diagnostics import sanitize_web_diagnostics
 from src.research.web_fallback.dom import DOMExtractionResult
 from src.research.web_fallback.identity import Target
 from src.research.web_fallback.network import (
@@ -23,6 +24,7 @@ from src.research.web_fallback.network import (
     USER_CARD_PATH,
     NetworkExtractionResult,
 )
+from src.research.web_fallback.service import _safe_diagnostics
 
 TID = "81001"
 FID = "120"
@@ -202,6 +204,10 @@ class FakePage:
         scroll_html_sequence=None,
         comment_growth_hover_points=None,
         hovered_html_text=None,
+        diagnostic_result=None,
+        evaluate_error=None,
+        content_delay=0,
+        diagnostic_title=None,
     ):
         self.url = "about:blank"
         self.html_text = html_text
@@ -227,6 +233,10 @@ class FakePage:
         self.scroll_html_sequence = list(scroll_html_sequence or ())
         self.comment_growth_hover_points = list(comment_growth_hover_points or ())
         self.hovered_html_text = hovered_html_text
+        self.diagnostic_result = diagnostic_result
+        self.evaluate_error = evaluate_error
+        self.content_delay = content_delay
+        self.diagnostic_title = diagnostic_title
         self.hover_positions = []
         self.comment_growth_hover_args = None
         self.mouse = FakeMouse(self)
@@ -302,6 +312,8 @@ class FakePage:
 
     async def content(self):
         self.content_calls += 1
+        if self.content_delay:
+            await asyncio.sleep(self.content_delay)
         if (
             self.render_after
             and self._navigation_started is not None
@@ -312,6 +324,12 @@ class FakePage:
         return self.html_text
 
     async def evaluate(self, script, arg=None):
+        if script == browser_module._PAGE_READINESS_DIAGNOSTIC_SCRIPT:
+            if self.evaluate_error is not None:
+                raise self.evaluate_error
+            if self.diagnostic_title is not None:
+                self.title_text = self.diagnostic_title
+            return self.diagnostic_result
         if script == browser_module._COMMENT_GROWTH_HOVER_POINTS_SCRIPT:
             self.comment_growth_hover_args = arg
             return self.comment_growth_hover_points
@@ -1983,6 +2001,130 @@ async def test_timeout_reports_requests_already_observed_and_closes_page():
     assert result.diagnostics["pages"] == 1
     assert result.diagnostics["requests"] == 1
     assert page.closed is True
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_page_readiness_timeout_records_safe_dom_counts_without_accepting_target():
+    page = FakePage(
+        html_text=(
+            '<div class="image-text"><div class="pc-pb-first-floor-interactive"></div>'
+            '<div class="pb-content-wrap"><div class="richtext-item"></div></div></div>'
+        ),
+        status=200,
+        redirect_url=f"https://tieba.baidu.com/p/{TID}?token=private-value",
+        content_delay=0.1,
+        diagnostic_result={
+            "readyState": "interactive",
+            "selectors": {
+                "first_floor_interactive": {"count": 1, "visible": 0},
+                "image_text_owner": {"count": 1, "visible": 1},
+                "pb_content_wrap": {"count": 1, "visible": 1},
+                "richtext_item": {"count": 0, "visible": 0},
+                "l_post": {"count": 1, "visible": 1},
+                "data_field": {"count": 1, "visible": 1},
+                "data_pid": {"count": 0, "visible": 0},
+                "identity": {"count": 0, "visible": 0},
+            },
+        },
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=0.05)
+
+    result = await provider.collect(_thread_target())
+
+    assert result.status == "timeout"
+    assert result.reason == "browser_task_timeout"
+    assert result.diagnostics["readiness_diagnostic_status"] == "ok"
+    assert result.diagnostics["readiness_url_class"] == "official_thread"
+    assert result.diagnostics["readiness_document_state"] == "interactive"
+    assert result.diagnostics["readiness_step"] == "content_snapshot"
+    assert result.diagnostics["readiness_headed"] is False
+    assert result.diagnostics["readiness_main_document_status"] == 200
+    assert result.diagnostics["readiness_first_floor_interactive_count"] == 1
+    assert result.diagnostics["readiness_first_floor_interactive_visible"] == 0
+    assert result.diagnostics["readiness_budget_pages_exhausted"] is True
+    assert result.diagnostics["readiness_resource_request_budget"] == "unknown"
+    assert "private-value" not in json.dumps(result.diagnostics)
+    for safe_diagnostics in (
+        sanitize_web_diagnostics(result.diagnostics),
+        _safe_diagnostics(result.diagnostics),
+    ):
+        assert safe_diagnostics["readiness_url_class"] == "official_thread"
+        assert safe_diagnostics["readiness_step"] == "content_snapshot"
+        assert safe_diagnostics["readiness_first_floor_interactive_count"] == 1
+        assert "private-value" not in json.dumps(safe_diagnostics)
+    assert page.closed is True
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_page_readiness_diagnostic_failure_keeps_timeout_and_does_not_leak_error():
+    page = FakePage(
+        html_text="",
+        content_delay=0.1,
+        evaluate_error=RuntimeError("private-value"),
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=0.05)
+
+    result = await provider.collect(_thread_target())
+
+    assert result.status == "timeout"
+    assert result.reason == "browser_task_timeout"
+    assert result.diagnostics["readiness_diagnostic_status"] == "unavailable"
+    assert "private-value" not in json.dumps(result.diagnostics)
+    assert page.closed is True
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_page_readiness_diagnostic_preserves_late_gate_and_429_priority():
+    page = FakePage(
+        html_text="",
+        content_delay=0.1,
+        diagnostic_result={"readyState": "complete", "selectors": {}},
+        diagnostic_title="百度安全验证",
+    )
+
+    async def on_blocked(reason):
+        assert reason == "security_verification"
+        request = FakeRequest(
+            f"https://tieba.baidu.com{PAGE_PC_PATH}", resource_type="xhr"
+        )
+        page.emit("response", FakeResponse(request, status=429))
+        await asyncio.sleep(0.25)
+
+    provider = _provider(
+        FakeContext(lambda: page),
+        timeout_seconds=0.05,
+        on_blocked=on_blocked,
+    )
+
+    result = await provider.collect(_thread_target())
+
+    assert result.status == "blocked"
+    assert result.reason == "http_429"
+    assert result.diagnostics["readiness_url_class"] == "official_gate"
+    assert result.diagnostics["readiness_gate_reason"] == "security_verification"
+    assert result.diagnostics["blocked_reason"] == "http_429"
+    assert result.diagnostics["manual_gate_detected"] is True
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_page_readiness_page_close_failure_preserves_timeout_outcome():
+    page = FakePage(
+        html_text="",
+        content_delay=0.1,
+        close_error=ConnectionResetError("private-value"),
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=0.05)
+
+    result = await provider.collect(_thread_target())
+
+    assert result.status == "timeout"
+    assert result.reason == "browser_task_timeout"
+    assert result.status != "ok"
+    assert "private-value" not in json.dumps(result.diagnostics)
     await provider.close()
 
 

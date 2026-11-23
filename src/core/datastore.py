@@ -753,6 +753,211 @@ class DataStore:
             row = result.one_or_none()
         return None if row is None else (row.generation, row.status, row.parent_generation)
 
+    async def _failed_comment_scope_context(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: str,
+        task_key: str,
+        tid: int,
+        parent_pid: int,
+        generation: int,
+        parent_generation: int,
+        fid: int | None = None,
+        rn: int | None = None,
+        lock: bool = False,
+    ) -> tuple[ResearchTaskScope, ResearchTaskScope, ResearchCheckpoint] | None:
+        from src.research.models import ResearchComment
+
+        parent_key = research_posts_task_key(tid)
+        child_key = research_comments_task_key(tid, parent_pid)
+        if task_key != research_comments_task_key(tid, parent_pid, generation):
+            return None
+        if lock:
+            parent = await self.get_research_task_scope_for_update(session, run_id, parent_key)
+            scope = await self.get_research_task_scope_for_update(session, run_id, child_key)
+        else:
+            parent = await session.get(ResearchTaskScope, (run_id, parent_key))
+            scope = await session.get(ResearchTaskScope, (run_id, child_key))
+        checkpoint = await session.get(ResearchCheckpoint, (run_id, task_key, 1))
+        if (
+            parent is None
+            or scope is None
+            or checkpoint is None
+            or parent.generation != parent_generation
+            or parent.scope_type != "thread_replies"
+            or parent.tid != tid
+            or (rn is not None and parent.rn != rn)
+            or scope.generation != generation
+            or scope.status not in {"running", "incomplete"}
+            or scope.task_type != "full_scan_comments"
+            or scope.scope_type != "post_comments"
+            or scope.tid != tid
+            or scope.parent_pid != parent_pid
+            or scope.parent_logical_task_key != parent_key
+            or scope.parent_generation != parent_generation
+            or scope.fid is None
+            or scope.fid != parent.fid
+            or (fid is not None and scope.fid != fid)
+            or checkpoint.status != "failed"
+            or checkpoint.scope_status != "incomplete"
+            or checkpoint.error_type != "PageIntegrityError"
+            or checkpoint.task_type != "full_scan_comments"
+            or checkpoint.scope_type != "post_comments"
+            or checkpoint.tid != tid
+            or checkpoint.parent_pid != parent_pid
+            or checkpoint.fid != scope.fid
+        ):
+            return None
+        later_page = await session.scalar(
+            select(ResearchCheckpoint.page_number)
+            .where(
+                ResearchCheckpoint.run_id == run_id,
+                ResearchCheckpoint.task_key == task_key,
+                ResearchCheckpoint.page_number > 1,
+            )
+            .limit(1)
+        )
+        existing_comment = await session.scalar(
+            select(ResearchComment.cid)
+            .where(ResearchComment.tid == tid, ResearchComment.parent_post_pid == parent_pid)
+            .limit(1)
+        )
+        return None if later_page is not None or existing_comment is not None else (parent, scope, checkpoint)
+
+    async def get_research_comment_parent_page_hint(
+        self,
+        run_id: str,
+        task_key: str,
+        tid: int,
+        parent_pid: int,
+        generation: int,
+        parent_generation: int,
+    ) -> tuple[int, int] | None:
+        """Preflight an old failed page-one scope and return one candidate page hint."""
+        from src.research.models import ResearchPost
+
+        async with self.async_sessionmaker() as session:
+            context = await self._failed_comment_scope_context(
+                session,
+                run_id=run_id,
+                task_key=task_key,
+                tid=tid,
+                parent_pid=parent_pid,
+                generation=generation,
+                parent_generation=parent_generation,
+            )
+            if context is None:
+                return None
+            parent, _scope, _checkpoint = context
+            if type(parent.rn) is not int or parent.rn < 1:
+                return None
+            floor = await session.scalar(
+                select(ResearchPost.floor).where(ResearchPost.tid == tid, ResearchPost.pid == parent_pid)
+            )
+            if type(floor) is not int or floor < 1:
+                floor = await session.scalar(select(Post.floor).where(Post.tid == tid, Post.pid == parent_pid))
+            return (floor, parent.rn) if type(floor) is int and floor > 0 else None
+
+    async def complete_failed_comment_scope_from_parent_zero(
+        self,
+        *,
+        run_id: str,
+        task_key: str,
+        tid: int,
+        parent_pid: int,
+        generation: int,
+        parent_generation: int,
+        fid: int,
+        parent_floor: int,
+        parent_rn: int,
+        parent_page: int,
+        source_observed_at: str,
+        current_failure: dict[str, object],
+        evidence: dict[str, object],
+    ) -> bool:
+        """Complete only a failed page-one scope backed by a fresh exact wire-zero proof."""
+        if (
+            type(parent_floor) is not int
+            or parent_floor < 1
+            or type(parent_rn) is not int
+            or parent_rn < 1
+            or type(parent_page) is not int
+            or parent_page != (parent_floor - 1) // parent_rn + 1
+            or current_failure.get("error_type") != "PageIntegrityError"
+            or current_failure.get("reason")
+            != "Comment detail empty response is missing or has zero page identity for page 1."
+            or not source_observed_at
+            or type(evidence.get("tid")) is not int
+            or evidence.get("tid") != tid
+            or type(evidence.get("pid")) is not int
+            or evidence.get("pid") != parent_pid
+            or type(evidence.get("fid")) is not int
+            or evidence.get("fid") != fid
+            or type(evidence.get("author_user_id")) is not int
+            or evidence.get("author_user_id", 0) <= 0
+            or type(evidence.get("source_page")) is not int
+            or evidence.get("source_page") != parent_page
+            or type(evidence.get("reported_count")) is not int
+            or evidence.get("reported_count") != 0
+            or evidence.get("count_field_present") is not True
+            or evidence.get("source_api") != "aiotieba.get_posts"
+            or evidence.get("evidence_kind") != "protobuf_wire_explicit_zero"
+            or evidence.get("count_field_path") != "data.post_list.sub_post_number"
+            or type(evidence.get("count_wire_field_number")) is not int
+            or evidence.get("count_wire_field_number") != 13
+        ):
+            return False
+
+        async with self.async_sessionmaker() as session, session.begin():
+            context = await self._failed_comment_scope_context(
+                session,
+                run_id=run_id,
+                task_key=task_key,
+                tid=tid,
+                parent_pid=parent_pid,
+                generation=generation,
+                parent_generation=parent_generation,
+                fid=fid,
+                rn=parent_rn,
+                lock=True,
+            )
+            if context is None:
+                return False
+            _parent, scope, checkpoint = context
+            previous_failure = {
+                key: getattr(checkpoint, key)
+                for key in (
+                    "status", "scope_status", "error_type", "error_code", "reason", "attempts", "has_more",
+                    "next_page", "total_pages", "reported_count", "reported_count_missing_reason",
+                    "page_item_count", "continuation_json",
+                )
+            }
+            checkpoint.status = checkpoint.scope_status = "completed"
+            checkpoint.has_more = checkpoint.total_pages = checkpoint.reported_count = None
+            checkpoint.reported_count_missing_reason = checkpoint.page_item_count = None
+            checkpoint.next_page = checkpoint.error_type = checkpoint.error_code = checkpoint.reason = None
+            checkpoint.continuation_json = {
+                "completion_basis": "fresh_parent_api_explicit_zero",
+                "checkpoint_kind": "scope_completion",
+                "comment_api_called": True,
+                "previous_failure": previous_failure,
+                "current_failure": current_failure,
+                "source_observed_at": source_observed_at,
+                "parent_floor": parent_floor,
+                "parent_rn": parent_rn,
+                "parent_page": parent_page,
+                "zero_comment_evidence": evidence,
+            }
+            checkpoint.last_checked = scope.last_checked = datetime.now(UTC)
+            scope.status = "completed"
+            scope.reason = "fresh_parent_api_explicit_zero"
+            await self.remove_pending_comment_scan_in_session(session, tid, parent_pid, task_kind="full")
+            run = await session.get(ResearchRun, run_id)
+            if run is not None:
+                run.last_checked = datetime.now(UTC)
+        return True
+
     async def claim_research_comments_scope(
         self,
         *,
@@ -1418,9 +1623,10 @@ class DataStore:
             row = result.scalar_one_or_none()
         if row is None:
             return 1, None, None
-        if row.status == "completed" and (row.continuation_json or {}).get("completion_basis") == (
-            "parent_api_explicit_zero"
-        ):
+        if row.status == "completed" and (row.continuation_json or {}).get("completion_basis") in {
+            "parent_api_explicit_zero",
+            "fresh_parent_api_explicit_zero",
+        }:
             return None, row.scope_status or "completed", row.continuation_json
         if row.status == "completed" and row.has_more is False:
             return None, row.scope_status or "completed", row.continuation_json

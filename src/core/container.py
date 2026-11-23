@@ -82,6 +82,7 @@ class Container:
         self.tb_clients: list[Client] = []
         self.research_run_cache = ResearchRunCache()
         self.research_run_id: str | None = None
+        self.revalidate_failed_comment_page_zero = False
         self.research_auth_ready = asyncio.Event()
         self.research_auth_ready.set()
         # Compatibility alias; this gate is auth-only. New request paths should

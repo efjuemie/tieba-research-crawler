@@ -121,6 +121,18 @@ uv run python main.py drain-pending --run-id YOUR_RUN_ID --limit 10 --max-second
 
 `get_posts` 附带的评论通常仍需通过 `get_comments` 独立分页。只有原始 protobuf 明确包含楼中楼数量为零，且主题、论坛、父楼、作者和页码身份均匹配时，才跳过该父楼的 `get_comments`；checkpoint 会记录这项证据来自哪条父楼 API 响应。缺少原始响应、数据不完整或身份不匹配时仍照常请求评论。
 
+#### 恢复旧的评论页身份失败
+
+对于已经失败的评论第 1 页，可在恢复时显式开启一次父楼复核。程序只根据已保存的正楼层和主题页大小选择一个候选帖子页，并通过现有帖子 API 限流器请求一次；只有同一 PID/TID/FID/作者身份匹配，且原始 protobuf 明确包含 `sub_post_number=0` 时才会完成该评论 scope。完成记录会保存旧失败、本次评论页身份失败和新父楼证据；评论页自身的页数、数量和条目数仍留空。没有精确零值证据时，scope 继续保持未完成。
+
+该开关默认关闭，只能与 `--resume` 使用，不能与 `drain-pending` 一起使用。运行模式和排序参数必须与原 run 一致：
+
+```sh
+uv run python main.py --mode backfill --backfill-sort create --resume --run-id 0e8e4ba2-6e13-443d-a2a5-19c6a2507fd9 --revalidate-failed-comment-page-zero
+```
+
+恢复前请先正常停止旧进程；更改在下次启动时生效。该修复只覆盖满足上述条件的旧失败，其他空响应不会被标为无回复。实现与验证记录见[评论页身份失败复核报告](docs/COMMENT_PAGE_IDENTITY_RECOVERY_20261123.md)。
+
 ## 登录与定向网页补采
 
 基础 API 回溯默认不需要登录。需要采集用户吧内快照时，在 `config.toml` 的 `[research]` 中开启：

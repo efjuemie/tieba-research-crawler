@@ -23,6 +23,7 @@ from src.research.models import (
     ResearchWebEnrichmentTask,
 )
 
+from .diagnostics import sanitize_page_readiness_diagnostics
 from .identity import Target
 from .tasks import (
     _GROWTH_FIELDS,
@@ -1433,6 +1434,7 @@ def _safe_diagnostics(values: Any) -> dict[str, Any]:
         else:
             if parsed.tzinfo is not None:
                 output["transport_error_at"] = parsed.astimezone(UTC).isoformat()
+    output.update(sanitize_page_readiness_diagnostics(values))
     return output
 
 

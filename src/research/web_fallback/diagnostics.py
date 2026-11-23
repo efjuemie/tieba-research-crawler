@@ -50,6 +50,72 @@ _TRANSPORT_COMPONENTS = frozenset(
         "web_provider_collect",
     }
 )
+_READINESS_SELECTOR_KEYS = (
+    "first_floor_interactive",
+    "image_text_owner",
+    "pb_content_wrap",
+    "richtext_item",
+    "l_post",
+    "data_field",
+    "data_pid",
+    "identity",
+    "comment_owner",
+    "comment_content",
+    "lzl_wrapper",
+    "show_more_lzl",
+    "nested_owner",
+)
+_READINESS_ENUMS = {
+    "readiness_diagnostic_status": frozenset({"ok", "unavailable", "gate"}),
+    "readiness_url_class": frozenset({"official_thread", "official_gate", "other"}),
+    "readiness_document_state": frozenset({"loading", "interactive", "complete", "unknown"}),
+    "readiness_step": frozenset({"content_snapshot", "target_check", "selector_wait", "unknown"}),
+    "readiness_gate_reason": frozenset({"needs_login", "blocked", "security_verification"}),
+    "readiness_resource_request_budget": frozenset({"unknown"}),
+}
+_READINESS_INT_KEYS = frozenset(
+    {
+        "readiness_main_document_status",
+        "readiness_budget_pages_limit",
+        "readiness_budget_expansions_limit",
+        "readiness_requests",
+        "readiness_observed_subresource_requests",
+        "readiness_page_pc_requests",
+        "readiness_nested_floor_requests",
+        "readiness_user_card_requests",
+        "readiness_budgeted_actions",
+        *(f"readiness_{name}_{metric}" for name in _READINESS_SELECTOR_KEYS for metric in ("count", "visible")),
+    }
+)
+_READINESS_BOOL_KEYS = frozenset(
+    {
+        "readiness_headed",
+        "readiness_main_document_status_known",
+        "readiness_budget_pages_exhausted",
+        "readiness_budget_expansions_exhausted",
+    }
+)
+
+
+def sanitize_page_readiness_diagnostics(values: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Keep only fixed, non-content page-readiness facts."""
+    if not values:
+        return {}
+    sanitized: dict[str, Any] = {}
+    for key, allowed in _READINESS_ENUMS.items():
+        value = values.get(key)
+        if isinstance(value, str) and value in allowed:
+            sanitized[key] = value
+    for key in _READINESS_INT_KEYS:
+        value = values.get(key)
+        if type(value) is int and value >= 0:
+            if key != "readiness_main_document_status" or 100 <= value <= 599:
+                sanitized[key] = value
+    for key in _READINESS_BOOL_KEYS:
+        value = values.get(key)
+        if type(value) is bool:
+            sanitized[key] = value
+    return sanitized
 
 
 def sanitize_web_diagnostics(values: Mapping[str, Any] | None) -> dict[str, int | float | str | bool]:
@@ -96,6 +162,7 @@ def sanitize_web_diagnostics(values: Mapping[str, Any] | None) -> dict[str, int 
         sanitized.setdefault("http_429", 1)
     if blocked_reason in {"http_auth_or_verification", "needs_login", "auth_required"}:
         sanitized.setdefault("auth_pauses", 1)
+    sanitized.update(sanitize_page_readiness_diagnostics(values))
     return sanitized
 
 
