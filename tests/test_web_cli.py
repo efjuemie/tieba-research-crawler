@@ -287,6 +287,37 @@ def _browser_result(
     )
 
 
+def _manual_gate_result(status, reason):
+    return _browser_result(
+        status,
+        reason,
+        diagnostics={"manual_gate_detected": True, "blocked_reason": reason},
+    )
+
+
+def test_manual_gate_requires_browser_evidence_and_a_retained_page():
+    result = _browser_result("blocked", "security_verification")
+    provider = SimpleNamespace(has_manual_login_page=True)
+
+    assert service._is_manual_gate(result, provider) is False
+    assert service._is_manual_gate(
+        _browser_result(
+            "blocked",
+            "security_verification",
+            diagnostics={"manual_gate_detected": False},
+        ),
+        provider,
+    ) is False
+    assert service._is_manual_gate(_manual_gate_result("blocked", "http_429"), provider) is False
+    assert service._is_manual_gate(
+        _manual_gate_result("blocked", "security_verification"),
+        SimpleNamespace(has_manual_login_page=False),
+    ) is False
+    assert service._is_manual_gate(
+        _manual_gate_result("blocked", "security_verification"), provider
+    ) is True
+
+
 @pytest.mark.asyncio
 async def test_field_backfill_dry_run_has_no_provider_or_task_writes(monkeypatch, tmp_path):
     plan = _plan()
@@ -457,6 +488,108 @@ async def test_blocked_429_stops_without_retrying_remaining_targets(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_security_verification_stays_blocked_without_manual_wait_flag(monkeypatch):
+    plan = _plan()
+    failures = []
+    provider = _FakeProvider(
+        [_browser_result("blocked", "security_verification")],
+        has_manual_login_page=True,
+    )
+
+    async def enqueue(*_args, **_kwargs):
+        return _summary(plan)
+
+    async def lease(*_args, **_kwargs):
+        return [SimpleNamespace(task_key=plan.task_key, lease_token="synthetic-token")]
+
+    async def fail(*_args, **kwargs):
+        failures.append(kwargs)
+
+    monkeypatch.setattr(service, "enqueue_web_enrichment_tasks", enqueue)
+    monkeypatch.setattr(service, "lease_web_enrichment_tasks", lease)
+    monkeypatch.setattr(service, "_preflight_web_task", _ready_preflight)
+    monkeypatch.setattr(service, "_fail_task", fail)
+    result = await service.run_field_backfill(
+        object(),
+        "synthetic-run",
+        ("ip_location_text",),
+        service.TargetFilters("comment"),
+        browser_profile="/private/synthetic-profile",
+        request_budget=_FakeBudget(),
+        browser_config=SimpleNamespace(max_pages=1, max_expansions=1, timeout_seconds=30),
+        provider_factory=lambda **_kwargs: provider,
+    )
+
+    assert failures[0]["status"] == "blocked"
+    assert failures[0]["reason_code"] == "security_verification"
+    assert result.stopped_reason == "security_verification"
+    assert provider.login_page_closed == 0
+    assert provider.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_unverified_blocked_target_stops_field_backfill_before_next_target(monkeypatch):
+    first, second = _plan("task-a"), _plan("task-b")
+    leases = iter((first, second))
+    lease_calls = []
+    failures = []
+    provider = _FakeProvider(
+        [
+            _browser_result(
+                "blocked",
+                "security_verification",
+                diagnostics={"manual_gate_detected": False},
+            ),
+            _browser_result("ok"),
+        ],
+        has_manual_login_page=True,
+    )
+
+    async def enqueue(*_args, **_kwargs):
+        return _summary(first, second)
+
+    async def lease(*_args, **kwargs):
+        lease_calls.append(kwargs)
+        next_plan = next(leases, None)
+        if next_plan is None:
+            return []
+        return [
+            SimpleNamespace(
+                task_key=next_plan.task_key,
+                lease_token=f"{next_plan.task_key}-token",
+                requested_fields=("ip_location_text",),
+            )
+        ]
+
+    async def fail(*_args, **kwargs):
+        failures.append(kwargs)
+
+    monkeypatch.setattr(service, "enqueue_web_enrichment_tasks", enqueue)
+    monkeypatch.setattr(service, "lease_web_enrichment_tasks", lease)
+    monkeypatch.setattr(service, "_preflight_web_task", _ready_preflight)
+    monkeypatch.setattr(service, "_fail_task", fail)
+    result = await service.run_field_backfill(
+        object(),
+        "synthetic-run",
+        ("ip_location_text",),
+        service.TargetFilters("comment"),
+        browser_profile="/private/synthetic-profile",
+        headed=True,
+        wait_for_login=True,
+        request_budget=_FakeBudget(),
+        browser_config=SimpleNamespace(max_pages=1, max_expansions=1, timeout_seconds=30),
+        provider_factory=lambda **_kwargs: provider,
+    )
+
+    assert len(lease_calls) == 1
+    assert len(provider.targets) == 1
+    assert failures[0]["status"] == "blocked"
+    assert result.stopped_reason == "security_verification"
+    assert provider.login_page_closed == 0
+    assert provider.closed == 1
+
+
+@pytest.mark.asyncio
 async def test_retryable_field_backfill_uses_persisted_retry_policy(monkeypatch):
     plan = _plan()
     failures = []
@@ -502,6 +635,51 @@ async def test_retryable_field_backfill_uses_persisted_retry_policy(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_field_backfill_transport_reset_stops_before_next_target(monkeypatch):
+    first, second = _plan("task-a"), _plan("task-b")
+    lease_calls = []
+    failures = []
+    provider = _FakeProvider([_browser_result("failed_retryable", "transport_reset")])
+
+    async def enqueue(*_args, **_kwargs):
+        return _summary(first, second)
+
+    async def lease(*_args, **kwargs):
+        lease_calls.append(kwargs)
+        return [
+            SimpleNamespace(
+                task_key=first.task_key,
+                lease_token="synthetic-token",
+                requested_fields=("ip_location_text",),
+            )
+        ]
+
+    async def fail(*_args, **kwargs):
+        failures.append(kwargs)
+
+    monkeypatch.setattr(service, "enqueue_web_enrichment_tasks", enqueue)
+    monkeypatch.setattr(service, "lease_web_enrichment_tasks", lease)
+    monkeypatch.setattr(service, "_preflight_web_task", _ready_preflight)
+    monkeypatch.setattr(service, "_fail_task", fail)
+    result = await service.run_field_backfill(
+        object(),
+        "synthetic-run",
+        ("ip_location_text",),
+        service.TargetFilters("comment"),
+        browser_profile="/private/synthetic-profile",
+        request_budget=_FakeBudget(),
+        browser_config=SimpleNamespace(max_pages=1, max_expansions=1, timeout_seconds=30),
+        provider_factory=lambda **_kwargs: provider,
+    )
+
+    assert len(lease_calls) == 1
+    assert len(provider.targets) == 1
+    assert failures[0]["status"] == "failed_retryable"
+    assert result.stopped_reason == "transport_reset"
+    assert provider.closed == 1
+
+
+@pytest.mark.asyncio
 async def test_durable_timeout_uses_persisted_retry_policy(monkeypatch):
     failures = []
     target = service._target_from_plan(_plan())
@@ -532,6 +710,39 @@ async def test_durable_timeout_uses_persisted_retry_policy(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_durable_transport_reset_stays_retryable_and_keeps_component_diagnostics(monkeypatch):
+    failures = []
+    target = service._target_from_plan(_plan())
+    lease = SimpleNamespace(
+        run_id="synthetic-run",
+        task_key="synthetic-task",
+        lease_token="synthetic-token",
+        requested_fields=target.requested_fields,
+    )
+
+    class Provider:
+        async def collect(self, _target):
+            raise ConnectionResetError("synthetic reset")
+
+    async def fail(_sessions, _task_key, _lease_token, **kwargs):
+        failures.append(kwargs)
+        return "failed_retryable"
+
+    monkeypatch.setattr(service, "_target_from_lease", lambda _lease: target)
+    monkeypatch.setattr(service, "_preflight_web_task", _ready_preflight)
+    monkeypatch.setattr(service, "_fail_task", fail)
+
+    status, result = await service._process_durable_web_lease(object(), Provider(), lease)
+
+    assert status == "failed_retryable"
+    assert result.reason == "transport_reset"
+    assert failures[0]["status"] == "failed_retryable"
+    assert failures[0]["reason_code"] == "transport_reset"
+    assert failures[0]["diagnostics"]["transport_error_type"] == "ConnectionResetError"
+    assert failures[0]["diagnostics"]["transport_component"] == "web_provider_collect"
+
+
+@pytest.mark.asyncio
 async def test_drain_waits_for_future_retry_then_finishes(monkeypatch):
     lease = SimpleNamespace(
         task_key="synthetic-task",
@@ -558,6 +769,9 @@ async def test_drain_waits_for_future_retry_then_finishes(monkeypatch):
     async def unresolved(*_args):
         return 0
 
+    async def status_counts(*_args):
+        return {"failed_retryable": 1}
+
     async def timeout(*_args):
         raise TimeoutError("synthetic browser timeout")
 
@@ -566,6 +780,7 @@ async def test_drain_waits_for_future_retry_then_finishes(monkeypatch):
     monkeypatch.setattr(service, "_fail_task", fail)
     monkeypatch.setattr(service, "_next_retry_delay", next_delay)
     monkeypatch.setattr(service, "_count_unresolved_web_tasks", unresolved)
+    monkeypatch.setattr(service, "_web_task_status_counts", status_counts)
     monkeypatch.setattr(service.asyncio, "sleep", record_sleep)
     summary = await service.drain_pending_web_enrichment(
         object(), ("synthetic-run",), provider=object(), wait_for_login=False
@@ -575,6 +790,150 @@ async def test_drain_waits_for_future_retry_then_finishes(monkeypatch):
     assert waits == [30]
     assert summary.collected_count == 1
     assert summary.stopped_reason == "queue_drained"
+
+
+@pytest.mark.asyncio
+async def test_drain_transport_reset_stops_before_leasing_another_target(monkeypatch):
+    lease = SimpleNamespace(
+        run_id="synthetic-run",
+        target_type="comment",
+        task_key="synthetic-task",
+        lease_token="synthetic-token",
+        requested_fields=("ip_location_text",),
+    )
+    lease_calls = 0
+
+    async def next_lease(*_args):
+        nonlocal lease_calls
+        lease_calls += 1
+        assert lease_calls == 1
+        return lease
+
+    async def process(*_args, **_kwargs):
+        return "failed_retryable", _browser_result("failed_retryable", "transport_reset")
+
+    async def unresolved(*_args):
+        return 1
+
+    monkeypatch.setattr(service, "_lease_one_web_task", next_lease)
+    monkeypatch.setattr(service, "_process_durable_web_lease", process)
+    monkeypatch.setattr(service, "_count_unresolved_web_tasks", unresolved)
+    summary = await service.drain_pending_web_enrichment(
+        object(), ("synthetic-run",), provider=object(), wait_for_login=False
+    )
+
+    assert lease_calls == 1
+    assert summary.retryable_count == 1
+    assert summary.stopped_reason == "transport_reset"
+    assert summary.unresolved_count == 1
+
+
+@pytest.mark.asyncio
+async def test_live_worker_transport_reset_stops_web_without_draining(monkeypatch):
+    stop_event = asyncio.Event()
+    api_done_event = asyncio.Event()
+    lease = SimpleNamespace(
+        run_id="synthetic-run",
+        target_type="comment",
+        task_key="synthetic-task",
+        lease_token="synthetic-token",
+        requested_fields=("ip_location_text",),
+    )
+    lease_calls = 0
+    drain_calls = []
+    provider = _FakeProvider([])
+
+    async def next_lease(*_args):
+        nonlocal lease_calls
+        lease_calls += 1
+        assert lease_calls == 1
+        return lease
+
+    async def process(*_args, **_kwargs):
+        api_done_event.set()
+        return "failed_retryable", _browser_result("failed_retryable", "transport_reset")
+
+    async def drain(*_args, **_kwargs):
+        drain_calls.append(True)
+        raise AssertionError("a transport reset must stop further WEB actions")
+
+    async def unresolved(*_args):
+        return 1
+
+    monkeypatch.setattr(service, "_lease_one_web_task", next_lease)
+    monkeypatch.setattr(service, "_process_durable_web_lease", process)
+    monkeypatch.setattr(service, "drain_pending_web_enrichment", drain)
+    monkeypatch.setattr(service, "_count_unresolved_web_tasks", unresolved)
+    summary = await service.run_live_web_fallback_worker(
+        object(),
+        lambda: ("synthetic-run",),
+        stop_event=stop_event,
+        api_done_event=api_done_event,
+        browser_profile="/private/synthetic-profile",
+        request_budget=_FakeBudget(),
+        browser_config=SimpleNamespace(max_pages=1, max_expansions=1, timeout_seconds=30),
+        provider_factory=lambda **_kwargs: provider,
+    )
+
+    assert lease_calls == 1
+    assert drain_calls == []
+    assert summary.retryable_count == 1
+    assert summary.stopped_reason == "transport_reset"
+    assert summary.unresolved_count == 1
+    assert provider.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_live_worker_logs_bounded_queue_wait_state_without_starting_browser(
+    monkeypatch, caplog
+):
+    import logging
+
+    stop_event = asyncio.Event()
+    provider = _FakeProvider([])
+    status_count_calls = []
+
+    async def no_lease(*_args):
+        return None
+
+    async def no_retry_delay(*_args):
+        return None
+
+    async def status_counts(_sessions, run_ids):
+        status_count_calls.append(tuple(run_ids))
+        return {"blocked": 3, "needs_login": 1}
+
+    async def wait_then_stop(event, _timeout):
+        event.set()
+
+    async def unresolved(*_args):
+        return 4
+
+    monkeypatch.setattr(service, "_lease_one_web_task", no_lease)
+    monkeypatch.setattr(service, "_next_retry_delay", no_retry_delay)
+    monkeypatch.setattr(service, "_web_task_status_counts", status_counts)
+    monkeypatch.setattr(service, "_wait_for_stop_or_timeout", wait_then_stop)
+    monkeypatch.setattr(service, "_count_unresolved_web_tasks", unresolved)
+    with caplog.at_level(logging.INFO, logger=service.__name__):
+        summary = await service.run_live_web_fallback_worker(
+            object(),
+            lambda: ("synthetic-run",),
+            stop_event=stop_event,
+            browser_profile="/private/synthetic-profile",
+            request_budget=_FakeBudget(),
+            browser_config=SimpleNamespace(
+                max_pages=1, max_expansions=1, timeout_seconds=30
+            ),
+            provider_factory=lambda **_kwargs: provider,
+        )
+
+    assert status_count_calls == [("synthetic-run",)]
+    assert "statuses={'blocked': 3, 'needs_login': 1}" in caplog.text
+    assert "browser_context_started=False" in caplog.text
+    assert "reason=no_eligible_lease" in caplog.text
+    assert summary.unresolved_count == 4
+    assert summary.stopped_reason == "stop_requested"
+    assert provider.closed == 1
 
 
 @pytest.mark.asyncio
@@ -634,13 +993,57 @@ async def test_live_worker_timeout_uses_persisted_retry_policy(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_manual_login_releases_lease_before_confirmation_and_resumes_exact_task(monkeypatch):
+async def test_live_worker_summary_reports_blocking_target_and_task_counts(monkeypatch):
+    stop_event = asyncio.Event()
+    lease = SimpleNamespace(
+        run_id="synthetic-run",
+        target_type="comment",
+        task_key="synthetic-task",
+        lease_token="synthetic-token",
+        requested_fields=("ip_location_text",),
+    )
+    provider = _FakeProvider([])
+
+    async def next_lease(*_args):
+        return lease
+
+    async def blocked(*_args, **_kwargs):
+        return "blocked", _browser_result("blocked", "security_verification")
+
+    async def unresolved(_sessions, _run_ids):
+        return 4
+
+    monkeypatch.setattr(service, "_lease_one_web_task", next_lease)
+    monkeypatch.setattr(service, "_process_durable_web_lease", blocked)
+    monkeypatch.setattr(service, "_count_unresolved_web_tasks", unresolved)
+    summary = await service.run_live_web_fallback_worker(
+        object(),
+        lambda: ("synthetic-run",),
+        stop_event=stop_event,
+        browser_profile="/private/synthetic-profile",
+        request_budget=_FakeBudget(),
+        browser_config=SimpleNamespace(max_pages=1, max_expansions=1, timeout_seconds=30),
+        provider_factory=lambda **_kwargs: provider,
+    )
+
+    assert summary.stopped_reason == "security_verification"
+    assert summary.stopped_run_id == "synthetic-run"
+    assert summary.stopped_target_type == "comment"
+    assert summary.completed_count == 0
+    assert summary.retryable_count == 0
+    assert summary.blocked_count == 1
+    assert summary.unresolved_count == 4
+    assert provider.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_security_verification_releases_lease_and_retries_exact_task_once(monkeypatch):
     plan = _plan()
     lease_count = 0
     lease_live = False
     calls = []
     provider = _FakeProvider(
-        [_browser_result("blocked", "http_auth_or_verification"), _browser_result()],
+        [_manual_gate_result("blocked", "security_verification"), _browser_result()],
         has_manual_login_page=True,
     )
 
@@ -703,6 +1106,68 @@ async def test_manual_login_releases_lease_before_confirmation_and_resumes_exact
     assert result.completed_count == 1
     assert result.collected_count == 2
     assert result.stopped_reason is None
+
+
+@pytest.mark.asyncio
+async def test_manual_security_verification_is_confirmed_at_most_once(monkeypatch):
+    plan = _plan()
+    lease_count = 0
+    confirmations = []
+    failures = []
+    provider = _FakeProvider(
+        [
+            _manual_gate_result("blocked", "security_verification"),
+            _manual_gate_result("blocked", "security_verification"),
+        ],
+        has_manual_login_page=True,
+    )
+
+    async def enqueue(*_args, **_kwargs):
+        return _summary(plan)
+
+    async def lease(*_args, **_kwargs):
+        nonlocal lease_count
+        lease_count += 1
+        if lease_count <= 2:
+            return [SimpleNamespace(task_key=plan.task_key, lease_token=f"token-{lease_count}")]
+        return []
+
+    async def fail(*_args, **kwargs):
+        failures.append(kwargs)
+
+    async def resume(*_args, **kwargs):
+        assert kwargs["task_keys"] == (plan.task_key,)
+        return 1
+
+    async def confirm(_provider, _timeout):
+        confirmations.append(True)
+        return True
+
+    monkeypatch.setattr(service, "enqueue_web_enrichment_tasks", enqueue)
+    monkeypatch.setattr(service, "lease_web_enrichment_tasks", lease)
+    monkeypatch.setattr(service, "_preflight_web_task", _ready_preflight)
+    monkeypatch.setattr(service, "_fail_task", fail)
+    monkeypatch.setattr(service, "resume_web_enrichment_tasks", resume)
+    result = await service.run_field_backfill(
+        object(),
+        "synthetic-run",
+        ("ip_location_text",),
+        service.TargetFilters("comment"),
+        browser_profile="/private/synthetic-profile",
+        headed=True,
+        wait_for_login=True,
+        request_budget=_FakeBudget(),
+        browser_config=SimpleNamespace(max_pages=1, max_expansions=1, timeout_seconds=30),
+        provider_factory=lambda **_kwargs: provider,
+        login_confirmation=confirm,
+    )
+
+    assert len(confirmations) == 1
+    assert len(failures) == 2
+    assert all(failure["status"] == "blocked" for failure in failures)
+    assert result.completed_count == 0
+    assert result.stopped_reason == "manual_login_page_unavailable"
+    assert provider.closed == 1
 
 
 @pytest.mark.asyncio
@@ -836,6 +1301,8 @@ async def test_login_or_stop_cancellation_cleans_up_both_waiters():
 
 @pytest.mark.asyncio
 async def test_web_audit_is_private_and_does_not_reconcile_or_enqueue(monkeypatch, tmp_path):
+    import os
+
     plan = _plan()
     provider = _FakeProvider([_browser_result(identity_verified=True)])
     planner_calls = []
@@ -903,8 +1370,9 @@ async def test_web_audit_is_private_and_does_not_reconcile_or_enqueue(monkeypatc
             },
         )
     ]
-    assert S_IMODE(output.parent.stat().st_mode) == 0o700
-    assert S_IMODE(output.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert S_IMODE(output.parent.stat().st_mode) == 0o700
+        assert S_IMODE(output.stat().st_mode) == 0o600
     assert provider.closed == 1
 
 
@@ -934,14 +1402,27 @@ def test_browser_configuration_error_prints_fixed_optional_install_help(monkeypa
     assert "must never be printed" not in captured.err
 
 
+@pytest.mark.parametrize(
+    ("plan_status", "gate_result"),
+    [
+        ("pending_web", _manual_gate_result("needs_login", "official_verification")),
+        ("blocked", _manual_gate_result("blocked", "security_verification")),
+    ],
+)
 @pytest.mark.asyncio
-async def test_web_audit_confirms_login_and_retries_target_once_without_task_writes(monkeypatch, tmp_path):
-    plan = _plan()
+async def test_web_audit_confirms_manual_gate_and_retries_target_once_without_task_writes(
+    monkeypatch, tmp_path, plan_status, gate_result
+):
+    plan = _plan(status=plan_status)
+    filters = service.TargetFilters(
+        "comment",
+        (plan.target_id,),
+        tid=plan.tid,
+        fid=plan.fid,
+        parent_pid=plan.parent_post_pid,
+    )
     provider = _FakeProvider(
-        [
-            _browser_result("needs_login", "official_verification"),
-            _browser_result(identity_verified=True),
-        ],
+        [gate_result, _browser_result(identity_verified=True)],
         has_manual_login_page=True,
     )
     confirmations = []
@@ -970,7 +1451,7 @@ async def test_web_audit_confirms_login_and_retries_target_once_without_task_wri
         object(),
         "synthetic-run",
         ("ip_location_text",),
-        service.TargetFilters("comment"),
+        filters,
         output_dir=tmp_path / "reports",
         browser_profile="/private/synthetic-profile",
         headed=True,
@@ -995,11 +1476,46 @@ async def test_web_audit_confirms_login_and_retries_target_once_without_task_wri
     assert report["task_rows_written"] is False
 
 
+@pytest.mark.parametrize("wait_for_login", [False, True])
+@pytest.mark.asyncio
+async def test_web_audit_does_not_collect_unscoped_blocked_target(monkeypatch, tmp_path, wait_for_login):
+    plan = _plan(status="blocked")
+
+    async def planner(*_args, **_kwargs):
+        return (plan,)
+
+    async def snapshot(*_args):
+        return {"status": "found", "fields": {}, "urls": {}}
+
+    async def should_not_open_browser(**_kwargs):
+        pytest.fail("blocked manual verification requires a precise target filter")
+
+    monkeypatch.setattr(service, "plan_web_enrichment_targets", planner)
+    monkeypatch.setattr(service, "_read_canonical_snapshot", snapshot)
+    output = await service.run_web_audit(
+        object(),
+        "synthetic-run",
+        ("ip_location_text",),
+        service.TargetFilters("comment"),
+        output_dir=tmp_path / "reports",
+        browser_profile="/private/synthetic-profile",
+        headed=wait_for_login,
+        wait_for_login=wait_for_login,
+        request_budget=_FakeBudget(),
+        browser_config=SimpleNamespace(max_pages=1, max_expansions=1, timeout_seconds=30),
+        provider_factory=should_not_open_browser,
+    )
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["targets"][0]["status"] == "blocked"
+    assert report["task_rows_written"] is False
+
+
 @pytest.mark.asyncio
 async def test_web_audit_login_timeout_writes_only_report_and_closes_provider(monkeypatch, tmp_path):
     plan = _plan()
     provider = _FakeProvider(
-        [_browser_result("needs_login", "official_verification")],
+        [_manual_gate_result("needs_login", "official_verification")],
         has_manual_login_page=True,
     )
 
@@ -1047,7 +1563,7 @@ async def test_web_audit_login_timeout_writes_only_report_and_closes_provider(mo
 async def test_web_audit_login_cancellation_closes_provider_without_report_or_writes(monkeypatch, tmp_path):
     plan = _plan()
     provider = _FakeProvider(
-        [_browser_result("needs_login", "official_verification")],
+        [_manual_gate_result("needs_login", "official_verification")],
         has_manual_login_page=True,
     )
     confirmation_started = asyncio.Event()
@@ -1160,6 +1676,9 @@ def test_web_audit_does_not_treat_legacy_bawu_false_as_a_known_zero():
 async def test_terminal_confirmation_removes_reader_on_timeout_and_cancel(monkeypatch):
     import os
 
+    if os.name == "nt":
+        pytest.skip("the add_reader cleanup path is not used for Windows consoles")
+
     read_fd, write_fd = os.pipe()
 
     @dataclass
@@ -1183,3 +1702,42 @@ async def test_terminal_confirmation_removes_reader_on_timeout_and_cancel(monkey
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+@pytest.mark.asyncio
+async def test_windows_terminal_confirmation_polls_tty_without_reader_or_thread(monkeypatch):
+    import os
+
+    @dataclass
+    class FakeInput:
+        tty: bool
+
+        def isatty(self):
+            return self.tty
+
+    monkeypatch.setattr(os, "name", "nt")
+    checks = iter((False, True))
+    monkeypatch.setattr(service, "_windows_console_enter_pressed", lambda: next(checks))
+
+    assert await service._wait_for_terminal_enter(1, stream=FakeInput(True)) is True
+    assert await service._wait_for_terminal_enter(0.01, stream=FakeInput(False)) is False
+
+
+@pytest.mark.asyncio
+async def test_windows_terminal_confirmation_times_out_and_cancels_without_background_reader(monkeypatch):
+    import os
+
+    @dataclass
+    class FakeInput:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(service, "_windows_console_enter_pressed", lambda: False)
+
+    assert await service._wait_for_terminal_enter(0.01, stream=FakeInput()) is False
+    task = asyncio.create_task(service._wait_for_terminal_enter(5, stream=FakeInput()))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

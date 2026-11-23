@@ -168,6 +168,8 @@ depth = 3
 # 自动网页补采和显式 field-backfill / web-audit 命令共用这些设置。
 [web_fallback]
 browser_profile = "data/web-fallback-profile"
+# 同一 run 的同一父楼下，重用已验证的自然响应快照；默认关闭。
+web_parent_batch_enabled = false
 max_pages = 1
 max_expansions = 10
 timeout_seconds = 90.0

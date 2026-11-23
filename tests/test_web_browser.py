@@ -198,6 +198,7 @@ class FakePage:
         has_wrapper=True,
         has_nested_items=False,
         close_delay=0,
+        close_error=None,
         scroll_html_sequence=None,
         comment_growth_hover_points=None,
         hovered_html_text=None,
@@ -222,6 +223,7 @@ class FakePage:
         self.has_wrapper = has_wrapper
         self.has_nested_items = has_nested_items
         self.close_delay = close_delay
+        self.close_error = close_error
         self.scroll_html_sequence = list(scroll_html_sequence or ())
         self.comment_growth_hover_points = list(comment_growth_hover_points or ())
         self.hovered_html_text = hovered_html_text
@@ -319,6 +321,8 @@ class FakePage:
     async def close(self):
         if self.close_delay:
             await asyncio.sleep(self.close_delay)
+        if self.close_error is not None:
+            raise self.close_error
         self.closed = True
 
 
@@ -541,6 +545,38 @@ def _page_pc_response(*, cid=CID):
                 }
             ],
             "user_list": [{"id": int(AUTHOR_ID), "ip_address": "合成地区"}],
+        },
+        ensure_ascii=False,
+    )
+
+
+def _page_pc_parent_response(comments):
+    return json.dumps(
+        {
+            "error_code": 0,
+            "forum": {"id": int(FID)},
+            "thread": {
+                "id": int(TID),
+                "post_id": int(POST_ID),
+                "author": {"id": int(AUTHOR_ID)},
+            },
+            "first_floor": {"id": int(POST_ID), "author_id": int(AUTHOR_ID)},
+            "post_list": [
+                {
+                    "id": int(POST_ID),
+                    "sub_post_list": {
+                        "pid": int(POST_ID),
+                        "sub_post_list": [
+                            {"id": int(cid), "author_id": int(author_id)}
+                            for cid, author_id, _ip in comments
+                        ],
+                    },
+                }
+            ],
+            "user_list": [
+                {"id": int(author_id), "ip_address": ip_address}
+                for _cid, author_id, ip_address in comments
+            ],
         },
         ensure_ascii=False,
     )
@@ -1049,6 +1085,216 @@ async def test_post_page_snapshot_reuses_one_live_page_for_other_exact_post_ids(
 
 
 @pytest.mark.asyncio
+async def test_comment_parent_snapshot_reuses_page_pc_and_nested_floor_per_cid_and_resets_by_run():
+    sibling_cid = "9007199254740994"
+    sibling_author = "77004"
+    anchor = _comment_target(requested_fields=("ip_location_text",))
+    sibling = _comment_target(
+        target_id=sibling_cid,
+        cid=sibling_cid,
+        author_user_id=sibling_author,
+        requested_fields=("ip_location_text",),
+    )
+    shared_response = _page_pc_parent_response(
+        ((CID, AUTHOR_ID, "黑龙江"), (sibling_cid, sibling_author, "浙江"))
+    )
+    old_context = FakeContext(
+        lambda: FakePage(page_pc_response_text=shared_response, nested_response_text=_nested_response())
+    )
+    old_provider = _provider(old_context, reuse_parent_snapshots=False)
+    old_first = await old_provider.collect(anchor)
+    old_second = await old_provider.collect(sibling)
+    assert old_first.status == old_second.status == "ok"
+    assert sum(len(page.goto_urls) for page in old_context.pages) == 2
+    assert sum(result.diagnostics["page_pc_requests"] for result in (old_first, old_second)) == 2
+    assert sum(result.diagnostics["nested_floor_requests"] for result in (old_first, old_second)) == 2
+    await old_provider.close()
+
+    pages = [
+        FakePage(page_pc_response_text=shared_response, nested_response_text=_nested_response()),
+        FakePage(
+            page_pc_response_text=shared_response,
+            nested_response_text=_nested_response(cid=sibling_cid, author_id=sibling_author),
+        ),
+    ]
+    context = FakeContext(lambda: pages.pop(0))
+    provider = _provider(context, reuse_parent_snapshots=True)
+    provider.set_run_scope("run-one")
+
+    first = await provider.collect(anchor)
+    second = await provider.collect(sibling)
+
+    assert first.status == second.status == "ok"
+    assert first.diagnostics["page_pc_requests"] == 1
+    assert first.diagnostics["nested_floor_requests"] == 1
+    assert second.diagnostics["parent_snapshot_hits"] == 1
+    assert second.diagnostics["pages"] == 0
+    second_candidate = next(
+        candidate for candidate in second.candidates if candidate.field_name == "ip_location_text"
+    )
+    assert second_candidate.normalized_value == "浙江"
+    assert second_candidate.identity.cid == sibling_cid
+    assert second_candidate.identity.author_user_id == sibling_author
+    assert len(context.pages) == 1
+    assert len(context.pages[0].goto_urls) == 1
+
+    provider.set_run_scope("run-two")
+    third = await provider.collect(sibling)
+
+    assert third.status == "ok"
+    assert third.diagnostics["parent_snapshot_hits"] == 0
+    assert third.diagnostics["pages"] == 1
+    assert len(context.pages) == 2
+    assert len(context.pages[1].goto_urls) == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_parent_snapshot_publishes_only_after_full_identity_success():
+    page = FakePage(
+        page_pc_response_text=_page_pc_parent_response(((CID, AUTHOR_ID, "黑龙江"),)),
+        nested_response_text=_nested_response(author_id=str(int(AUTHOR_ID) + 1)),
+    )
+    provider = _provider(FakeContext(lambda: page), reuse_parent_snapshots=True)
+
+    result = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+
+    assert result.status == "identity_unverified"
+    assert result.reason is not None
+    assert provider._cached_parent_snapshot is None
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_snapshot_growth_miss_falls_back_to_exact_cid_dom():
+    sibling_cid = str(int(CID) + 1)
+    sibling_author = str(int(AUTHOR_ID) + 1)
+    shared_response = _page_pc_parent_response(
+        ((CID, AUTHOR_ID, "黑龙江"), (sibling_cid, sibling_author, "浙江"))
+    )
+    anchor = _comment_target(requested_fields=("ip_location_text",))
+    sibling = _comment_target(
+        target_id=sibling_cid,
+        cid=sibling_cid,
+        author_user_id=sibling_author,
+        requested_fields=("global_growth_level", "global_growth_icon_url"),
+    )
+
+    old_pages = [
+        FakePage(
+            page_pc_response_text=shared_response,
+            nested_response_text=_nested_response(),
+        ),
+        FakePage(
+            html_text=_comment_author_growth_html(include_growth_icon=True, growth_tooltip=True),
+            page_pc_response_text=shared_response,
+            nested_response_text=_nested_response(cid=sibling_cid, author_id=sibling_author),
+        ),
+    ]
+    old_context = FakeContext(lambda: old_pages.pop(0))
+    old_provider = _provider(old_context)
+    await old_provider.collect(anchor)
+    old_result = await old_provider.collect(sibling)
+    await old_provider.close()
+
+    pages = [
+        FakePage(
+            page_pc_response_text=shared_response,
+            nested_response_text=_nested_response(),
+        ),
+        FakePage(
+            html_text=_comment_author_growth_html(include_growth_icon=True, growth_tooltip=True),
+            page_pc_response_text=shared_response,
+            nested_response_text=_nested_response(cid=sibling_cid, author_id=sibling_author),
+        ),
+    ]
+    context = FakeContext(lambda: pages.pop(0))
+    provider = _provider(context, reuse_parent_snapshots=True)
+    await provider.collect(anchor)
+    new_result = await provider.collect(sibling)
+
+    assert old_result.status == new_result.status == "ok", (
+        old_result.status,
+        old_result.reason,
+        new_result.status,
+        new_result.reason,
+    )
+    assert {candidate.field_name: candidate.normalized_value for candidate in old_result.candidates} == {
+        candidate.field_name: candidate.normalized_value for candidate in new_result.candidates
+    }
+    assert {candidate.field_name for candidate in new_result.candidates} == {
+        "global_growth_level",
+        "global_growth_icon_url",
+    }
+    assert new_result.diagnostics["parent_snapshot_misses"] == 1
+    assert new_result.diagnostics["pages"] == 1
+    assert len(context.pages) == 2
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_parent_snapshot_has_ttl_and_eight_target_cap():
+    siblings = [
+        (str(9007199254741000 + index), str(77100 + index), f"地区{index}")
+        for index in range(8)
+    ]
+    comments = [(CID, AUTHOR_ID, "黑龙江"), *siblings]
+    shared_response = _page_pc_parent_response(comments)
+    pages = [
+        FakePage(page_pc_response_text=shared_response, nested_response_text=_nested_response())
+        for _ in range(3)
+    ]
+    context = FakeContext(lambda: pages.pop(0))
+    provider = _provider(context, reuse_parent_snapshots=True)
+    provider.set_run_scope("synthetic-run")
+
+    anchor = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+    hits = []
+    for cid, author_id, _region in siblings[:7]:
+        result = await provider.collect(
+            _comment_target(
+                target_id=cid,
+                cid=cid,
+                author_user_id=author_id,
+                requested_fields=("ip_location_text",),
+            )
+        )
+        hits.append(result)
+
+    assert anchor.status == "ok"
+    assert all(result.status == "ok" and result.diagnostics["parent_snapshot_hits"] == 1 for result in hits)
+    assert len(context.pages) == 1
+    capped = await provider.collect(
+        _comment_target(
+            target_id=siblings[7][0],
+            cid=siblings[7][0],
+            author_user_id=siblings[7][1],
+            requested_fields=("ip_location_text",),
+        )
+    )
+    assert capped.status == "ok"
+    assert capped.diagnostics["parent_snapshot_hits"] == 0
+    assert capped.diagnostics["pages"] == 1
+    assert len(context.pages) == 2
+
+    assert provider._cached_parent_snapshot is not None
+    provider._cached_parent_snapshot.cached_at = 0
+    expired = await provider.collect(
+        _comment_target(
+            target_id=siblings[0][0],
+            cid=siblings[0][0],
+            author_user_id=siblings[0][1],
+            requested_fields=("ip_location_text",),
+        )
+    )
+    assert expired.status == "ok"
+    assert expired.diagnostics["parent_snapshot_hits"] == 0
+    assert expired.diagnostics["pages"] == 1
+    assert len(context.pages) == 3
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_post_waits_for_virtualized_owner_after_exact_network_identity():
     page = FakePage(
         html_text="<html><body></body></html>",
@@ -1337,6 +1583,67 @@ async def test_provider_stops_on_429_and_notifies_shared_gate():
 
 
 @pytest.mark.asyncio
+async def test_429_remains_sticky_when_later_403_and_response_reset_arrive(monkeypatch):
+    blocked = []
+    page = FakePage(
+        status=429,
+        title="百度安全验证",
+        page_pc_response_text=_page_pc_response(),
+    )
+    original_goto = page.goto
+    original_text = FakeResponse.text
+
+    async def goto_with_later_403(url, **kwargs):
+        await original_goto(url, **kwargs)
+        document = FakeRequest(url, resource_type="document")
+        page.emit("response", FakeResponse(document, status=403))
+        return FakeResponse(document, status=403)
+
+    async def response_body(self):
+        if PAGE_PC_PATH in self.url:
+            raise ConnectionResetError("synthetic response reset")
+        return await original_text(self)
+
+    page.goto = goto_with_later_403
+    monkeypatch.setattr(FakeResponse, "text", response_body)
+    provider = _provider(FakeContext(lambda: page), on_blocked=blocked.append)
+
+    result = await provider.collect(_thread_target())
+
+    assert result.status == "blocked"
+    assert result.reason == "http_429"
+    assert result.diagnostics["transport_error_type"] == "ConnectionResetError"
+    assert blocked == ["http_429"]
+    assert provider.has_manual_login_page is False
+    await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("readiness", ["security_verification", "timeout"])
+async def test_429_during_readiness_is_not_overwritten_by_verification_title(
+    monkeypatch, readiness
+):
+    page = FakePage(title="百度安全验证")
+    provider = _provider(FakeContext(lambda: page), headless=False, keep_login_page=True)
+
+    async def gate_races_with_rate_limit(
+        _self, _page, _target, _page_deadline, _deadline, state, *_args
+    ):
+        state["blocked_reason"] = "http_429"
+        return readiness
+
+    monkeypatch.setattr(provider, "_wait_for_target", gate_races_with_rate_limit.__get__(provider))
+
+    result = await provider.collect(_thread_target())
+
+    assert result.status == "blocked"
+    assert result.reason == "http_429"
+    assert result.diagnostics.get("manual_gate_detected") is not True
+    assert provider.has_manual_login_page is False
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_provider_records_login_gate_without_retrying():
     page = FakePage(redirect_url="https://passport.baidu.com/v3/", body_text="正常正文")
     provider = _provider(FakeContext(lambda: page))
@@ -1345,6 +1652,45 @@ async def test_provider_records_login_gate_without_retrying():
 
     assert result.status == "blocked"
     assert result.reason == "needs_login"
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_page_navigation_connection_reset_is_retryable_and_component_scoped():
+    page = FakePage()
+
+    async def reset(_url, **_kwargs):
+        raise ConnectionResetError("synthetic reset")
+
+    page.goto = reset
+    provider = _provider(FakeContext(lambda: page))
+
+    result = await provider.collect(_thread_target())
+
+    assert result.status == "failed_retryable"
+    assert result.reason == "transport_reset"
+    assert result.diagnostics["transport_error_type"] == "ConnectionResetError"
+    assert result.diagnostics["transport_component"] == "page_navigation"
+    assert result.diagnostics["transport_error_at"].endswith("+00:00")
+    assert page.closed is True
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_page_close_connection_reset_is_retryable_without_leaving_parent_snapshot():
+    page = FakePage(
+        page_pc_response_text=_page_pc_parent_response(((CID, AUTHOR_ID, "黑龙江"),)),
+        nested_response_text=_nested_response(),
+        close_error=ConnectionResetError("synthetic page close reset"),
+    )
+    provider = _provider(FakeContext(lambda: page), reuse_parent_snapshots=True)
+
+    result = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+
+    assert result.status == "failed_retryable"
+    assert result.reason == "transport_reset"
+    assert result.diagnostics["transport_component"] == "page_close"
+    assert provider._cached_parent_snapshot is None
     await provider.close()
 
 
@@ -1371,8 +1717,44 @@ async def test_explicit_security_verification_title_stops_and_notifies_gate():
     result = await provider.collect(_thread_target())
 
     assert result.status == "blocked"
-    assert result.reason == "blocked"
-    assert blocked == ["blocked"]
+    assert result.reason == "security_verification"
+    assert result.diagnostics["blocked_reason"] == "security_verification"
+    assert blocked == ["security_verification"]
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_security_verification_title_requires_a_trusted_https_baidu_host():
+    page = FakePage(title="百度安全验证")
+
+    page.url = "https://attacker.example/verify"
+    assert await browser_module._page_gate_reason(page) is None
+
+    page.url = "http://tieba.baidu.com/p/81001"
+    assert await browser_module._page_gate_reason(page) is None
+
+    page.url = "https://user@tieba.baidu.com/p/81001"
+    assert await browser_module._page_gate_reason(page) is None
+
+    page.url = "https://tieba.baidu.com/p/81001"
+    assert await browser_module._page_gate_reason(page) == "security_verification"
+
+
+@pytest.mark.asyncio
+async def test_explicit_security_verification_redirect_after_http_403_remains_blocked():
+    blocked = []
+    page = FakePage(
+        status=403,
+        redirect_url="https://wappass.baidu.com/verify/captcha",
+    )
+    provider = _provider(FakeContext(lambda: page), on_blocked=blocked.append)
+
+    result = await provider.collect(_thread_target())
+
+    assert result.status == "blocked"
+    assert result.reason == "security_verification"
+    assert result.diagnostics["blocked_reason"] == "security_verification"
+    assert blocked == ["http_auth_or_verification"]
     await provider.close()
 
 
@@ -1605,7 +1987,7 @@ async def test_timeout_reports_requests_already_observed_and_closes_page():
 
 
 @pytest.mark.asyncio
-async def test_total_timeout_during_blocked_callback_cleanup_still_closes_page():
+async def test_http_429_during_blocked_callback_cleanup_stays_blocked_and_closes_page():
     callback_cancelled = asyncio.Event()
 
     async def blocked(_reason):
@@ -1622,9 +2004,11 @@ async def test_total_timeout_during_blocked_callback_cleanup_still_closes_page()
 
     result = await provider.collect(_thread_target())
 
-    assert result.status == "timeout"
+    assert result.status == "blocked"
+    assert result.reason == "http_429"
     assert callback_cancelled.is_set()
     assert page.closed is True
+    assert len(page.goto_urls) == 1
     await provider.close()
 
 

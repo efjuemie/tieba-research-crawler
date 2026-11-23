@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse
@@ -23,13 +25,18 @@ from .network import (
     PAGE_PC_PATH,
     USER_CARD_PATH,
     NetworkExtractionResult,
+    extract_from_parent_snapshot,
     extract_nested_floor,
     extract_page_pc_comment,
     extract_page_pc_post,
     extract_page_pc_thread_counts,
+    verify_parent_snapshot,
 )
 
 _CALLBACK_CLEANUP_TIMEOUT_SECONDS = 0.05
+_PARENT_SNAPSHOT_TTL_SECONDS = 30.0
+_PARENT_SNAPSHOT_MAX_TARGETS = 8
+_TRANSPORT_ERRORS = (ConnectionResetError, BrokenPipeError, EOFError, asyncio.IncompleteReadError)
 _COMMENT_GROWTH_HYDRATION_WAIT_SECONDS = 2.0
 _COMMENT_GROWTH_HYDRATION_POLL_SECONDS = 0.05
 _MAX_COMMENT_GROWTH_HOVERS = 3
@@ -120,6 +127,15 @@ class _CachedPostPage:
     response_status: int
 
 
+@dataclass(slots=True)
+class _CachedParentSnapshot:
+    run_id: str | None
+    group_key: tuple[str | None, str, str]
+    snapshots: list[Any]
+    cached_at: float
+    target_count: int = 1
+
+
 class BrowserProviderConfigurationError(RuntimeError):
     """The provider lacks an explicit isolated profile or request budget."""
 
@@ -140,6 +156,7 @@ class PlaywrightWebFallbackProvider:
         keep_login_page: bool = False,
         on_blocked: Any | None = None,
         playwright_factory: Any | None = None,
+        reuse_parent_snapshots: bool = False,
     ) -> None:
         if budget is None or not hasattr(budget, "__aenter__"):
             raise BrowserProviderConfigurationError("an async request budget is required")
@@ -155,6 +172,8 @@ class PlaywrightWebFallbackProvider:
             raise ValueError("timeout_seconds must be positive")
         if not isinstance(headless, bool) or not isinstance(keep_login_page, bool):
             raise ValueError("headless and keep_login_page must be booleans")
+        if not isinstance(reuse_parent_snapshots, bool):
+            raise ValueError("reuse_parent_snapshots must be a boolean")
         if keep_login_page and headless:
             raise BrowserProviderConfigurationError("keep_login_page requires headless=False")
         if profile_dir is not None:
@@ -172,11 +191,14 @@ class PlaywrightWebFallbackProvider:
         self._max_pages = max_pages
         self._headless = headless
         self._keep_login_page = keep_login_page
+        self._reuse_parent_snapshots = reuse_parent_snapshots
         self._on_blocked = on_blocked
         self._target_semaphore = asyncio.Semaphore(1)
         self._closed = False
         self._manual_login_page = None
         self._cached_post_page: _CachedPostPage | None = None
+        self._cached_parent_snapshot: _CachedParentSnapshot | None = None
+        self._run_scope_id: str | None = None
         self._active_collect_task: asyncio.Task | None = None
         self._close_task: asyncio.Task | None = None
         self._close_deferred = False
@@ -187,6 +209,15 @@ class PlaywrightWebFallbackProvider:
     @property
     def has_manual_login_page(self) -> bool:
         return self._manual_login_page is not None
+
+    @property
+    def browser_started(self) -> bool:
+        return self._context is not None
+
+    def set_run_scope(self, run_id: str) -> None:
+        if self._run_scope_id != run_id:
+            self._cached_parent_snapshot = None
+            self._run_scope_id = run_id
 
     async def collect(self, target: Target) -> BrowserRunResult:
         """Visit at most max_pages and naturally trigger bounded expansions."""
@@ -201,6 +232,8 @@ class PlaywrightWebFallbackProvider:
             "user_card_requests": 0,
             "pages": 0,
             "page_cache_hits": 0,
+            "parent_snapshot_hits": 0,
+            "parent_snapshot_misses": 0,
             "post_owner_scrolls": 0,
             "growth_hover_attempts": 0,
             "expansions": 0,
@@ -241,7 +274,18 @@ class PlaywrightWebFallbackProvider:
                         if self._active_collect_task is current_task:
                             self._active_collect_task = None
         except TimeoutError:
+            self._cached_parent_snapshot = None
+            if state.get("blocked_reason") == "http_429":
+                return BrowserRunResult("blocked", "http_429", (), dict(state))
             return BrowserRunResult("timeout", "browser_task_timeout", (), dict(state))
+        except _TRANSPORT_ERRORS as error:
+            self._cached_parent_snapshot = None
+            if state.get("blocked_reason") == "http_429":
+                _record_transport_error(state, error, "browser_worker_cleanup")
+                return BrowserRunResult("blocked", "http_429", (), dict(state))
+            if not state.get("transport_error_type"):
+                _record_transport_error(state, error, "browser_worker_cleanup")
+            return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
 
     async def _finish_deferred_close(self) -> None:
         if not self._close_deferred:
@@ -253,7 +297,15 @@ class PlaywrightWebFallbackProvider:
 
     async def _collect(self, target: Target, state: dict[str, Any], deadline: float) -> BrowserRunResult:
         loop = asyncio.get_running_loop()
-        context = await self._ensure_context()
+        cached_result = self._collect_from_parent_snapshot(target, state)
+        if cached_result is not None:
+            return cached_result
+        state["operation_phase"] = "browser_context_start"
+        try:
+            context = await self._ensure_context()
+        except _TRANSPORT_ERRORS as error:
+            _record_transport_error(state, error, "browser_context_start")
+            return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
         cached_page = self._cached_post_page
         reuse_page = (
             target.target_type == "post"
@@ -262,8 +314,16 @@ class PlaywrightWebFallbackProvider:
         )
         if cached_page is not None and not reuse_page:
             self._cached_post_page = None
-            await _await_cleanup(asyncio.create_task(cached_page.page.close()))
-        page = cached_page.page if reuse_page else await context.new_page()
+            try:
+                await _await_cleanup(asyncio.create_task(cached_page.page.close()))
+            except _TRANSPORT_ERRORS as error:
+                _record_transport_error(state, error, "cached_page_close")
+                return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
+        try:
+            page = cached_page.page if reuse_page else await context.new_page()
+        except _TRANSPORT_ERRORS as error:
+            _record_transport_error(state, error, "page_create")
+            return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
         request_contexts: dict[Any, ImmutableRequestContext] = {}
         request_page_numbers: dict[Any, int] = {}
         request_page_urls: dict[Any, str] = {}
@@ -272,6 +332,7 @@ class PlaywrightWebFallbackProvider:
         response_tasks: set[asyncio.Task] = set()
         callback_tasks: set[asyncio.Task] = set()
         network_results: list[NetworkExtractionResult] = []
+        parent_snapshot_pending = []
         identity_mismatch = False
         post_page_snapshot: _CachedPostPage | None = None
 
@@ -300,6 +361,9 @@ class PlaywrightWebFallbackProvider:
             except TimeoutError:
                 network_results.append(NetworkExtractionResult("timeout", "response_text_timeout", False, ()))
                 return
+            except _TRANSPORT_ERRORS as error:
+                _record_transport_error(state, error, "playwright_response_body")
+                return
             if path == PAGE_PC_PATH:
                 parser = (
                     extract_page_pc_thread_counts
@@ -317,6 +381,21 @@ class PlaywrightWebFallbackProvider:
                 response_status=response.status,
             )
             network_results.append(result)
+            if (
+                self._reuse_parent_snapshots
+                and path in {NESTED_FLOOR_PATH, PAGE_PC_PATH}
+                and target.target_type == "comment"
+                and result.status == "ok"
+                and result.identity_verified
+            ):
+                snapshot = verify_parent_snapshot(
+                    target,
+                    response_text,
+                    context_snapshot,
+                    response_status=response.status,
+                )
+                if snapshot is not None:
+                    parent_snapshot_pending.append(snapshot)
             if (
                 path == PAGE_PC_PATH
                 and target.target_type == "post"
@@ -401,7 +480,7 @@ class PlaywrightWebFallbackProvider:
             if status == 429:
                 state["blocked_reason"] = "http_429"
                 schedule_blocked("http_429")
-            elif status in {401, 403} and (
+            elif state.get("blocked_reason") != "http_429" and status in {401, 403} and (
                 path in {NESTED_FLOOR_PATH, USER_CARD_PATH}
                 or (path == PAGE_PC_PATH and target.target_type in {"thread", "post", "comment"})
                 or _is_document_request(response.request)
@@ -456,7 +535,9 @@ class PlaywrightWebFallbackProvider:
             for page_number in (() if cache_ready else range(1, self._max_pages + 1)):
                 state["pages"] += 1
                 page_url = _target_page_url(target, page_number)
+                state["operation_phase"] = "page_navigation"
                 async with self._budget(state):
+                    self._cached_parent_snapshot = None
                     response = await page.goto(
                         page_url,
                         wait_until="domcontentloaded",
@@ -465,20 +546,26 @@ class PlaywrightWebFallbackProvider:
                 if response is not None and response.status == 429:
                     state["blocked_reason"] = "http_429"
                     await notify_blocked_once("http_429")
-                elif response is not None and response.status in {401, 403}:
+                elif (
+                    response is not None
+                    and response.status in {401, 403}
+                    and state.get("blocked_reason") != "http_429"
+                ):
                     state["blocked_reason"] = "http_auth_or_verification"
                     await notify_blocked_once("http_auth_or_verification")
                 if state["blocked_reason"] == "http_auth_or_verification":
                     explicit_gate = await _page_gate_reason(page)
-                    if explicit_gate in {"needs_login", "blocked"}:
+                    if explicit_gate in {"needs_login", "blocked", "security_verification"}:
                         state["blocked_reason"] = explicit_gate
                         state["manual_gate_detected"] = True
                 if state["blocked_reason"]:
+                    self._cached_parent_snapshot = None
                     break
 
                 pages_left = self._max_pages - page_number + 1
                 remaining = max(0.0, deadline - loop.time())
                 page_deadline = loop.time() + remaining / pages_left
+                state["operation_phase"] = "page_readiness"
                 readiness = await self._wait_for_target(
                     page,
                     target,
@@ -488,12 +575,16 @@ class PlaywrightWebFallbackProvider:
                     page_network_results,
                     page_number,
                 )
-                if readiness in {"needs_login", "blocked"}:
-                    state["blocked_reason"] = readiness
-                    state["manual_gate_detected"] = True
-                    await notify_blocked_once(readiness)
+                if readiness in {"needs_login", "blocked", "security_verification"}:
+                    if state.get("blocked_reason") != "http_429":
+                        state["blocked_reason"] = readiness
+                        state["manual_gate_detected"] = True
+                        await notify_blocked_once(readiness)
                     break
                 if readiness == "timeout":
+                    self._cached_parent_snapshot = None
+                    if state.get("blocked_reason") == "http_429":
+                        return BrowserRunResult("blocked", "http_429", (), dict(state))
                     return BrowserRunResult("timeout", "browser_task_timeout", (), dict(state))
                 if readiness in {"network_ready", "network_invalid"}:
                     dom_result = (
@@ -522,6 +613,7 @@ class PlaywrightWebFallbackProvider:
                     if dom_result.reason not in {"post_data_id_missing", "first_floor_owner_missing"}:
                         break
                 elif target.target_type == "comment":
+                    state["operation_phase"] = "comment_expansion"
                     await self._expand_comment_owner(page, target, state, capture_response, deadline)
                     dom_result = _extract_dom_or_empty(target, page.url, await page.content())
                     if dom_result.identity_verified:
@@ -545,9 +637,19 @@ class PlaywrightWebFallbackProvider:
                         break
 
             if response_tasks:
-                await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
+                task_results = await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
+                transport_error = next(
+                    (result for result in task_results if isinstance(result, _TRANSPORT_ERRORS)),
+                    None,
+                )
+                if transport_error is not None:
+                    _record_transport_error(state, transport_error, "playwright_response_capture")
             if state["blocked_reason"]:
+                self._cached_parent_snapshot = None
                 return BrowserRunResult("blocked", state["blocked_reason"], (), dict(state))
+            if state.get("transport_error_type"):
+                self._cached_parent_snapshot = None
+                return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
             if target.target_type == "post" and dom_result is not None and dom_result.status == "identity_unverified":
                 return BrowserRunResult(
                     "identity_unverified",
@@ -585,6 +687,7 @@ class PlaywrightWebFallbackProvider:
             if target.target_type == "post" and identity_verified and post_page_snapshot is not None:
                 self._cached_post_page = post_page_snapshot
             if candidates:
+                self._cache_parent_snapshots(target, parent_snapshot_pending)
                 return BrowserRunResult(
                     "ok",
                     None,
@@ -595,6 +698,7 @@ class PlaywrightWebFallbackProvider:
                     identity_methods,
                 )
             if identity_verified:
+                self._cache_parent_snapshots(target, parent_snapshot_pending)
                 return BrowserRunResult(
                     "ok",
                     None,
@@ -646,8 +750,19 @@ class PlaywrightWebFallbackProvider:
                 )
             return BrowserRunResult("dom_changed", "target_owner_not_found", (), dict(state))
         except asyncio.CancelledError:
+            self._cached_parent_snapshot = None
             raise
         except Exception as error:
+            self._cached_parent_snapshot = None
+            if state.get("blocked_reason") == "http_429":
+                if isinstance(error, _TRANSPORT_ERRORS):
+                    _record_transport_error(state, error, state.get("operation_phase", "page_readiness"))
+                return BrowserRunResult("blocked", "http_429", (), dict(state))
+            if isinstance(error, _TRANSPORT_ERRORS):
+                _record_transport_error(
+                    state, error, state.get("operation_phase", "page_readiness")
+                )
+                return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
             if _looks_like_timeout(error):
                 return BrowserRunResult("timeout", "browser_operation_timeout", (), dict(state))
             return BrowserRunResult("dom_changed", "browser_operation_failed", (), dict(state))
@@ -678,7 +793,151 @@ class PlaywrightWebFallbackProvider:
                 else:
                     if self._cached_post_page is not None and self._cached_post_page.page is page:
                         self._cached_post_page = None
-                    await _await_cleanup(asyncio.create_task(page.close()))
+                    try:
+                        await _await_cleanup(asyncio.create_task(page.close()))
+                    except asyncio.CancelledError:
+                        raise
+                    except _TRANSPORT_ERRORS as error:
+                        self._cached_parent_snapshot = None
+                        _record_transport_error(state, error, "page_close")
+                        task = asyncio.current_task()
+                        if (
+                            (task is None or not task.cancelling())
+                            and not state.get("blocked_reason")
+                            and not state.get("identity_failure")
+                            and not identity_mismatch
+                        ):
+                            raise
+
+    def _cache_parent_snapshots(self, target: Target, snapshots: list[Any]) -> None:
+        if not snapshots:
+            return
+        group_key = (
+            str(target.fid) if target.fid is not None else None,
+            str(target.tid),
+            str(target.parent_post_pid),
+        )
+        cached = self._cached_parent_snapshot
+        if (
+            cached is not None
+            and cached.run_id == self._run_scope_id
+            and cached.group_key == group_key
+            and time.monotonic() - cached.cached_at <= _PARENT_SNAPSHOT_TTL_SECONDS
+        ):
+            for snapshot in snapshots:
+                if all(existing.source_path != snapshot.source_path for existing in cached.snapshots):
+                    cached.snapshots.append(snapshot)
+        else:
+            self._cached_parent_snapshot = _CachedParentSnapshot(
+                self._run_scope_id,
+                group_key,
+                list(snapshots),
+                time.monotonic(),
+            )
+
+    def _collect_from_parent_snapshot(
+        self, target: Target, state: dict[str, Any]
+    ) -> BrowserRunResult | None:
+        cached = self._cached_parent_snapshot
+        if not self._reuse_parent_snapshots or target.target_type != "comment":
+            self._cached_parent_snapshot = None
+            return None
+        if cached is None:
+            return None
+        group_key = (str(target.fid) if target.fid is not None else None, str(target.tid), str(target.parent_post_pid))
+        if (
+            cached.run_id != self._run_scope_id
+            or cached.group_key != group_key
+            or time.monotonic() - cached.cached_at > _PARENT_SNAPSHOT_TTL_SECONDS
+            or cached.target_count >= _PARENT_SNAPSHOT_MAX_TARGETS
+        ):
+            self._cached_parent_snapshot = None
+            state["parent_snapshot_misses"] = 1
+            return None
+        results = []
+        identity_failure = None
+        for snapshot in cached.snapshots:
+            result = extract_from_parent_snapshot(target, snapshot)
+            if result.status == "ok" and result.identity_verified:
+                results.append(result)
+            elif result.status == "identity_unverified" and result.reason not in {
+                "cid_missing_from_response",
+                "parent_post_missing_from_response",
+            }:
+                identity_failure = result.reason or "parent_snapshot_unverified"
+                break
+        if identity_failure is not None:
+            self._cached_parent_snapshot = None
+            state["parent_snapshot_misses"] = 1
+            return BrowserRunResult(
+                "identity_unverified",
+                identity_failure,
+                (),
+                {**state, "identity_failure": identity_failure},
+                {
+                    name: {"status": "identity_unverified", "reason": identity_failure}
+                    for name in target.requested_fields
+                },
+                False,
+            )
+        if not results:
+            self._cached_parent_snapshot = None
+            state["parent_snapshot_misses"] = 1
+            return None
+
+        growth_fields = {"global_growth_level", "global_growth_icon_url"}
+        if (
+            set(target.requested_fields) & growth_fields
+            and not any(
+                candidate.field_name in growth_fields
+                for result in results
+                for candidate in result.candidates
+            )
+        ):
+            self._cached_parent_snapshot = None
+            state["parent_snapshot_misses"] = 1
+            return None
+
+        candidates_by_field = {}
+        outcomes = {}
+        identity_methods = []
+        for result in results:
+            outcomes.update(result.field_outcomes)
+            evidence = result.identity_evidence
+            if evidence is not None:
+                identity_methods.extend(method for method in evidence.match_methods if method not in identity_methods)
+            for candidate in result.candidates:
+                existing = candidates_by_field.get(candidate.field_name)
+                if existing is not None and existing.normalized_value != candidate.normalized_value:
+                    self._cached_parent_snapshot = None
+                    reason = "parent_snapshot_candidate_conflict"
+                    return BrowserRunResult(
+                        "identity_unverified",
+                        reason,
+                        (),
+                        {**state, "identity_failure": reason},
+                        {
+                            name: {"status": "identity_unverified", "reason": reason}
+                            for name in target.requested_fields
+                        },
+                        False,
+                    )
+                candidates_by_field.setdefault(candidate.field_name, candidate)
+        for field_name in candidates_by_field:
+            outcomes.pop(field_name, None)
+        cached.target_count += 1
+        if cached.target_count >= _PARENT_SNAPSHOT_MAX_TARGETS:
+            self._cached_parent_snapshot = None
+        state["parent_snapshot_hits"] = 1
+        return BrowserRunResult(
+            "ok",
+            None,
+            tuple(candidates_by_field.values()),
+            dict(state),
+            outcomes,
+            True,
+            tuple(identity_methods),
+        )
 
     async def _wait_for_target(
         self,
@@ -849,6 +1108,7 @@ class PlaywrightWebFallbackProvider:
         await _await_cleanup(self._close_task)
 
     async def _close_resources(self) -> None:
+        self._cached_parent_snapshot = None
         active_task = self._active_collect_task
         if active_task is not None and active_task is not asyncio.current_task():
             active_task.cancel()
@@ -870,6 +1130,7 @@ class PlaywrightWebFallbackProvider:
         page = self._manual_login_page
         self._manual_login_page = None
         if page is not None:
+            self._cached_parent_snapshot = None
             await page.close()
 
 
@@ -1314,22 +1575,40 @@ def _is_document_request(request) -> bool:
 async def _page_gate_reason(page) -> str | None:
     parsed = urlparse(page.url)
     host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() != "https"
+        or host not in {"tieba.baidu.com", "www.tieba.baidu.com", "passport.baidu.com", "wappass.baidu.com"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+    ):
+        return None
     if host == "passport.baidu.com":
         return "needs_login"
     if host == "wappass.baidu.com" and any(
         marker in parsed.path.lower() for marker in ("verify", "captcha", "appeal")
     ):
-        return "blocked"
+        return "security_verification"
     title = " ".join((await page.title()).split())
     if title in {"百度账号登录", "百度帐号登录", "百度登录", "贴吧登录"}:
         return "needs_login"
     if title in {"百度安全验证", "安全验证", "百度安全中心验证"}:
-        return "blocked"
+        return "security_verification"
     return None
 
 
 def _looks_like_timeout(error: Exception) -> bool:
     return "timeout" in type(error).__name__.lower() or "timed out" in str(error).lower()
+
+
+def _record_transport_error(state: dict[str, Any], error: BaseException, component: str) -> None:
+    state["transport_error_type"] = type(error).__name__
+    state["transport_component"] = component
+    state["transport_error_at"] = datetime.now(UTC).isoformat()
 
 
 def _reject_default_chrome_profile(path: Path) -> None:

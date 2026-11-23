@@ -12,6 +12,7 @@ from src.core.config import RateLimitConfig, WebFallbackConfig
 def test_web_fallback_defaults_are_bounded_and_serialized_in_examples():
     settings = WebFallbackConfig()
     assert settings.browser_profile == "data/web-fallback-profile"
+    assert settings.web_parent_batch_enabled is False
     assert settings.max_pages == 1
     assert settings.max_expansions == 10
     assert settings.timeout_seconds == 90.0
@@ -23,6 +24,7 @@ def test_web_fallback_defaults_are_bounded_and_serialized_in_examples():
             sample = tomllib.load(stream)
         assert sample["web_fallback"] == {
             "browser_profile": "data/web-fallback-profile",
+            "web_parent_batch_enabled": False,
             "max_pages": 1,
             "max_expansions": 10,
             "timeout_seconds": 90.0,

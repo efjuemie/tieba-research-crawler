@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from urllib.parse import urlencode
 
 import pytest
 
 from src.research.web_fallback.dom import extract_comment_author_growth
 from src.research.web_fallback.identity import Target, make_request_context
-from src.research.web_fallback.network import extract_nested_floor
+from src.research.web_fallback.network import (
+    extract_from_parent_snapshot,
+    extract_nested_floor,
+    verify_parent_snapshot,
+)
 
 TID = "81001"
 FID = "120"
@@ -168,6 +173,81 @@ def test_nested_floor_uses_python_raw_json_ids_and_explicit_zero_presence():
         "status": "not_tested",
         "reason": "not_observed_in_response",
     }
+
+
+def test_verified_parent_snapshot_reuses_original_request_for_sibling_cid():
+    anchor = _target(requested_fields=("ip_location_text",))
+    sibling_cid = "9007199254740994"
+    sibling_author = "77004"
+    sibling = _target(
+        target_id=sibling_cid,
+        cid=sibling_cid,
+        author_user_id=sibling_author,
+        requested_fields=("ip_location_text",),
+    )
+    payload = _payload(ip_address="黑龙江")
+    sibling_item = deepcopy(payload["data"]["post_list"][0])
+    sibling_item["id"] = int(sibling_cid)
+    sibling_item["author_id"] = int(sibling_author)
+    sibling_item["author"]["id"] = int(sibling_author)
+    sibling_item["author"]["ip_address"] = "浙江"
+    payload["data"]["post_list"].append(sibling_item)
+    response_text = json.dumps(payload, ensure_ascii=False)
+    context = _context(anchor)
+
+    snapshot = verify_parent_snapshot(anchor, response_text, context)
+    assert snapshot is not None
+    assert snapshot.request_context.target == anchor
+
+    result = extract_from_parent_snapshot(sibling, snapshot)
+
+    assert result.status == "ok"
+    candidate = next(candidate for candidate in result.candidates if candidate.field_name == "ip_location_text")
+    assert candidate.normalized_value == "浙江"
+    assert candidate.identity.cid == sibling_cid
+    assert candidate.identity.author_user_id == sibling_author
+    assert candidate.identity.context_id == context.context_id
+
+
+def test_verified_parent_snapshot_rejects_other_parent_and_duplicate_target():
+    anchor = _target(requested_fields=("ip_location_text",))
+    payload = _payload()
+    context = _context(anchor)
+    snapshot = verify_parent_snapshot(anchor, json.dumps(payload, ensure_ascii=False), context)
+    assert snapshot is not None
+
+    other_parent = _target(
+        target_id="9007199254740994",
+        cid="9007199254740994",
+        parent_post_pid="45003",
+        author_user_id="77004",
+        requested_fields=("ip_location_text",),
+    )
+    rejected = extract_from_parent_snapshot(other_parent, snapshot)
+    assert rejected.status == "identity_unverified"
+    assert rejected.reason == "parent_snapshot_context_mismatch"
+    assert rejected.candidates == ()
+
+    sibling_cid = "9007199254740994"
+    sibling_author = "77004"
+    duplicated = deepcopy(payload["data"]["post_list"][0])
+    duplicated["id"] = int(sibling_cid)
+    duplicated["author_id"] = int(sibling_author)
+    duplicated["author"]["id"] = int(sibling_author)
+    duplicated["author"]["ip_address"] = "新地区"
+    payload["data"]["post_list"].extend((duplicated, deepcopy(duplicated)))
+    duplicate_snapshot = verify_parent_snapshot(anchor, json.dumps(payload, ensure_ascii=False), context)
+    assert duplicate_snapshot is not None
+    duplicate_target = _target(
+        target_id=sibling_cid,
+        cid=sibling_cid,
+        author_user_id=sibling_author,
+        requested_fields=("ip_location_text",),
+    )
+    duplicate_result = extract_from_parent_snapshot(duplicate_target, duplicate_snapshot)
+    assert duplicate_result.status == "identity_unverified"
+    assert duplicate_result.reason == "duplicate_target_cid"
+    assert duplicate_result.candidates == ()
 
 
 def test_nested_floor_extracts_reply_target_only_from_exact_prefix_and_type4_mention():

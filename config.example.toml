@@ -182,6 +182,8 @@ retry_wait_seconds = 0.5
 [web_fallback]
 # 项目专用隔离浏览器资料目录；可按本机需要覆盖，不要使用个人 Chrome Profile。
 browser_profile = "data/web-fallback-profile"
+# 同一 run 的同一父楼下，重用已验证的自然响应快照；默认关闭。
+web_parent_batch_enabled = false
 # 每个目标最多访问一个页面，并最多自然展开十次；可在本机配置中调低。
 max_pages = 1
 max_expansions = 10

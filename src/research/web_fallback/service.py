@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from collections import Counter
@@ -32,6 +33,10 @@ from .tasks import (
     plan_web_enrichment_targets,
     resume_web_enrichment_tasks,
 )
+
+_TRANSPORT_ERRORS = (ConnectionResetError, BrokenPipeError, EOFError, asyncio.IncompleteReadError)
+_QUEUE_WAIT_LOG_INTERVAL_SECONDS = 30.0
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -74,6 +79,10 @@ class WebWorkerSummary:
     unresolved_count: int
     stopped_reason: str | None
     diagnostics: dict[str, int | float]
+    blocked_count: int = 0
+    retryable_count: int = 0
+    stopped_run_id: str | None = None
+    stopped_target_type: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -279,6 +288,7 @@ async def run_field_backfill(
                 partial += 1
                 continue
             target = replace(_target_from_plan(plan), requested_fields=preflight.missing_fields)
+            _set_provider_run_scope(provider, run_id)
             result = await _collect_with_deadline(provider, target, deadline)
             collected += 1
             _add_diagnostics(diagnostic_counts, getattr(result, "diagnostics", {}))
@@ -332,7 +342,7 @@ async def run_field_backfill(
                 stopped_reason = _safe_reason(reason or "blocked")
                 if _is_rate_limited(reason):
                     break
-                if wait_for_login and _is_login_or_verification(status, reason):
+                if wait_for_login and _is_manual_gate(result, provider):
                     if lease.task_key in login_resumed or not getattr(provider, "has_manual_login_page", False):
                         stopped_reason = "manual_login_page_unavailable"
                         break
@@ -359,6 +369,9 @@ async def run_field_backfill(
                         stopped_reason = "manual_resume_not_applied"
                         break
                     continue
+                break
+            if task_status == "failed_retryable" and reason == "transport_reset":
+                stopped_reason = "transport_reset"
                 break
     except asyncio.CancelledError:
         raise
@@ -423,7 +436,13 @@ async def _process_durable_web_lease(
             preflight_skipped=True,
         )
     target = replace(_target_from_lease(lease), requested_fields=preflight.missing_fields)
-    result = await provider.collect(target)
+    run_id = getattr(lease, "run_id", None)
+    if isinstance(run_id, str):
+        _set_provider_run_scope(provider, run_id)
+    try:
+        result = await provider.collect(target)
+    except _TRANSPORT_ERRORS as error:
+        result = _transport_reset_result(error, "web_provider_collect")
     status = getattr(result, "status", "failed_retryable")
     reason = getattr(result, "reason", None)
     diagnostics = getattr(result, "diagnostics", {})
@@ -528,6 +547,18 @@ async def _count_unresolved_web_tasks(sessions: Any, run_ids: Sequence[str]) -> 
             continue
         unresolved += 1
     return unresolved
+
+
+async def _web_task_status_counts(sessions: Any, run_ids: Sequence[str]) -> dict[str, int]:
+    if not run_ids:
+        return {}
+    async with sessions() as session:
+        rows = await session.execute(
+            select(ResearchWebEnrichmentTask.status, func.count())
+            .where(ResearchWebEnrichmentTask.run_id.in_(tuple(run_ids)))
+            .group_by(ResearchWebEnrichmentTask.status)
+        )
+    return {str(status): int(count) for status, count in rows}
 
 
 def _partial_task_fields_satisfied(task: Any, row: Any | None) -> bool:
@@ -651,6 +682,11 @@ async def drain_pending_web_enrichment(
     diagnostics: Counter[str] = Counter()
     stopped_reason = None
     login_resumed: set[str] = set()
+    blocked_count = 0
+    retryable_count = 0
+    stopped_run_id = None
+    stopped_target_type = None
+    last_queue_wait_log = 0.0
 
     while normalized_run_ids and not (stop_event is not None and stop_event.is_set()):
         lease = await _lease_one_web_task(sessions, normalized_run_ids, "live-web-fallback")
@@ -658,6 +694,18 @@ async def drain_pending_web_enrichment(
             if stop_event is not None and stop_event.is_set():
                 break
             retry_delay = await _next_retry_delay(sessions, normalized_run_ids)
+            now = asyncio.get_running_loop().time()
+            if now - last_queue_wait_log >= _QUEUE_WAIT_LOG_INTERVAL_SECONDS:
+                counts = await _web_task_status_counts(sessions, normalized_run_ids)
+                logger.info(
+                    "WEB queue waiting: run_ids=%s reason=no_eligible_lease statuses=%s "
+                    "next_due_seconds=%s browser_context_started=%s",
+                    normalized_run_ids,
+                    counts,
+                    None if retry_delay is None else round(retry_delay, 1),
+                    bool(getattr(provider, "browser_started", False)),
+                )
+                last_queue_wait_log = now
             if retry_delay is None:
                 break
             if stop_event is None:
@@ -690,6 +738,13 @@ async def drain_pending_web_enrichment(
             collected += 1
         _add_diagnostics(diagnostics, getattr(result, "diagnostics", {}))
 
+        if status == "failed_retryable":
+            retryable_count += 1
+        elif status in {"blocked", "needs_login"}:
+            blocked_count += 1
+            stopped_run_id = lease.run_id
+            stopped_target_type = lease.target_type
+
         if status == "completed":
             completed += 1
         elif status == "partially_completed":
@@ -697,13 +752,16 @@ async def drain_pending_web_enrichment(
             await _enqueue_remaining_fields(sessions, lease)
 
         reason = getattr(result, "reason", None)
+        if status == "failed_retryable" and reason == "transport_reset":
+            stopped_reason = "transport_reset"
+            break
         if status == "blocked" and _is_rate_limited(reason):
             stopped_reason = "http_429"
             break
         if status in {"blocked", "needs_login"}:
             if (
                 wait_for_login
-                and _is_login_or_verification(getattr(result, "status", status), reason)
+                and _is_manual_gate(result, provider)
                 and lease.task_key not in login_resumed
                 and getattr(provider, "has_manual_login_page", False)
             ):
@@ -741,6 +799,10 @@ async def drain_pending_web_enrichment(
         unresolved_count=unresolved,
         stopped_reason=stopped_reason,
         diagnostics=dict(diagnostics),
+        blocked_count=blocked_count,
+        retryable_count=retryable_count,
+        stopped_run_id=stopped_run_id,
+        stopped_target_type=stopped_target_type,
     )
 
 
@@ -787,7 +849,12 @@ async def run_live_web_fallback_worker(
     diagnostics: Counter[str] = Counter()
     stopped_reason = None
     login_resumed: set[str] = set()
+    blocked_count = 0
+    retryable_count = 0
+    stopped_run_id = None
+    stopped_target_type = None
     all_run_ids: set[str] = set()
+    last_queue_wait_log = 0.0
     try:
         while not stop_event.is_set() and not (
             api_done_event is not None and api_done_event.is_set()
@@ -799,6 +866,18 @@ async def run_live_web_fallback_worker(
                 if api_done_event is not None and api_done_event.is_set():
                     break
                 retry_delay = await _next_retry_delay(sessions, current_run_ids)
+                now = asyncio.get_running_loop().time()
+                if now - last_queue_wait_log >= _QUEUE_WAIT_LOG_INTERVAL_SECONDS:
+                    counts = await _web_task_status_counts(sessions, current_run_ids)
+                    logger.info(
+                        "WEB queue waiting: run_ids=%s reason=no_eligible_lease statuses=%s "
+                        "next_due_seconds=%s browser_context_started=%s",
+                        current_run_ids,
+                        counts,
+                        None if retry_delay is None else round(retry_delay, 1),
+                        bool(getattr(provider, "browser_started", False)),
+                    )
+                    last_queue_wait_log = now
                 await _wait_for_stop_or_timeout(stop_event, min(retry_delay or 0.5, 1.0))
                 continue
             if stop_event.is_set():
@@ -827,6 +906,12 @@ async def run_live_web_fallback_worker(
             if not getattr(result, "preflight_skipped", False):
                 collected += 1
             _add_diagnostics(diagnostics, getattr(result, "diagnostics", {}))
+            if status == "failed_retryable":
+                retryable_count += 1
+            elif status in {"blocked", "needs_login"}:
+                blocked_count += 1
+                stopped_run_id = lease.run_id
+                stopped_target_type = lease.target_type
             if status == "completed":
                 completed += 1
             elif status == "partially_completed":
@@ -834,13 +919,16 @@ async def run_live_web_fallback_worker(
                 await _enqueue_remaining_fields(sessions, lease)
 
             reason = getattr(result, "reason", None)
+            if status == "failed_retryable" and reason == "transport_reset":
+                stopped_reason = "transport_reset"
+                break
             if status == "blocked" and _is_rate_limited(reason):
                 stopped_reason = "http_429"
                 break
             if status in {"blocked", "needs_login"}:
                 if (
                     wait_for_login
-                    and _is_login_or_verification(getattr(result, "status", status), reason)
+                    and _is_manual_gate(result, provider)
                     and lease.task_key not in login_resumed
                     and getattr(provider, "has_manual_login_page", False)
                 ):
@@ -887,6 +975,10 @@ async def run_live_web_fallback_worker(
             collected += drained.collected_count
             completed += drained.completed_count
             partial += drained.partial_count
+            blocked_count += getattr(drained, "blocked_count", 0)
+            retryable_count += getattr(drained, "retryable_count", 0)
+            stopped_run_id = getattr(drained, "stopped_run_id", None) or stopped_run_id
+            stopped_target_type = getattr(drained, "stopped_target_type", None) or stopped_target_type
             _add_diagnostics(diagnostics, drained.diagnostics)
             stopped_reason = (
                 "stop_requested_drained"
@@ -909,6 +1001,10 @@ async def run_live_web_fallback_worker(
         stopped_reason=stopped_reason
         or ("queue_drained" if unresolved == 0 else "queue_drained_with_unresolved_tasks"),
         diagnostics=dict(diagnostics),
+        blocked_count=blocked_count,
+        retryable_count=retryable_count,
+        stopped_run_id=stopped_run_id,
+        stopped_target_type=stopped_target_type,
     )
 
 
@@ -951,7 +1047,31 @@ async def run_web_audit(
     deadline = asyncio.get_running_loop().time() + max_seconds
     targets: list[dict[str, Any]] = []
     aggregate: Counter[str] = Counter()
-    eligible_plans = [plan for plan in plans if plan.eligibility_status == "pending_web"]
+    sole_plan = plans[0] if len(plans) == 1 else None
+    precise_target = sole_plan is not None and (
+        (
+            filters.target_type == "thread"
+            and filters.tid == sole_plan.tid
+            and sole_plan.target_type == "thread"
+        )
+        or (
+            filters.target_type == sole_plan.target_type
+            and filters.target_ids == (sole_plan.target_id,)
+        )
+    )
+    if precise_target and sole_plan is not None:
+        precise_target = (
+            (filters.tid is None or filters.tid == sole_plan.tid)
+            and (filters.fid is None or filters.fid == sole_plan.fid)
+            and (filters.parent_pid is None or filters.parent_pid == sole_plan.parent_post_pid)
+        )
+    allow_blocked_audit = headed and wait_for_login and precise_target
+    eligible_plans = [
+        plan
+        for plan in plans
+        if plan.eligibility_status == "pending_web"
+        or (allow_blocked_audit and plan.eligibility_status == "blocked")
+    ]
     provider = None
     if eligible_plans:
         factory = provider_factory or _make_browser_provider
@@ -967,7 +1087,9 @@ async def run_web_audit(
     try:
         for plan in plans:
             entry = _base_audit_target(plan)
-            if plan.eligibility_status != "pending_web":
+            if plan.eligibility_status != "pending_web" and not (
+                allow_blocked_audit and plan.eligibility_status == "blocked"
+            ):
                 entry["status"] = plan.eligibility_status
                 entry["field_statuses"] = plan.field_statuses
                 targets.append(entry)
@@ -981,6 +1103,7 @@ async def run_web_audit(
                 entry["status"] = entry["database"].get("status", "identity_snapshot_mismatch")
                 targets.append(entry)
                 continue
+            _set_provider_run_scope(provider, run_id)
             result = await _collect_with_deadline(provider, _target_from_plan(plan), deadline)
             _add_diagnostics(aggregate, getattr(result, "diagnostics", {}))
             status = getattr(result, "status", "failed_retryable")
@@ -988,7 +1111,7 @@ async def run_web_audit(
             if (
                 wait_for_login
                 and not _is_rate_limited(reason)
-                and _is_login_or_verification(status, reason)
+                and _is_manual_gate(result, provider)
                 and getattr(provider, "has_manual_login_page", False)
             ):
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -1106,6 +1229,7 @@ def _make_browser_provider(*, budget: Any, profile_dir: str | Path, settings: An
         timeout_seconds=settings.timeout_seconds,
         headless=not headed,
         keep_login_page=keep_login_page,
+        reuse_parent_snapshots=getattr(settings, "web_parent_batch_enabled", False),
     )
 
 
@@ -1135,6 +1259,29 @@ async def _collect_with_deadline(provider: Any, target: Target, deadline: float)
             return await provider.collect(target)
     except TimeoutError:
         return _status_result("timeout", "max_seconds_exhausted")
+    except _TRANSPORT_ERRORS as error:
+        return _transport_reset_result(error, "web_provider_collect")
+
+
+def _set_provider_run_scope(provider: Any, run_id: str) -> None:
+    set_scope = getattr(provider, "set_run_scope", None)
+    if callable(set_scope):
+        set_scope(run_id)
+
+
+def _transport_reset_result(error: BaseException, component: str):
+    from .browser import BrowserRunResult
+
+    return BrowserRunResult(
+        "failed_retryable",
+        "transport_reset",
+        (),
+        {
+            "transport_error_type": type(error).__name__,
+            "transport_component": component,
+            "transport_error_at": datetime.now(UTC).isoformat(),
+        },
+    )
 
 
 def _status_result(status: str, reason: str):
@@ -1178,7 +1325,7 @@ def _task_failure_status(status: str, reason: str | None) -> str:
         return "needs_login"
     if status == "identity_unverified":
         return "identity_unverified"
-    if status in {"timeout", "dom_changed"}:
+    if status in {"timeout", "dom_changed", "failed_retryable", "transport_reset"}:
         return "failed_retryable"
     return "failed_final"
 
@@ -1193,6 +1340,20 @@ def _is_login_or_verification(status: str, reason: str | None) -> bool:
         "http_auth_or_verification",
         "official_verification",
     }
+
+
+def _is_manual_gate(result: Any, provider: Any) -> bool:
+    status = getattr(result, "status", None)
+    reason = getattr(result, "reason", None)
+    diagnostics = getattr(result, "diagnostics", {})
+    return (
+        not _is_rate_limited(reason)
+        and status in {"blocked", "needs_login"}
+        and reason in {"blocked", "needs_login", "security_verification", "official_verification"}
+        and isinstance(diagnostics, dict)
+        and diagnostics.get("manual_gate_detected") is True
+        and getattr(provider, "has_manual_login_page", False) is True
+    )
 
 
 def _safe_reason(value: str | None) -> str:
@@ -1218,6 +1379,8 @@ def _add_diagnostics(counter: Counter[str], values: Any) -> None:
         "page_cache_hits",
         "post_owner_scrolls",
         "growth_hover_attempts",
+        "parent_snapshot_hits",
+        "parent_snapshot_misses",
     ):
         value = values.get(name)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
@@ -1255,6 +1418,21 @@ def _safe_diagnostics(values: Any) -> dict[str, Any]:
         value = values.get(name)
         if isinstance(value, str):
             output[name] = _safe_reason(value)
+    if values.get("manual_gate_detected") is True:
+        output["manual_gate_detected"] = True
+    for name in ("transport_error_type", "transport_component", "operation_phase"):
+        value = values.get(name)
+        if isinstance(value, str):
+            output[name] = _safe_reason(value)
+    error_at = values.get("transport_error_at")
+    if isinstance(error_at, str):
+        try:
+            parsed = datetime.fromisoformat(error_at)
+        except ValueError:
+            pass
+        else:
+            if parsed.tzinfo is not None:
+                output["transport_error_at"] = parsed.astimezone(UTC).isoformat()
     return output
 
 
@@ -1313,6 +1491,10 @@ async def _wait_for_stop_or_timeout(stop_event: Any, timeout_seconds: float) -> 
 async def _wait_for_terminal_enter(timeout_seconds: float, *, stream: Any | None = None) -> bool:
     """Wait for Enter without spawning a blocking thread that can outlive cancellation."""
     stream = stream or sys.stdin
+    if os.name == "nt":
+        if not getattr(stream, "isatty", lambda: False)():
+            return False
+        return await _wait_for_windows_terminal_enter(timeout_seconds)
     fd = stream.fileno()
     loop = asyncio.get_running_loop()
     future: asyncio.Future[bool] = loop.create_future()
@@ -1346,6 +1528,27 @@ async def _wait_for_terminal_enter(timeout_seconds: float, *, stream: Any | None
             return False
     finally:
         loop.remove_reader(fd)
+
+
+async def _wait_for_windows_terminal_enter(timeout_seconds: float) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout_seconds)
+    while True:
+        if _windows_console_enter_pressed():
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.05, remaining))
+
+
+def _windows_console_enter_pressed() -> bool:
+    import msvcrt
+
+    while msvcrt.kbhit():
+        if msvcrt.getwch() in {"\r", "\n"}:
+            return True
+    return False
 
 
 async def _close_manual_login_page(provider: Any) -> None:

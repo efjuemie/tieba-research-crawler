@@ -970,6 +970,49 @@ async def test_blocked_tasks_require_explicit_resume_and_retry_is_bounded(resear
 
 
 @pytest.mark.asyncio
+async def test_security_verification_reason_persists_as_blocked_and_needs_explicit_resume(research_db):
+    engine, maker = research_db
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_level"],
+        target_type="thread",
+        tid=1001,
+    )
+    lease = (
+        await lease_web_enrichment_tasks(
+            maker, "run-web-001", "synthetic-worker", task_keys=summary.task_keys
+        )
+    )[0]
+
+    result = await fail_web_enrichment_task(
+        maker,
+        lease.task_key,
+        lease.lease_token,
+        status="blocked",
+        reason_code="security_verification",
+        diagnostics={"pages": 1, "blocked_reason": "security_verification"},
+    )
+
+    assert result == "blocked"
+    assert await lease_web_enrichment_tasks(
+        maker, "run-web-001", "synthetic-worker", task_keys=summary.task_keys
+    ) == []
+    assert await resume_web_enrichment_tasks(
+        maker, "run-web-001", statuses=("failed_final",), task_keys=summary.task_keys
+    ) == 0
+    with Session(engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, summary.task_keys[0])
+        attempt = session.get(ResearchWebEnrichmentAttempt, (summary.task_keys[0], 1))
+        assert task.status == "blocked"
+        assert task.last_error == "security_verification"
+        assert task.last_diagnostics_json["blocked_reason"] == "security_verification"
+        assert attempt.status == "blocked"
+        assert attempt.reason_code == "security_verification"
+        assert attempt.diagnostics_json["blocked_reason"] == "security_verification"
+
+
+@pytest.mark.asyncio
 async def test_retry_delay_increases_and_stops_after_three_attempts(research_db):
     engine, maker = research_db
     summary = await enqueue_web_enrichment_tasks(

@@ -18,17 +18,45 @@ _COUNT_KEYS = frozenset(
         "budgeted_actions",
         "http_429",
         "auth_pauses",
+        "parent_snapshot_hits",
+        "parent_snapshot_misses",
     }
 )
 _FLOAT_KEYS = frozenset({"elapsed_seconds"})
-_STATUS_KEYS = frozenset({"status", "blocked_reason", "user_card_status", "user_card_reason"})
+_STATUS_KEYS = frozenset(
+    {
+        "status",
+        "blocked_reason",
+        "user_card_status",
+        "user_card_reason",
+        "transport_error_type",
+        "transport_component",
+        "operation_phase",
+    }
+)
+_TRANSPORT_ERROR_TYPES = frozenset(
+    {"ConnectionResetError", "BrokenPipeError", "EOFError", "IncompleteReadError"}
+)
+_TRANSPORT_COMPONENTS = frozenset(
+    {
+        "browser_context_start",
+        "page_create",
+        "page_navigation",
+        "page_readiness",
+        "comment_expansion",
+        "playwright_response_body",
+        "playwright_response_capture",
+        "cached_page_close",
+        "web_provider_collect",
+    }
+)
 
 
-def sanitize_web_diagnostics(values: Mapping[str, Any] | None) -> dict[str, int | float | str]:
+def sanitize_web_diagnostics(values: Mapping[str, Any] | None) -> dict[str, int | float | str | bool]:
     """Keep only known bounded counters and status labels; never persist URLs or raw errors."""
     if not values:
         return {}
-    sanitized: dict[str, int | float | str] = {}
+    sanitized: dict[str, int | float | str | bool] = {}
     for key in _COUNT_KEYS | _FLOAT_KEYS:
         value = values.get(key)
         if isinstance(value, bool):
@@ -42,7 +70,22 @@ def sanitize_web_diagnostics(values: Mapping[str, Any] | None) -> dict[str, int 
         if isinstance(value, str) and value and len(value) <= 64 and all(
             char.isalnum() or char in "_.-" for char in value
         ):
+            if key == "transport_error_type" and value not in _TRANSPORT_ERROR_TYPES:
+                continue
+            if key == "transport_component" and value not in _TRANSPORT_COMPONENTS:
+                continue
             sanitized[key] = value
+    if values.get("manual_gate_detected") is True:
+        sanitized["manual_gate_detected"] = True
+    error_at = values.get("transport_error_at")
+    if isinstance(error_at, str) and len(error_at) <= 40:
+        try:
+            parsed = datetime.fromisoformat(error_at)
+        except ValueError:
+            pass
+        else:
+            if parsed.tzinfo is not None:
+                sanitized["transport_error_at"] = parsed.astimezone(UTC).isoformat()
     if "budgeted_actions" not in sanitized:
         page_actions = sanitized.get("pages", 0)
         expansions = sanitized.get("expansions", 0)
@@ -60,7 +103,7 @@ def with_elapsed_seconds(
     values: Mapping[str, Any] | None,
     leased_at: datetime | None,
     finished_at: datetime,
-) -> dict[str, int | float | str]:
+) -> dict[str, int | float | str | bool]:
     sanitized = sanitize_web_diagnostics(values)
     if leased_at is not None:
         start = leased_at.replace(tzinfo=UTC) if leased_at.tzinfo is None else leased_at.astimezone(UTC)

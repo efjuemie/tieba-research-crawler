@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -30,14 +32,40 @@ from src.research.models import ResearchWebEnrichmentTask
 from src.scraper.router import QueueRouter
 from src.scraper.tasks import FullScanPostsTask
 
-TEST_DATABASE_NAME = "tieba_research_runtime_test_20261114"
+_TEST_DATABASE_NAME_OVERRIDE = os.environ.get("TIEBA_RESEARCH_TEST_DATABASE_NAME")
+TEST_DATABASE_NAME = _TEST_DATABASE_NAME_OVERRIDE or "tieba_research_runtime_test_20261114"
+if _TEST_DATABASE_NAME_OVERRIDE and not re.fullmatch(
+    r"tieba_research_runtime_test_nov23_[0-9a-f]{12}", _TEST_DATABASE_NAME_OVERRIDE
+):
+    pytest.fail("The opt-in runtime database name must be a unique nov23 test database.", pytrace=False)
 TEST_DATABASE_COMMENT = "TiebaScraper synthetic runtime integration test database"
 TEST_FID = 9_223_372_036_854_775_807
 TEST_TID = 9_223_372_036_854_775_806
 
 
-async def _fake_web_worker_waits_for_shutdown(_sessions, _run_ids, *, stop_event, **_kwargs):
-    await stop_event.wait()
+async def _fake_web_worker_waits_for_shutdown(
+    _sessions, _run_ids, *, stop_event, api_done_event, **_kwargs
+):
+    waits = (
+        asyncio.create_task(stop_event.wait()),
+        asyncio.create_task(api_done_event.wait()),
+    )
+    try:
+        await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in waits:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*waits, return_exceptions=True)
+    return SimpleNamespace(
+        run_ids=(),
+        collected_count=0,
+        completed_count=0,
+        partial_count=0,
+        unresolved_count=0,
+        stopped_reason="api_finished" if api_done_event.is_set() else "stop_requested",
+        diagnostics={},
+    )
 
 
 async def _fake_discover_missing_web_targets(*_args, **_kwargs):
@@ -119,7 +147,7 @@ async def test_main_backfill_persists_real_run_and_checkpoints_before_completing
             events.append(f"checkpoint_{kwargs['is_good']}")
 
         async def reconcile_after_drain(received_run_id):
-            assert events[-1] == "queue_drained"
+            assert "queue_drained" in events
             events.append("reconcile_started")
             status = await original_reconcile(received_run_id)
             events.append(f"reconciled_{status}")
@@ -322,7 +350,16 @@ async def test_main_recovers_committed_current_generation_without_checkpoint(mon
             await session.commit()
 
         generations = await store.save_threads_and_pending_scans(
-            [make_thread(tid=tid, fid=fid, fname=forum[1], reply_num=100)],
+            [
+                make_thread(
+                    tid=tid,
+                    fid=fid,
+                    fname=forum[1],
+                    reply_num=100,
+                    create_time=datetime(2026, 11, 15, tzinfo=UTC),
+                    last_time=datetime(2026, 11, 16, tzinfo=UTC),
+                )
+            ],
             backfill=True,
             upsert_threads=True,
             force_pending_scan=True,

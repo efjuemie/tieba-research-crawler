@@ -343,8 +343,15 @@ def _report_web_worker_exit(web_worker_task: asyncio.Task) -> None:
         )
     else:
         logger.info(
-            "WEB fallback worker exited with reason={} unresolved={}; API production continues.",
+            "WEB fallback worker exited reason={} run_id={} target_type={} run_ids={} "
+            "completed={} retryable={} blocked={} unresolved={}; API production continues.",
             getattr(summary, "stopped_reason", None),
+            getattr(summary, "stopped_run_id", None),
+            getattr(summary, "stopped_target_type", None),
+            getattr(summary, "run_ids", "unknown"),
+            getattr(summary, "completed_count", "unknown"),
+            getattr(summary, "retryable_count", "unknown"),
+            getattr(summary, "blocked_count", "unknown"),
             getattr(summary, "unresolved_count", "unknown"),
         )
 

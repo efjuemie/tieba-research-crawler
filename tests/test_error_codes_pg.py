@@ -1,6 +1,7 @@
 """Opt-in PostgreSQL checks for persisted research error codes."""
 
 import os
+import re
 import uuid
 
 import pytest
@@ -12,7 +13,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.core.datastore import DataStore
 from src.core.models import ResearchCheckpoint, ResearchRun, ResearchTaskScope
 
-TEST_DATABASE_NAME = "tieba_p0_repro_20261120_deploy"
+_TEST_DATABASE_NAME_OVERRIDE = os.environ.get("TIEBA_P0_TEST_DATABASE_NAME")
+TEST_DATABASE_NAME = _TEST_DATABASE_NAME_OVERRIDE or "tieba_p0_repro_20261120_deploy"
+if _TEST_DATABASE_NAME_OVERRIDE and not re.fullmatch(
+    r"tieba_p0_test_nov23_[0-9a-f]{12}", _TEST_DATABASE_NAME_OVERRIDE
+):
+    pytest.fail("The opt-in P0 database name must be a unique nov23 test database.", pytrace=False)
 
 
 @pytest_asyncio.fixture

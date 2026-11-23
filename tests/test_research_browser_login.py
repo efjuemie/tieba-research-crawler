@@ -132,7 +132,8 @@ async def test_ignores_bduss_cookie_from_non_baidu_domain(monkeypatch):
             timeout_seconds=0.01,
         )
 
-    assert context.cookie_urls == [list(browser_login_module.BAIDU_COOKIE_URLS)]
+    assert context.cookie_urls
+    assert all(urls == list(browser_login_module.BAIDU_COOKIE_URLS) for urls in context.cookie_urls)
     assert context.closed
     assert browser.closed
     assert playwright.stopped

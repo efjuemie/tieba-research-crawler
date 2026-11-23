@@ -39,6 +39,18 @@ class NetworkExtractionResult:
     identity_evidence: IdentityEvidence | None = None
 
 
+@dataclass(frozen=True)
+class VerifiedParentSnapshot:
+    """One naturally observed parent response anchored to its original target."""
+
+    anchor_target: Target
+    response_text: str
+    request_context: ImmutableRequestContext
+    response_status: int
+    observed_at: datetime
+    source_path: str
+
+
 def extract_page_pc_thread_counts(
     target: Target,
     response_text: str,
@@ -400,9 +412,15 @@ def extract_page_pc_comment(
     request_context: ImmutableRequestContext,
     *,
     response_status: int = 200,
+    parent_snapshot: VerifiedParentSnapshot | None = None,
 ) -> NetworkExtractionResult:
     payload, failure = _page_pc_payload(
-        target, response_text, request_context, "comment", response_status
+        target,
+        response_text,
+        request_context,
+        "comment",
+        response_status,
+        parent_snapshot=parent_snapshot,
     )
     if failure is not None:
         return failure
@@ -756,7 +774,15 @@ def extract_page_pc_comment(
     )
 
 
-def _page_pc_payload(target, response_text, request_context, target_type, response_status):
+def _page_pc_payload(
+    target,
+    response_text,
+    request_context,
+    target_type,
+    response_status,
+    *,
+    parent_snapshot: VerifiedParentSnapshot | None = None,
+):
     if response_status == 429:
         return None, _page_pc_failed(target, "blocked", "http_429")
     if response_status in {401, 403}:
@@ -765,11 +791,21 @@ def _page_pc_payload(target, response_text, request_context, target_type, respon
         return None, _page_pc_failed(target, "dom_changed", f"http_{response_status}")
     if target.target_type != target_type:
         return None, _page_pc_failed(target, "identity_unverified", "page_pc_target_type_mismatch")
-    context_reason = (
-        _page_pc_post_request_reason(target, request_context)
-        if target_type == "post"
-        else _page_pc_request_reason(target, request_context)
-    )
+    if parent_snapshot is not None:
+        context_reason = _parent_snapshot_context_reason(
+            target,
+            parent_snapshot,
+            request_context=request_context,
+            expected_path=PAGE_PC_PATH,
+            response_text=response_text,
+            response_status=response_status,
+        )
+    else:
+        context_reason = (
+            _page_pc_post_request_reason(target, request_context)
+            if target_type == "post"
+            else _page_pc_request_reason(target, request_context)
+        )
     if context_reason is not None:
         return None, _page_pc_failed(
             target, "identity_unverified", context_reason
@@ -789,6 +825,39 @@ def _page_pc_payload(target, response_text, request_context, target_type, respon
     if error_code != 0:
         return None, _page_pc_failed(target, "dom_changed", "response_error_code_nonzero")
     return payload, None
+
+
+def _parent_snapshot_context_reason(
+    target: Target,
+    snapshot: VerifiedParentSnapshot,
+    *,
+    request_context: ImmutableRequestContext,
+    expected_path: str,
+    response_text: str,
+    response_status: int,
+) -> str | None:
+    if (
+        snapshot.source_path != expected_path
+        or snapshot.request_context.request_url == ""
+        or urlparse(snapshot.request_context.request_url).path != expected_path
+        or snapshot.request_context != request_context
+        or snapshot.response_text != response_text
+        or snapshot.response_status != response_status
+        or not _same_parent_group(target, snapshot.anchor_target)
+    ):
+        return "parent_snapshot_context_mismatch"
+    if expected_path == PAGE_PC_PATH and (
+        snapshot.request_context.page_post_id != snapshot.anchor_target.parent_post_pid
+    ):
+        return "page_parent_pid_mismatch"
+    context_check = (
+        validate_page_pc_request_context(snapshot.anchor_target, snapshot.request_context)
+        if expected_path == PAGE_PC_PATH
+        else validate_request_context(snapshot.anchor_target, snapshot.request_context)
+    )
+    if not context_check.identity_verified:
+        return context_check.reason or "parent_snapshot_context_invalid"
+    return None
 
 
 def _page_pc_request_reason(target, request_context):
@@ -916,6 +985,7 @@ def extract_nested_floor(
     *,
     observed_at: datetime | None = None,
     response_status: int = 200,
+    parent_snapshot: VerifiedParentSnapshot | None = None,
 ) -> NetworkExtractionResult:
     """Extract values displayed at observation time for the exact CID and author."""
     def failed(status: str, reason: str) -> NetworkExtractionResult:
@@ -938,7 +1008,21 @@ def extract_nested_floor(
     if target.target_type != "comment":
         return failed("identity_unverified", "nested_floor_requires_comment_target")
 
-    context_check = validate_request_context(target, request_context)
+    context_target = target
+    if parent_snapshot is not None:
+        context_reason = _parent_snapshot_context_reason(
+            target,
+            parent_snapshot,
+            request_context=request_context,
+            expected_path=NESTED_FLOOR_PATH,
+            response_text=response_text,
+            response_status=response_status,
+        )
+        if context_reason is not None:
+            return failed("identity_unverified", context_reason)
+        context_target = parent_snapshot.anchor_target
+
+    context_check = validate_request_context(context_target, request_context)
     if not context_check.identity_verified:
         return failed("identity_unverified", context_check.reason or "request_context_invalid")
 
@@ -1125,6 +1209,82 @@ def extract_nested_floor(
     _add_forum_level_candidates(target, item, base, add)
     return NetworkExtractionResult(
         "ok", None, True, tuple(candidates), field_outcomes, identity_evidence=identity
+    )
+
+
+def verify_parent_snapshot(
+    anchor_target: Target,
+    response_text: str,
+    request_context: ImmutableRequestContext,
+    *,
+    response_status: int = 200,
+) -> VerifiedParentSnapshot | None:
+    if anchor_target.target_type != "comment":
+        return None
+    source_path = urlparse(request_context.request_url).path
+    if source_path == NESTED_FLOOR_PATH:
+        if not validate_request_context(anchor_target, request_context).identity_verified:
+            return None
+        anchor_result = extract_nested_floor(
+            anchor_target,
+            response_text,
+            request_context,
+            response_status=response_status,
+        )
+    elif source_path == PAGE_PC_PATH:
+        if request_context.page_post_id != anchor_target.parent_post_pid:
+            return None
+        if not validate_page_pc_request_context(anchor_target, request_context).identity_verified:
+            return None
+        anchor_result = extract_page_pc_comment(
+            anchor_target,
+            response_text,
+            request_context,
+            response_status=response_status,
+        )
+    else:
+        return None
+    if anchor_result.status != "ok" or not anchor_result.identity_verified:
+        return None
+    return VerifiedParentSnapshot(
+        anchor_target=anchor_target,
+        response_text=response_text,
+        request_context=request_context,
+        response_status=response_status,
+        observed_at=request_context.observed_at,
+        source_path=source_path,
+    )
+
+
+def extract_from_parent_snapshot(
+    target: Target,
+    snapshot: VerifiedParentSnapshot,
+) -> NetworkExtractionResult:
+    if snapshot.source_path == PAGE_PC_PATH:
+        return extract_page_pc_comment(
+            target,
+            snapshot.response_text,
+            snapshot.request_context,
+            response_status=snapshot.response_status,
+            parent_snapshot=snapshot,
+        )
+    return extract_nested_floor(
+        target,
+        snapshot.response_text,
+        snapshot.request_context,
+        observed_at=snapshot.observed_at,
+        response_status=snapshot.response_status,
+        parent_snapshot=snapshot,
+    )
+
+
+def _same_parent_group(target: Target, anchor: Target) -> bool:
+    return (
+        target.target_type == "comment"
+        and anchor.target_type == "comment"
+        and target.fid == anchor.fid
+        and target.tid == anchor.tid
+        and target.parent_post_pid == anchor.parent_post_pid
     )
 
 

@@ -158,6 +158,8 @@ uv run python -m src.research field-backfill --run-id YOUR_RUN_ID --target-type 
 uv run python -m src.research field-backfill --run-id YOUR_RUN_ID --target-type comment --tid YOUR_TID --cid YOUR_CID --field ip_location_text --limit 1 --max-seconds 300 --browser-profile data/web-fallback-profile --headed --wait-for-login
 ```
 
+楼中楼同一父楼下的快照复用默认关闭。完成离线与隔离环境验证后，如需启用，在本机 `config.toml` 的 `[web_fallback]` 下设置 `web_parent_batch_enabled = true`；它只在同一 run、同一父楼、且原始请求上下文和每个 CID/UID 都通过身份校验时复用快照，每个快照最多供八个目标使用并在 30 秒后过期。定向手工核验仍使用上面的单 CID `field-backfill` 命令。恢复中断的 run 前先核对原排序：CREATE 使用 `uv run python main.py --mode backfill --resume --run-id YOUR_RUN_ID`；只有 REPLY run 才追加 `--backfill-sort reply`。
+
 网页补采不替代 API 回溯，也不会为身份或字段缺少证据的记录补造数据。
 
 ## 导出与媒体

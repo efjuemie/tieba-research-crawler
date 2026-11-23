@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -8,9 +9,11 @@ import pytest
 
 from src.research.web_fallback.identity import Target, make_request_context
 from src.research.web_fallback.network import (
+    extract_from_parent_snapshot,
     extract_page_pc_comment,
     extract_page_pc_post,
     extract_page_pc_thread_counts,
+    verify_parent_snapshot,
 )
 
 TID = "81001"
@@ -323,6 +326,40 @@ def test_page_pc_comment_requires_exact_parent_cid_and_unique_user_id():
     assert candidates["disagree_count"].normalized_value == 0
     assert candidates["disagree_count"].identity.cid == CID
     assert "unique_response_user_id" in candidates["agree_count"].identity.match_methods
+
+
+def test_verified_page_pc_parent_snapshot_checks_page_pid_and_sibling_author():
+    anchor = _comment_target(requested_fields=("ip_location_text",))
+    sibling_cid = "9007199254740994"
+    sibling_author = "77004"
+    sibling = _comment_target(
+        target_id=sibling_cid,
+        cid=sibling_cid,
+        author_user_id=sibling_author,
+        requested_fields=("ip_location_text",),
+    )
+    payload = _payload()
+    sibling_comment = deepcopy(payload["post_list"][0]["sub_post_list"]["sub_post_list"][0])
+    sibling_comment["id"] = int(sibling_cid)
+    sibling_comment["author_id"] = int(sibling_author)
+    payload["post_list"][0]["sub_post_list"]["sub_post_list"].append(sibling_comment)
+    payload["user_list"].append({"id": int(sibling_author), "ip_address": "浙江"})
+    response_text = json.dumps(payload, ensure_ascii=False)
+    context = _context(anchor, page_url=f"https://tieba.baidu.com/p/{TID}?pid={POST_ID}")
+
+    snapshot = verify_parent_snapshot(anchor, response_text, context)
+    assert snapshot is not None
+    assert snapshot.request_context.target == anchor
+
+    result = extract_from_parent_snapshot(sibling, snapshot)
+    assert result.status == "ok"
+    candidate = next(candidate for candidate in result.candidates if candidate.field_name == "ip_location_text")
+    assert candidate.normalized_value == "浙江"
+    assert candidate.identity.cid == sibling_cid
+    assert candidate.identity.author_user_id == sibling_author
+
+    wrong_page_parent = _context(anchor, page_url=f"https://tieba.baidu.com/p/{TID}?pid=45003")
+    assert verify_parent_snapshot(anchor, response_text, wrong_page_parent) is None
 
 
 def test_page_pc_comment_extracts_growth_from_exact_user_without_nested_request():

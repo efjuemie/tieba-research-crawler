@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -25,7 +26,12 @@ from src.core.models import (
 from src.scraper.tasks import FullScanCommentsTask
 from src.scraper.worker import FullScanCommentsTaskHandler
 
-TEST_DATABASE_NAME = "tieba_research_scope_test_20261114"
+_TEST_DATABASE_NAME_OVERRIDE = os.environ.get("TIEBA_RESEARCH_SCOPE_TEST_DATABASE_NAME")
+TEST_DATABASE_NAME = _TEST_DATABASE_NAME_OVERRIDE or "tieba_research_scope_test_20261114"
+if _TEST_DATABASE_NAME_OVERRIDE and not re.fullmatch(
+    r"tieba_research_scope_test_nov23_[0-9a-f]{12}", _TEST_DATABASE_NAME_OVERRIDE
+):
+    pytest.fail("The opt-in scope database name must be a unique nov23 test database.", pytrace=False)
 
 
 async def _ensure_test_database(url: URL) -> None:

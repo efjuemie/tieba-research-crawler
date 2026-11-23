@@ -155,6 +155,7 @@ class ImmutableRequestContext:
     context_id: str
     reason: str | None = None
     page_origin: str | None = None
+    page_post_id: str | None = None
 
 
 def canonical_thread_id_from_url(url: str) -> str | None:
@@ -299,6 +300,22 @@ def make_request_context(
     page_tid = canonical_thread_id_from_url(page_url)
     if page_tid is None:
         reason = reason or "page_tid_unavailable"
+    page_post_values = [
+        value
+        for key, value in parse_qsl(urlparse(page_url).query, keep_blank_values=True)
+        if key.lower() in {"pid", "post_id"}
+    ]
+    page_post_id: str | None = None
+    if page_post_values:
+        try:
+            canonical_page_posts = [parse_positive_id(value) for value in page_post_values]
+        except IdentityError:
+            reason = reason or "invalid_page_post_id"
+        else:
+            if len(set(canonical_page_posts)) != 1:
+                reason = reason or "conflicting_page_post_id"
+            else:
+                page_post_id = canonical_page_posts[0]
     request_tid = one_id("tid")
     request_fid = one_id("fid")
     request_post_id = one_id("post")
@@ -322,6 +339,7 @@ def make_request_context(
         context_id=context_id,
         reason=reason,
         page_origin=_trusted_origin(page_url),
+        page_post_id=page_post_id,
     )
 
 
