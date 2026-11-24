@@ -2670,3 +2670,67 @@ async def test_thread_with_verified_page_pc_and_missing_richtext_exits_fast_as_n
     assert by_field["global_growth_level"].normalized_value == 5
     assert by_field["reply_count"].normalized_value == 8
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_video_thread_with_mutating_dom_and_verified_page_pc_exits_fast_without_timeout(monkeypatch):
+    monkeypatch.setattr(browser_module, "_THREAD_NETWORK_READY_STABLE_SECONDS", 0.02)
+    payload = json.loads(_page_pc_response())
+    payload["thread"]["author"] = {
+        "id": int(AUTHOR_ID),
+        "ip_address": "合成地区",
+        "user_growth": {"level_id": 5},
+    }
+
+    class _MutatingVideoFakePage(FakePage):
+        async def content(self):
+            tick = self.content_calls + 1
+            self.html_text = (
+                f'<html><body><div class="image-text"><video data-time="{tick}"></video>'
+                '<div class="pc-pb-first-floor-interactive"></div></div></body></html>'
+            )
+            return await super().content()
+
+    page = _MutatingVideoFakePage(
+        page_pc_response_text=json.dumps(payload, ensure_ascii=False),
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 0},
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=0.5)
+
+    result = await provider.collect(
+        _thread_target(requested_fields=("ip_location_text", "global_growth_level"))
+    )
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.diagnostics["pages"] == 1
+    assert page.content_calls >= 3
+    by_field = {candidate.field_name: candidate for candidate in result.candidates}
+    assert by_field["ip_location_text"].normalized_value == "合成地区"
+    assert by_field["global_growth_level"].normalized_value == 5
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_with_unverified_page_pc_exits_fast_as_identity_unverified():
+    payload = json.loads(_page_pc_response())
+    payload["first_floor"] = None
+    page = FakePage(
+        html_text=(
+            '<html><body><div class="image-text">'
+            '<div class="pc-pb-first-floor-interactive"></div>'
+            "</div></body></html>"
+        ),
+        page_pc_response_text=json.dumps(payload, ensure_ascii=False),
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 0},
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=1.0)
+
+    result = await provider.collect(_thread_target(requested_fields=("ip_location_text",)))
+
+    assert result.status == "identity_unverified"
+    assert result.reason == "page_pc_identity_structure_missing"
+    assert result.identity_verified is False
+    assert result.candidates == ()
+    assert result.diagnostics["pages"] == 1
+    await provider.close()

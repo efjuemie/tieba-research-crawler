@@ -1152,12 +1152,10 @@ class PlaywrightWebFallbackProvider:
         comment_readiness_signature = None
         comment_readiness_stable_since = None
         comment_readiness_samples = 0
-        error_previous_html = None
-        error_stable_since = None
-        error_stable_samples = 0
-        thread_net_previous_html = None
-        thread_net_stable_since = None
-        thread_net_stable_samples = 0
+        error_since = None
+        error_samples = 0
+        thread_net_ready_since = None
+        thread_net_ready_samples = 0
         while loop.time() < page_deadline:
             if loop.time() >= task_deadline:
                 return "timeout"
@@ -1175,11 +1173,12 @@ class PlaywrightWebFallbackProvider:
                 result.status == "dom_changed" and result.reason == "response_error_code_nonzero"
                 for result in current_results
             )
-            if target.target_type == "post":
+            if target.target_type in {"thread", "post"}:
                 if state.get("network_request_context_unavailable") or state.get("identity_failure"):
                     return "network_invalid"
                 if any(result.status == "identity_unverified" for result in current_results):
                     return "network_invalid"
+            if target.target_type == "post":
                 if any(result.identity_verified for result in current_results):
                     return "network_ready"
                 if any(
@@ -1199,39 +1198,29 @@ class PlaywrightWebFallbackProvider:
                 if target.target_type == "thread" and any(
                     result.identity_verified for result in current_results
                 ):
-                    if html_text == thread_net_previous_html:
-                        thread_net_stable_samples += 1
-                    else:
-                        thread_net_previous_html = html_text
-                        thread_net_stable_since = loop.time()
-                        thread_net_stable_samples = 1
+                    if thread_net_ready_since is None:
+                        thread_net_ready_since = loop.time()
+                    thread_net_ready_samples += 1
                     if (
-                        thread_net_stable_samples >= _COMMENT_SELECTOR_STABLE_SAMPLES
-                        and thread_net_stable_since is not None
-                        and loop.time() - thread_net_stable_since >= _THREAD_NETWORK_READY_STABLE_SECONDS
+                        thread_net_ready_samples >= _COMMENT_SELECTOR_STABLE_SAMPLES
+                        and loop.time() - thread_net_ready_since >= _THREAD_NETWORK_READY_STABLE_SECONDS
                     ):
                         return "network_ready"
                 else:
-                    thread_net_previous_html = None
-                    thread_net_stable_since = None
-                    thread_net_stable_samples = 0
+                    thread_net_ready_since = None
+                    thread_net_ready_samples = 0
                 if page_pc_nonzero_error:
-                    if html_text == error_previous_html:
-                        error_stable_samples += 1
-                    else:
-                        error_previous_html = html_text
-                        error_stable_since = loop.time()
-                        error_stable_samples = 1
+                    if error_since is None:
+                        error_since = loop.time()
+                    error_samples += 1
                     if (
-                        error_stable_samples >= _COMMENT_SELECTOR_STABLE_SAMPLES
-                        and error_stable_since is not None
-                        and loop.time() - error_stable_since >= _COMMENT_SELECTOR_STABLE_SECONDS
+                        error_samples >= _COMMENT_SELECTOR_STABLE_SAMPLES
+                        and loop.time() - error_since >= _COMMENT_SELECTOR_STABLE_SECONDS
                     ):
                         return "page_pc_error"
                 else:
-                    error_previous_html = None
-                    error_stable_since = None
-                    error_stable_samples = 0
+                    error_since = None
+                    error_samples = 0
             else:
                 state["readiness_step"] = "selector_wait"
                 owner = page.locator(f'.pb-comment-item[data-id="{target.parent_post_pid}"]')
