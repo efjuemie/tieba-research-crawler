@@ -1423,6 +1423,8 @@ def _failure_outcomes(requested_fields, status: str, reason: str | None) -> dict
         "needs_login": "needs_login",
         "blocked": "blocked",
         "identity_unverified": "identity_unverified",
+        "unsupported_by_source": "unsupported_by_source",
+        "not_applicable": "not_applicable",
         "failed_retryable": "failed_retryable",
         "failed_final": "failed_final",
     }.get(_task_failure_status(status, reason), "not_tested")
@@ -1441,6 +1443,10 @@ def _task_failure_status(status: str, reason: str | None) -> str:
         return "needs_login"
     if status == "identity_unverified":
         return "identity_unverified"
+    if status == "not_applicable":
+        return "not_applicable"
+    if status == "unsupported_by_source":
+        return "unsupported_by_source"
     if status in {"timeout", "dom_changed", "failed_retryable", "transport_reset"}:
         return "failed_retryable"
     return "failed_final"

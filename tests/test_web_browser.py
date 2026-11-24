@@ -2536,3 +2536,100 @@ async def test_cancelled_late_response_from_previous_target_cannot_cross_tasks()
     assert all(candidate.identity.cid == next_cid for candidate in second_result.candidates)
     assert all(":request-1:" in candidate.identity.context_id for candidate in second_result.candidates)
     await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_factory",
+    [
+        lambda: _comment_target(requested_fields=("ip_location_text",)),
+        lambda: _thread_target(requested_fields=("ip_location_text",)),
+        lambda: _post_target(requested_fields=("ip_location_text",)),
+    ],
+)
+async def test_deleted_thread_page_exits_fast_as_not_applicable(target_factory):
+    page = FakePage(
+        html_text="<html><body><div>帖子可能已被删除</div></body></html>",
+        has_post=False,
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 0},
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=1.0)
+
+    result = await provider.collect(target_factory())
+
+    assert result.status == "not_applicable"
+    assert result.reason == "thread_deleted_or_unavailable"
+    assert result.identity_verified is False
+    assert result.candidates == ()
+    assert result.diagnostics["pages"] == 1
+    assert result.field_outcomes == {
+        "ip_location_text": {"status": "not_applicable", "reason": "thread_deleted_or_unavailable"}
+    }
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_deleted_thread_marker_respects_gate_priority_untrusted_host_and_live_owners(monkeypatch):
+    monkeypatch.setattr(browser_module, "_COMMENT_SELECTOR_STABLE_SECONDS", 0.05)
+
+    blocked_page = FakePage(
+        status=429,
+        html_text="<html><body><div>帖子可能已被删除</div></body></html>",
+        has_post=False,
+    )
+    blocked_provider = _provider(FakeContext(lambda: blocked_page), timeout_seconds=1.0)
+    blocked_result = await blocked_provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+    assert blocked_result.status == "blocked"
+    assert blocked_result.reason == "http_429"
+    await blocked_provider.close()
+
+    untrusted_page = FakePage(
+        redirect_url=f"https://example.com/p/{TID}",
+        html_text="<html><body><div>帖子可能已被删除</div></body></html>",
+        has_post=False,
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 0},
+    )
+    untrusted_provider = _provider(FakeContext(lambda: untrusted_page), timeout_seconds=0.15)
+    untrusted_result = await untrusted_provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+    assert untrusted_result.status == "timeout"
+    assert untrusted_result.reason == "browser_task_timeout"
+    await untrusted_provider.close()
+
+    live_owner_page = FakePage(
+        html_text='<div class="pb-comment-item" data-id="99999">帖子可能已被删除</div>',
+        has_post=False,
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 1},
+    )
+    live_owner_provider = _provider(FakeContext(lambda: live_owner_page), timeout_seconds=1.0)
+    live_owner_result = await live_owner_provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+    assert live_owner_result.status == "identity_unverified"
+    await live_owner_provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_factory",
+    [
+        lambda: _comment_target(requested_fields=("ip_location_text",)),
+        lambda: _thread_target(requested_fields=("ip_location_text",)),
+    ],
+)
+async def test_nonzero_page_pc_error_exits_fast_instead_of_timing_out(monkeypatch, target_factory):
+    monkeypatch.setattr(browser_module, "_COMMENT_SELECTOR_STABLE_SECONDS", 0.05)
+    page = FakePage(
+        html_text="<html><body><div>未知错误</div></body></html>",
+        page_pc_response_text=json.dumps({"error_code": 110001, "error_msg": "未知错误"}, ensure_ascii=False),
+        has_post=False,
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 0},
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=1.0)
+
+    result = await provider.collect(target_factory())
+
+    assert result.status == "dom_changed"
+    assert result.reason == "response_error_code_nonzero"
+    assert result.identity_verified is False
+    assert result.field_outcomes == {
+        "ip_location_text": {"status": "not_tested", "reason": "response_error_code_nonzero"}
+    }
+    await provider.close()

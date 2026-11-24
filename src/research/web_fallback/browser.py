@@ -42,6 +42,15 @@ _COMMENT_GROWTH_HYDRATION_POLL_SECONDS = 0.05
 _MAX_COMMENT_GROWTH_HOVERS = 3
 _COMMENT_SELECTOR_STABLE_SECONDS = 2.5
 _COMMENT_SELECTOR_STABLE_SAMPLES = 3
+_DELETED_THREAD_PAGE_MARKERS = (
+    "帖子可能已被删除",
+    "很抱歉，该贴已被删除",
+    "该贴已被删除",
+    "贴子已被删除",
+    "抱歉，您访问的贴子被隐藏",
+    "很抱歉，您访问的贴子不存在",
+)
+_LIVE_CONTENT_OWNER_MARKERS = ("pb-comment-item", "l_post", "image-text")
 _PAGE_READINESS_DIAGNOSTIC_TIMEOUT_SECONDS = 0.75
 _PAGE_READINESS_DIAGNOSTIC_GRACE_SECONDS = 1.0
 _PAGE_READINESS_BLOCK_NOTICE_TIMEOUT_SECONDS = 0.2
@@ -609,6 +618,7 @@ class PlaywrightWebFallbackProvider:
         page.on("request", on_request)
         page.on("response", on_response)
         dom_result: DOMExtractionResult | None = None
+        terminal_readiness: str | None = None
         cache_ready = False
         try:
             if reuse_page and cached_page is not None:
@@ -716,6 +726,12 @@ class PlaywrightWebFallbackProvider:
                         state["manual_gate_detected"] = True
                         await notify_blocked_once(readiness)
                     break
+                if readiness == "state_blocked":
+                    self._cached_parent_snapshot = None
+                    break
+                if readiness in {"content_unavailable", "page_pc_error"}:
+                    terminal_readiness = readiness
+                    break
                 if readiness == "timeout":
                     timeout_scope = self._collect_timeout.get()
                     if timeout_scope is not None and not timeout_scope.expired():
@@ -813,6 +829,32 @@ class PlaywrightWebFallbackProvider:
             ):
                 self._cached_parent_snapshot = None
                 return BrowserRunResult("identity_unverified", "network_identity_mismatch", (), dict(state))
+            if terminal_readiness == "content_unavailable":
+                self._cached_parent_snapshot = None
+                return BrowserRunResult(
+                    "not_applicable",
+                    "thread_deleted_or_unavailable",
+                    (),
+                    dict(state),
+                    {
+                        name: {"status": "not_applicable", "reason": "thread_deleted_or_unavailable"}
+                        for name in target.requested_fields
+                    },
+                    False,
+                )
+            if terminal_readiness == "page_pc_error":
+                self._cached_parent_snapshot = None
+                return BrowserRunResult(
+                    "dom_changed",
+                    "response_error_code_nonzero",
+                    (),
+                    dict(state),
+                    {
+                        name: {"status": "not_tested", "reason": "response_error_code_nonzero"}
+                        for name in target.requested_fields
+                    },
+                    False,
+                )
 
             if (
                 target.target_type == "post"
@@ -1108,18 +1150,27 @@ class PlaywrightWebFallbackProvider:
         comment_readiness_signature = None
         comment_readiness_stable_since = None
         comment_readiness_samples = 0
+        error_previous_html = None
+        error_stable_since = None
+        error_stable_samples = 0
         while loop.time() < page_deadline:
             if loop.time() >= task_deadline:
                 return "timeout"
             gate_reason = await _page_gate_reason(page)
             if gate_reason:
                 return gate_reason
+            if state.get("blocked_reason"):
+                return "state_blocked"
+            current_results = (
+                page_network_results.get(page_number, ())
+                if page_network_results is not None and page_number is not None
+                else ()
+            )
+            page_pc_nonzero_error = any(
+                result.status == "dom_changed" and result.reason == "response_error_code_nonzero"
+                for result in current_results
+            )
             if target.target_type == "post":
-                current_results = (
-                    page_network_results.get(page_number, ())
-                    if page_network_results is not None and page_number is not None
-                    else ()
-                )
                 if state.get("network_request_context_unavailable") or state.get("identity_failure"):
                     return "network_invalid"
                 if any(result.status == "identity_unverified" for result in current_results):
@@ -1138,6 +1189,25 @@ class PlaywrightWebFallbackProvider:
                 state["readiness_step"] = "target_check"
                 if target_dom_structure_ready(target, page.url, html_text):
                     return "ready"
+                if _page_content_unavailable_reason(page.url, html_text) is not None:
+                    return "content_unavailable"
+                if page_pc_nonzero_error:
+                    if html_text == error_previous_html:
+                        error_stable_samples += 1
+                    else:
+                        error_previous_html = html_text
+                        error_stable_since = loop.time()
+                        error_stable_samples = 1
+                    if (
+                        error_stable_samples >= _COMMENT_SELECTOR_STABLE_SAMPLES
+                        and error_stable_since is not None
+                        and loop.time() - error_stable_since >= _COMMENT_SELECTOR_STABLE_SECONDS
+                    ):
+                        return "page_pc_error"
+                else:
+                    error_previous_html = None
+                    error_stable_since = None
+                    error_stable_samples = 0
             else:
                 state["readiness_step"] = "selector_wait"
                 owner = page.locator(f'.pb-comment-item[data-id="{target.parent_post_pid}"]')
@@ -1175,16 +1245,21 @@ class PlaywrightWebFallbackProvider:
                         document_state = readiness_state.get("readyState")
                         visible_owner_count = readiness_state.get("visibleOwnerCount")
                         page_pc_verified = page_number in state.get("verified_page_pc_response_pages", ())
-                        ready_signature = (
-                            document_state,
-                            visible_owner_count,
-                        )
+                        if (
+                            document_state == "complete"
+                            and type(visible_owner_count) is int
+                            and visible_owner_count == 0
+                        ):
+                            html_text = await page.content()
+                            if _page_content_unavailable_reason(page.url, html_text) is not None:
+                                return "content_unavailable"
                         if (
                             document_state == "complete"
                             and type(visible_owner_count) is int
                             and visible_owner_count >= 0
                             and (visible_owner_count > 0 or page_pc_verified)
                         ):
+                            ready_signature = ("ready", document_state, visible_owner_count)
                             if ready_signature == comment_readiness_signature:
                                 comment_readiness_samples += 1
                             else:
@@ -1197,6 +1272,25 @@ class PlaywrightWebFallbackProvider:
                                 and loop.time() - comment_readiness_stable_since >= _COMMENT_SELECTOR_STABLE_SECONDS
                             ):
                                 return "ready"
+                        elif (
+                            document_state == "complete"
+                            and type(visible_owner_count) is int
+                            and visible_owner_count == 0
+                            and page_pc_nonzero_error
+                        ):
+                            ready_signature = ("page_pc_error", document_state, visible_owner_count)
+                            if ready_signature == comment_readiness_signature:
+                                comment_readiness_samples += 1
+                            else:
+                                comment_readiness_signature = ready_signature
+                                comment_readiness_stable_since = loop.time()
+                                comment_readiness_samples = 1
+                            if (
+                                comment_readiness_samples >= _COMMENT_SELECTOR_STABLE_SAMPLES
+                                and comment_readiness_stable_since is not None
+                                and loop.time() - comment_readiness_stable_since >= _COMMENT_SELECTOR_STABLE_SECONDS
+                            ):
+                                return "page_pc_error"
                         else:
                             comment_readiness_signature = None
                             comment_readiness_stable_since = None
@@ -1828,6 +1922,16 @@ def _page_url_class(page_url: str) -> str:
     ):
         return "official_thread"
     return "other"
+
+
+def _page_content_unavailable_reason(page_url: str, html_text: str) -> str | None:
+    if _page_url_class(page_url) != "official_thread" or not isinstance(html_text, str) or not html_text:
+        return None
+    if any(marker in html_text for marker in _LIVE_CONTENT_OWNER_MARKERS):
+        return None
+    if any(marker in html_text for marker in _DELETED_THREAD_PAGE_MARKERS):
+        return "thread_deleted_or_unavailable"
+    return None
 
 
 async def _page_readiness_diagnostics(

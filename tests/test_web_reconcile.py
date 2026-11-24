@@ -2348,3 +2348,24 @@ async def test_retried_response_is_observation_idempotent(reconcile_db):
             select(ResearchFieldObservation).where(ResearchFieldObservation.task_key == first_lease.task_key)
         ).all()
         assert len(observations) == 1
+
+
+def test_service_failure_mapping_preserves_terminal_not_applicable_and_unsupported_statuses():
+    assert service._task_failure_status("not_applicable", "thread_deleted_or_unavailable") == "not_applicable"
+    assert service._task_failure_status("unsupported_by_source", "field_unsupported") == "unsupported_by_source"
+    assert service._failure_outcomes(
+        ("ip_location_text",), "not_applicable", "thread_deleted_or_unavailable"
+    ) == {
+        "ip_location_text": {
+            "status": "not_applicable",
+            "reason": "thread_deleted_or_unavailable",
+        }
+    }
+    assert service._failure_outcomes(
+        ("ip_location_text",), "unsupported_by_source", "field_unsupported"
+    ) == {
+        "ip_location_text": {
+            "status": "unsupported_by_source",
+            "reason": "field_unsupported",
+        }
+    }

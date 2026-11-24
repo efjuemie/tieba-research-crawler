@@ -960,3 +960,105 @@ async def test_real_sqlalchemy_interface_error_code_is_not_passed_to_checkpoint_
 
     assert values_seen[0]["error_type"] == "InterfaceError"
     assert values_seen[0]["error_code"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("Comment detail empty response is missing or has zero page identity for page 1.", True),
+        ("Comment detail empty response is not a confirmed terminal page for page 1.", True),
+        ("Comment detail empty response is not a confirmed terminal page for page 2.", False),
+        ("unrelated_failure_reason", False),
+    ],
+)
+async def test_complete_failed_comment_scope_from_parent_zero_reason_allowlist(
+    monkeypatch, reason, expected
+):
+    datastore = DataStore.__new__(DataStore)
+    scope = SimpleNamespace(
+        fid=10,
+        status="incomplete",
+        reason="PageIntegrityError",
+        last_checked=None,
+    )
+    checkpoint = SimpleNamespace(
+        status="failed",
+        scope_status="incomplete",
+        error_type="PageIntegrityError",
+        error_code=None,
+        reason="PageIntegrityError",
+        attempts=1,
+        has_more=None,
+        next_page=1,
+        total_pages=None,
+        reported_count=None,
+        reported_count_missing_reason=None,
+        page_item_count=None,
+        continuation_json={},
+        fid=None,
+        last_checked=None,
+    )
+    parent = SimpleNamespace(rn=30)
+
+    class _FakeSession:
+        def __call__(self):
+            return self
+
+        def begin(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args):
+            return None
+
+    async def fake_context(*_args, **_kwargs):
+        return (parent, scope, checkpoint)
+
+    async def fake_remove(*_args, **_kwargs):
+        return None
+
+    datastore.async_sessionmaker = _FakeSession()
+    monkeypatch.setattr(datastore, "_failed_comment_scope_context", fake_context)
+    monkeypatch.setattr(datastore, "remove_pending_comment_scan_in_session", fake_remove)
+
+    evidence: dict[str, object] = {
+        "tid": 9,
+        "pid": 101,
+        "fid": 10,
+        "author_user_id": 555,
+        "source_page": 1,
+        "reported_count": 0,
+        "count_field_present": True,
+        "source_api": "aiotieba.get_posts",
+        "evidence_kind": "protobuf_wire_explicit_zero",
+        "count_field_path": "data.post_list.sub_post_number",
+        "count_wire_field_number": 13,
+    }
+    completed = await datastore.complete_failed_comment_scope_from_parent_zero(
+        run_id="synthetic-run",
+        task_key="post_comments:9:101:g3",
+        tid=9,
+        parent_pid=101,
+        generation=3,
+        parent_generation=2,
+        fid=10,
+        parent_floor=2,
+        parent_rn=30,
+        parent_page=1,
+        source_observed_at="2026-11-24T00:00:00+00:00",
+        current_failure={"error_type": "PageIntegrityError", "reason": reason},
+        evidence=evidence,
+    )
+
+    assert completed is expected
+    if expected:
+        assert scope.status == "completed"
+        assert scope.reason == "fresh_parent_api_explicit_zero"
+        assert checkpoint.status == "completed"
+        assert checkpoint.fid == 10

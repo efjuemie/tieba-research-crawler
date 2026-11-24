@@ -70,6 +70,12 @@ RESEARCH_RUN_RESUMABLE_STATUSES = (
     "paused_limit",
     "blocked",
 )
+REVALIDATABLE_EMPTY_COMMENT_PAGE_ONE_REASONS = frozenset(
+    {
+        "Comment detail empty response is missing or has zero page identity for page 1.",
+        "Comment detail empty response is not a confirmed terminal page for page 1.",
+    }
+)
 
 
 def _research_forum_ids(forums_json: Any) -> tuple[set[int], bool]:
@@ -988,8 +994,7 @@ class DataStore:
             or type(parent_page) is not int
             or parent_page != (parent_floor - 1) // parent_rn + 1
             or current_failure.get("error_type") != "PageIntegrityError"
-            or current_failure.get("reason")
-            != "Comment detail empty response is missing or has zero page identity for page 1."
+            or current_failure.get("reason") not in REVALIDATABLE_EMPTY_COMMENT_PAGE_ONE_REASONS
             or not source_observed_at
             or type(evidence.get("tid")) is not int
             or evidence.get("tid") != tid

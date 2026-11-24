@@ -867,6 +867,79 @@ async def test_failed_comment_identity_parent_zero_revalidation_is_explicitly_op
 
 
 @pytest.mark.asyncio
+async def test_failed_comment_non_terminal_empty_page_one_triggers_parent_zero_revalidation():
+    post = make_post(pid=101, tid=9, fid=10, floor=2, reply_num=0)
+    evidence = {
+        "tid": 9,
+        "pid": post.pid,
+        "fid": 10,
+        "author_user_id": post.author_id,
+        "reported_count": 0,
+        "count_field_present": True,
+        "source_api": "aiotieba.get_posts",
+        "evidence_kind": "protobuf_wire_explicit_zero",
+        "source_page": 1,
+        "count_field_path": "data.post_list.sub_post_number",
+        "count_wire_field_number": 13,
+    }
+    post_response = ResearchPage(
+        raw=SimpleNamespace(),
+        dto=make_posts_response([post], current_page=1),
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
+        zero_comment_evidence={post.pid: evidence},
+    )
+    empty_dto = make_comments_response([], current_page=1, total_page=1, has_more=False)
+    empty_dto.page.total_count = 2
+    empty_comment_response = ResearchPage(
+        raw=SimpleNamespace(
+            page=SimpleNamespace(current_page=1, total_page=1, total_count=2, has_more=False),
+        ),
+        dto=empty_dto,
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_comments",
+    )
+    client = SimpleNamespace(
+        get_comments_research=AsyncMock(return_value=empty_comment_response),
+        get_posts_research=AsyncMock(return_value=post_response),
+    )
+    datastore = SimpleNamespace(
+        get_research_task_scope_state=AsyncMock(side_effect=[(3, "incomplete", 2), (2, "completed", None)]),
+        get_research_resume_state=AsyncMock(return_value=(1, "incomplete", None)),
+        claim_research_comments_scope=AsyncMock(return_value=True),
+        get_research_comment_parent_page_hint=AsyncMock(return_value=(2, 30)),
+        complete_failed_comment_scope_from_parent_zero=AsyncMock(return_value=True),
+        record_research_checkpoint=AsyncMock(),
+        resume_research_run_if_status=AsyncMock(),
+        set_research_run_status_if=AsyncMock(),
+    )
+    container = make_research_container(client)
+    container.revalidate_failed_comment_page_zero = True
+    handler = FullScanCommentsTaskHandler(0, container, cast("Any", datastore), QueueRouter())
+
+    await handler.handle(
+        FullScanCommentsTask(
+            tid=9,
+            pid=101,
+            run_id="synthetic-run",
+            generation=3,
+            parent_generation=2,
+            fid=10,
+        )
+    )
+
+    client.get_comments_research.assert_awaited_once_with(9, 101, 1)
+    client.get_posts_research.assert_awaited_once_with(9, 1, rn=30, with_comments=False)
+    completion = datastore.complete_failed_comment_scope_from_parent_zero.await_args.kwargs
+    assert completion["evidence"] == evidence
+    assert completion["current_failure"] == {
+        "error_type": "PageIntegrityError",
+        "reason": "Comment detail empty response is not a confirmed terminal page for page 1.",
+    }
+    datastore.record_research_checkpoint.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid_proof",
     ["missing_target", "missing_wire_presence", "nonzero", "wrong_pid", "wrong_page"],

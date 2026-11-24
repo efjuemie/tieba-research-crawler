@@ -28,6 +28,7 @@ from tiebameow.client.tieba_client import RetriableApiError, UnretriableApiError
 from tiebameow.models.orm import Comment, Post, User
 from tiebameow.utils.logger import logger
 
+from ..core.datastore import REVALIDATABLE_EMPTY_COMMENT_PAGE_ONE_REASONS
 from ..core.error_codes import normalize_checkpoint_error_code
 from ..core.metrics import (
     ACTIVE_WORKERS,
@@ -2882,7 +2883,7 @@ class FullScanCommentsTaskHandler(TaskHandler):
     ) -> bool:
         if (
             type(error) is not PageIntegrityError
-            or str(error) != "Comment detail empty response is missing or has zero page identity for page 1."
+            or str(error) not in REVALIDATABLE_EMPTY_COMMENT_PAGE_ONE_REASONS
             or not getattr(self.container, "revalidate_failed_comment_page_zero", False)
             or task.parent_generation is None
         ):
