@@ -17,7 +17,11 @@ from tiebameow.models.orm import Base
 from src.research import __main__ as cli
 from src.research.models import ResearchComment
 from src.research.web_fallback import service
-from src.research.web_fallback.tasks import EnqueueSummary, WebEnrichmentTargetPlan
+from src.research.web_fallback.tasks import (
+    EnqueueSummary,
+    WebEnrichmentTargetPlan,
+    WebEnrichmentTaskLease,
+)
 
 
 def _plan(task_key: str = "task-a", *, status: str = "pending_web") -> WebEnrichmentTargetPlan:
@@ -53,9 +57,43 @@ def _summary(*plans: WebEnrichmentTargetPlan, created: int = 1) -> EnqueueSummar
     )
 
 
+def test_target_factories_preserve_both_scope_generations():
+    plan = _plan()
+    from_plan = service._target_from_plan(plan)
+    lease = WebEnrichmentTaskLease(
+        task_key=plan.task_key,
+        lease_token="synthetic-token",
+        lease_generation=1,
+        run_id="synthetic-run",
+        target_type=plan.target_type,
+        target_id=plan.target_id,
+        tid=plan.tid,
+        pid=plan.pid,
+        cid=plan.cid,
+        parent_post_pid=plan.parent_post_pid,
+        author_user_id=plan.author_user_id,
+        author_portrait=plan.author_portrait,
+        fid=plan.fid,
+        requested_fields=plan.requested_fields,
+        target_observed_at=plan.target_observed_at,
+        scope_generation=3,
+        parent_scope_generation=2,
+        max_attempts=3,
+    )
+    from_lease = service._target_from_lease(lease)
+
+    assert (from_plan.scope_generation, from_plan.parent_scope_generation) == (1, 1)
+    assert (from_lease.scope_generation, from_lease.parent_scope_generation) == (3, 2)
+
+
 async def _ready_preflight(_sessions, lease):
     fields = tuple(getattr(lease, "requested_fields", ("ip_location_text",)))
-    return SimpleNamespace(status="ready", missing_fields=fields, satisfied_fields=())
+    return SimpleNamespace(
+        status="ready",
+        missing_fields=fields,
+        satisfied_fields=(),
+        preserved_outcomes={},
+    )
 
 
 class _SQLiteSessionAdapter:

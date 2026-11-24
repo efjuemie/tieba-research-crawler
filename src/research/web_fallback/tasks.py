@@ -73,6 +73,86 @@ _ZERO_UNKNOWN_REASONS = frozenset(
     }
 )
 _GROWTH_FIELDS = frozenset({"global_growth_level", "global_growth_icon_url"})
+_RESOLVED_FIELD_STATUSES = frozenset(
+    {"applied", "confirmed", "absent_on_page", "unsupported_by_source", "not_applicable"}
+)
+_RESOLVED_NEEDS_EVIDENCE_REASONS = frozenset(
+    {"icon_semantics_unverified", "numeric_level_not_exposed_in_page"}
+)
+
+
+def _field_outcome_resolved(field_name: str, outcome: Any) -> bool:
+    if not isinstance(outcome, dict):
+        return False
+    status = outcome.get("status")
+    if status in _RESOLVED_FIELD_STATUSES:
+        return True
+    return (
+        field_name in _GROWTH_FIELDS
+        and status == "needs_evidence"
+        and outcome.get("reason") in _RESOLVED_NEEDS_EVIDENCE_REASONS
+    )
+
+
+def _field_outcome_inheritable_without_value(field_name: str, outcome: Any) -> bool:
+    if not isinstance(outcome, dict):
+        return False
+    if outcome.get("status") in {
+        "absent_on_page",
+        "unsupported_by_source",
+        "not_applicable",
+    }:
+        return True
+    return (
+        field_name in _GROWTH_FIELDS
+        and outcome.get("status") == "needs_evidence"
+        and outcome.get("reason") in _RESOLVED_NEEDS_EVIDENCE_REASONS
+    )
+
+
+def _resolved_web_task_status(
+    requested_fields: Sequence[str],
+    field_statuses: Any,
+    *,
+    identity_verified: bool | None,
+) -> str | None:
+    if identity_verified is not True or not requested_fields or not isinstance(field_statuses, dict):
+        return None
+    outcomes = {name: field_statuses.get(name) for name in requested_fields}
+    if any(not isinstance(outcome, dict) for outcome in outcomes.values()):
+        return None
+    growth_fields = set(requested_fields) & _GROWTH_FIELDS
+    growth_positive = any(
+        isinstance(outcomes[name], dict)
+        and outcomes[name].get("status") in {"applied", "confirmed"}
+        for name in growth_fields
+    )
+    if any(
+        not _field_outcome_resolved(name, outcomes[name])
+        for name in requested_fields
+        if name not in _GROWTH_FIELDS
+    ):
+        return None
+    if growth_fields and not (
+        growth_fields == _GROWTH_FIELDS and growth_positive
+    ) and any(not _field_outcome_resolved(name, outcomes[name]) for name in growth_fields):
+        return None
+    non_growth_positive = all(
+        isinstance(outcomes[name], dict)
+        and outcomes[name].get("status") in {"applied", "confirmed"}
+        for name in requested_fields
+        if name not in _GROWTH_FIELDS
+    )
+    if non_growth_positive and (not growth_fields or growth_positive):
+        return "completed"
+    statuses = [outcomes[name].get("status") for name in requested_fields]
+    if all(status == "unsupported_by_source" for status in statuses):
+        return "unsupported_by_source"
+    if all(status == "not_applicable" for status in statuses):
+        return "not_applicable"
+    return "completed_with_absent_fields"
+
+
 _CONTENT_MARKERS = {
     "thread": ("thread_first_post", "aiotieba.get_posts"),
     "post": ("post", "aiotieba.get_posts"),
@@ -312,6 +392,7 @@ def _task_key(
     author_portrait: str | None,
     fid: int | None,
     requested_fields: tuple[str, ...],
+    target_observed_at: datetime,
     scope_generation: int,
     parent_scope_generation: int | None,
 ) -> str:
@@ -327,6 +408,7 @@ def _task_key(
         "author_portrait": author_portrait,
         "fid": fid,
         "requested_fields": requested_fields,
+        "target_observed_at": _now(target_observed_at).isoformat(),
         "scope_generation": scope_generation,
         "parent_scope_generation": parent_scope_generation,
     }
@@ -414,6 +496,7 @@ async def _persist_enqueued_task(
                     ResearchWebEnrichmentTask.parent_scope_generation.is_(None)
                     if task["parent_scope_generation"] is None
                     else ResearchWebEnrichmentTask.parent_scope_generation == task["parent_scope_generation"],
+                    ResearchWebEnrichmentTask.target_observed_at == task["target_observed_at"],
                 )
                 .order_by(ResearchWebEnrichmentTask.created_at.desc(), ResearchWebEnrichmentTask.task_key)
                 .with_for_update()
@@ -424,6 +507,32 @@ async def _persist_enqueued_task(
             (row for row in existing_rows if requested.issubset(set(row.requested_fields_json))),
             None,
         )
+        if existing is None and existing_rows:
+            inherited = dict(task["field_statuses_json"])
+            for field_name in requested:
+                if _field_outcome_resolved(field_name, inherited.get(field_name)):
+                    continue
+                for row in existing_rows:
+                    if row.identity_verified is not True or field_name not in row.requested_fields_json:
+                        continue
+                    outcome = dict(row.field_statuses_json or {}).get(field_name)
+                    if _field_outcome_inheritable_without_value(field_name, outcome):
+                        inherited[field_name] = dict(outcome)
+                        break
+            if any(
+                _field_outcome_inheritable_without_value(field_name, inherited.get(field_name))
+                for field_name in requested
+            ):
+                task["field_statuses_json"] = inherited
+                task["identity_verified"] = True
+                terminal_status = _resolved_web_task_status(
+                    task["requested_fields_json"],
+                    inherited,
+                    identity_verified=True,
+                )
+                if terminal_status is not None:
+                    task["status"] = terminal_status
+                    task["completed_at"] = now
         if existing is not None:
             planned_status = task["status"]
             if existing.task_key != task["task_key"]:
@@ -432,7 +541,17 @@ async def _persist_enqueued_task(
             if planned_status == "pending_web" and existing.status == "pending_api_detail":
                 existing.status = "pending_web"
             elif planned_status == "pending_web" and existing.status == "partially_completed":
-                if existing.attempts < existing.max_attempts:
+                terminal_status = _resolved_web_task_status(
+                    existing.requested_fields_json,
+                    existing.field_statuses_json,
+                    identity_verified=existing.identity_verified,
+                )
+                if terminal_status is not None:
+                    existing.status = terminal_status
+                    existing.completed_at = now
+                    existing.next_retry_at = None
+                    existing.updated_at = now
+                elif existing.attempts < existing.max_attempts:
                     existing.status = "failed_retryable"
                     existing.next_retry_at = now + timedelta(seconds=3 if existing.attempts == 1 else 5)
                     existing.last_error_type = "failed_retryable"
@@ -451,13 +570,6 @@ async def _persist_enqueued_task(
                     existing.last_error = "max_attempts_exhausted_after_partial"
                     existing.completed_at = now
                     existing.updated_at = now
-                    existing.field_statuses_json = {
-                        name: {
-                            "status": "failed_final",
-                            "reason": "max_attempts_exhausted_after_partial",
-                        }
-                        for name in existing.requested_fields_json
-                    }
                     _record_enqueue_failure(
                         session,
                         existing,
@@ -479,13 +591,6 @@ async def _persist_enqueued_task(
                     existing.last_error = "web_attempt_limit_exhausted_after_api_refresh"
                     existing.completed_at = now
                     existing.updated_at = now
-                    existing.field_statuses_json = {
-                        name: {
-                            "status": "failed_final",
-                            "reason": "web_attempt_limit_exhausted_after_api_refresh",
-                        }
-                        for name in existing.requested_fields_json
-                    }
                     _record_enqueue_failure(
                         session,
                         existing,
@@ -516,7 +621,17 @@ async def _persist_enqueued_task(
             if existing.status == "pending_api_detail":
                 existing.status = "pending_web"
             elif existing.status == "partially_completed":
-                if existing.attempts < existing.max_attempts:
+                terminal_status = _resolved_web_task_status(
+                    existing.requested_fields_json,
+                    existing.field_statuses_json,
+                    identity_verified=existing.identity_verified,
+                )
+                if terminal_status is not None:
+                    existing.status = terminal_status
+                    existing.completed_at = now
+                    existing.next_retry_at = None
+                    existing.updated_at = now
+                elif existing.attempts < existing.max_attempts:
                     existing.status = "failed_retryable"
                     existing.next_retry_at = now + timedelta(seconds=3 if existing.attempts == 1 else 5)
                     existing.last_error_type = "failed_retryable"
@@ -535,13 +650,6 @@ async def _persist_enqueued_task(
                     existing.last_error = "max_attempts_exhausted_after_partial"
                     existing.completed_at = now
                     existing.updated_at = now
-                    existing.field_statuses_json = {
-                        name: {
-                            "status": "failed_final",
-                            "reason": "max_attempts_exhausted_after_partial",
-                        }
-                        for name in existing.requested_fields_json
-                    }
                     _record_enqueue_failure(
                         session,
                         existing,
@@ -792,6 +900,7 @@ async def enqueue_web_enrichment_tasks(
                     author_portrait=row.author_portrait,
                     fid=row.fid,
                     requested_fields=field_names,
+                    target_observed_at=row.observed_at,
                     scope_generation=parent_scope.generation if parent_scope else thread_scope.generation,
                     parent_scope_generation=thread_scope.generation if parent_scope else None,
                 )
@@ -984,10 +1093,11 @@ async def lease_web_enrichment_tasks(
             .order_by(
                 ResearchWebEnrichmentTask.attempts.asc(),
                 ResearchWebEnrichmentTask.priority.desc(),
-                ResearchWebEnrichmentTask.created_at,
                 ResearchWebEnrichmentTask.target_type,
                 ResearchWebEnrichmentTask.tid,
+                ResearchWebEnrichmentTask.parent_post_pid,
                 ResearchWebEnrichmentTask.target_id,
+                ResearchWebEnrichmentTask.created_at,
                 ResearchWebEnrichmentTask.task_key,
             )
             .limit(limit)
@@ -1005,11 +1115,6 @@ async def lease_web_enrichment_tasks(
             task.leased_at = current_time
             task.next_retry_at = None
             task.updated_at = current_time
-            task.identity_verified = None
-            task.identity_reason = None
-            task.field_statuses_json = {
-                name: {"status": "pending", "reason": None} for name in task.requested_fields_json
-            }
             session.add(
                 ResearchWebEnrichmentAttempt(
                     task_key=task.task_key,

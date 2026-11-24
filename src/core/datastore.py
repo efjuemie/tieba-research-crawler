@@ -445,6 +445,65 @@ class DataStore:
             checkpoint.scope_status.is_(None),
             checkpoint.scope_status != "completed",
         )
+        current_scope = aliased(ResearchTaskScope)
+        parent_scope = aliased(ResearchTaskScope)
+        current_task_key = case(
+            (current_scope.generation == 0, current_scope.logical_task_key),
+            else_=current_scope.logical_task_key + literal(":g") + cast(current_scope.generation, String),
+        )
+        latest_detail_pages = (
+            select(
+                checkpoint.task_key.label("task_key"),
+                func.max(checkpoint.page_number).label("page_number"),
+            )
+            .select_from(checkpoint)
+            .join(
+                current_scope,
+                and_(
+                    current_scope.run_id == checkpoint.run_id,
+                    current_scope.scope_type == checkpoint.scope_type,
+                    checkpoint.task_key == current_task_key,
+                ),
+            )
+            .outerjoin(
+                parent_scope,
+                and_(
+                    parent_scope.run_id == current_scope.run_id,
+                    parent_scope.logical_task_key == current_scope.parent_logical_task_key,
+                    parent_scope.scope_type == "thread_replies",
+                    parent_scope.generation == current_scope.parent_generation,
+                    parent_scope.tid == current_scope.tid,
+                    parent_scope.fid == current_scope.fid,
+                ),
+            )
+            .where(
+                checkpoint.run_id == run_id,
+                checkpoint.scope_type.in_(("thread_replies", "post_comments")),
+                or_(
+                    current_scope.scope_type == "thread_replies",
+                    parent_scope.logical_task_key.is_not(None),
+                ),
+            )
+            .group_by(checkpoint.task_key)
+            .subquery()
+        )
+        current_detail_220034_count = (
+            select(func.count())
+            .select_from(checkpoint)
+            .join(
+                latest_detail_pages,
+                and_(
+                    checkpoint.task_key == latest_detail_pages.c.task_key,
+                    checkpoint.page_number == latest_detail_pages.c.page_number,
+                ),
+            )
+            .where(
+                checkpoint.run_id == run_id,
+                checkpoint.error_code == 220034,
+                is_incomplete,
+            )
+            .scalar_subquery()
+        )
         async with self.async_sessionmaker() as session:
             run = await session.get(ResearchRun, run_id)
             if run is None:
@@ -484,6 +543,7 @@ class DataStore:
                         func.sum(case((is_incomplete, 1), else_=0)),
                         0,
                     ).label("incomplete_count"),
+                    current_detail_220034_count.label("api_220034_count"),
                 )
                 .select_from(checkpoint)
                 .join(
@@ -546,22 +606,39 @@ class DataStore:
                 missing_list_proof = invalid_forums or not forum_ids.issubset(completed_list_forums)
 
             scope_status_rows = await session.execute(
-                select(ResearchTaskScope.status).where(
+                select(ResearchTaskScope.status, ResearchTaskScope.reason).where(
                     ResearchTaskScope.run_id == run_id,
                     ResearchTaskScope.scope_type.in_(("thread_replies", "post_comments")),
                 )
             )
-            scope_statuses = list(scope_status_rows.scalars())
-            if list_counts.blocked_count or "blocked" in scope_statuses:
+            scope_rows = []
+            for row in scope_status_rows.all():
+                if isinstance(row, str):
+                    scope_rows.append((row, None))
+                else:
+                    scope_status, scope_reason = row
+                    scope_rows.append((scope_status, scope_reason))
+            scope_statuses = [status for status, _reason in scope_rows]
+            content_unavailable_scopes = any(
+                status == "blocked" and reason == "content_unavailable" for status, reason in scope_rows
+            )
+            effective_scope_statuses = [
+                status
+                for status, reason in scope_rows
+                if not (status == "blocked" and reason == "content_unavailable")
+            ]
+            if list_counts.blocked_count or getattr(list_counts, "api_220034_count", 0):
                 status, reason = "blocked", "latest_checkpoint_reports_api_220034"
             elif list_counts.auth_count or "paused_auth" in scope_statuses:
                 status, reason = "paused_auth", "latest_checkpoint_requires_authentication"
             elif list_counts.rate_count or "paused_rate_limit" in scope_statuses:
                 status, reason = "paused_rate_limit", "latest_checkpoint_paused_for_rate_limit"
             elif list_counts.incomplete_count or any(
-                scope_status != "completed" for scope_status in scope_statuses
+                scope_status != "completed" for scope_status in effective_scope_statuses
             ) or missing_list_proof:
                 status, reason = "incomplete", "latest_checkpoint_not_terminal"
+            elif content_unavailable_scopes:
+                status, reason = "incomplete", "content_unavailable_scopes"
             else:
                 status, reason = "completed", None
 
@@ -690,13 +767,25 @@ class DataStore:
         values: dict[str, object],
         generation: int | None,
     ) -> bool:
+        values = dict(values)
+        scope = None
         if generation is not None:
             logical_key = task_key.rsplit(":g", 1)[0] if ":g" in task_key else task_key
             scope = await self.get_research_task_scope_for_update(session, run_id, logical_key)
             if scope is None or scope.generation != generation:
                 return False
+            scope_fid = scope.fid
+            if values.get("fid") is None and scope_fid is not None:
+                values["fid"] = scope_fid
+            elif scope_fid is not None and values.get("fid") != scope_fid:
+                return False
 
         row = await session.get(ResearchCheckpoint, (run_id, task_key, page_number))
+        if row is not None and row.fid is not None and (
+            (values.get("fid") is not None and row.fid != values.get("fid"))
+            or (scope is not None and scope.fid is not None and row.fid != scope.fid)
+        ):
+            return False
         if row is None:
             session.add(
                 ResearchCheckpoint(
@@ -708,6 +797,8 @@ class DataStore:
             )
         else:
             for name, value in values.items():
+                if name == "fid" and value is None and row.fid is not None:
+                    continue
                 setattr(row, name, value)
         run = await session.get(ResearchRun, run_id)
         if run is not None:
@@ -806,7 +897,8 @@ class DataStore:
             or checkpoint.scope_type != "post_comments"
             or checkpoint.tid != tid
             or checkpoint.parent_pid != parent_pid
-            or checkpoint.fid != scope.fid
+            or checkpoint.parent_kind != scope.parent_kind
+            or (checkpoint.fid is not None and checkpoint.fid != scope.fid)
         ):
             return None
         later_page = await session.scalar(
@@ -835,7 +927,7 @@ class DataStore:
         parent_generation: int,
     ) -> tuple[int, int] | None:
         """Preflight an old failed page-one scope and return one candidate page hint."""
-        from src.research.models import ResearchPost
+        from src.research.models import ResearchPost, ResearchThread
 
         async with self.async_sessionmaker() as session:
             context = await self._failed_comment_scope_context(
@@ -849,14 +941,25 @@ class DataStore:
             )
             if context is None:
                 return None
-            parent, _scope, _checkpoint = context
+            parent, scope, _checkpoint = context
             if type(parent.rn) is not int or parent.rn < 1:
                 return None
-            floor = await session.scalar(
-                select(ResearchPost.floor).where(ResearchPost.tid == tid, ResearchPost.pid == parent_pid)
-            )
-            if type(floor) is not int or floor < 1:
-                floor = await session.scalar(select(Post.floor).where(Post.tid == tid, Post.pid == parent_pid))
+            if scope.parent_kind == "first_post":
+                first_pid = await session.scalar(
+                    select(ResearchThread.first_pid).where(
+                        ResearchThread.tid == tid,
+                        ResearchThread.fid == scope.fid,
+                    )
+                )
+                if first_pid != parent_pid:
+                    return None
+                floor = 1
+            else:
+                floor = await session.scalar(
+                    select(ResearchPost.floor).where(ResearchPost.tid == tid, ResearchPost.pid == parent_pid)
+                )
+                if type(floor) is not int or floor < 1:
+                    floor = await session.scalar(select(Post.floor).where(Post.tid == tid, Post.pid == parent_pid))
             return (floor, parent.rn) if type(floor) is int and floor > 0 else None
 
     async def complete_failed_comment_scope_from_parent_zero(
@@ -934,6 +1037,7 @@ class DataStore:
                 )
             }
             checkpoint.status = checkpoint.scope_status = "completed"
+            checkpoint.fid = scope.fid
             checkpoint.has_more = checkpoint.total_pages = checkpoint.reported_count = None
             checkpoint.reported_count_missing_reason = checkpoint.page_item_count = None
             checkpoint.next_page = checkpoint.error_type = checkpoint.error_code = checkpoint.reason = None

@@ -17,7 +17,7 @@ from src.research.web_fallback.browser import (
 )
 from src.research.web_fallback.diagnostics import sanitize_web_diagnostics
 from src.research.web_fallback.dom import DOMExtractionResult
-from src.research.web_fallback.identity import Target
+from src.research.web_fallback.identity import IdentityError, Target
 from src.research.web_fallback.network import (
     NESTED_FLOOR_PATH,
     PAGE_PC_PATH,
@@ -208,6 +208,7 @@ class FakePage:
         evaluate_error=None,
         content_delay=0,
         diagnostic_title=None,
+        selector_readiness_result=None,
     ):
         self.url = "about:blank"
         self.html_text = html_text
@@ -237,6 +238,10 @@ class FakePage:
         self.evaluate_error = evaluate_error
         self.content_delay = content_delay
         self.diagnostic_title = diagnostic_title
+        self.selector_readiness_result = selector_readiness_result or {
+            "readyState": "complete",
+            "visibleOwnerCount": 0,
+        }
         self.hover_positions = []
         self.comment_growth_hover_args = None
         self.mouse = FakeMouse(self)
@@ -324,6 +329,10 @@ class FakePage:
         return self.html_text
 
     async def evaluate(self, script, arg=None):
+        if script == browser_module._COMMENT_SELECTOR_STABILITY_SCRIPT:
+            if self.evaluate_error is not None:
+                raise self.evaluate_error
+            return self.selector_readiness_result
         if script == browser_module._PAGE_READINESS_DIAGNOSTIC_SCRIPT:
             if self.evaluate_error is not None:
                 raise self.evaluate_error
@@ -408,6 +417,8 @@ def _comment_target(**changes):
         "author_user_id": AUTHOR_ID,
         "author_portrait": PORTRAIT,
         "requested_fields": ("author_nickname",),
+        "scope_generation": 0,
+        "parent_scope_generation": 0,
     }
     values.update(changes)
     return Target(**values)
@@ -1168,6 +1179,77 @@ async def test_comment_parent_snapshot_reuses_page_pc_and_nested_floor_per_cid_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope_generation", "parent_scope_generation"),
+    [(1, 0), (0, 1)],
+)
+async def test_parent_snapshot_does_not_cross_scope_generations(scope_generation, parent_scope_generation):
+    sibling_cid = str(int(CID) + 1)
+    sibling_author = str(int(AUTHOR_ID) + 1)
+    shared_response = _page_pc_parent_response(
+        ((CID, AUTHOR_ID, "黑龙江"), (sibling_cid, sibling_author, "浙江"))
+    )
+    pages = [
+        FakePage(page_pc_response_text=shared_response, expansion_remaining=0),
+        FakePage(page_pc_response_text=shared_response, expansion_remaining=0),
+    ]
+    context = FakeContext(lambda: pages.pop(0))
+    provider = _provider(context, reuse_parent_snapshots=True)
+
+    anchor = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+    sibling = await provider.collect(
+        _comment_target(
+            target_id=sibling_cid,
+            cid=sibling_cid,
+            author_user_id=sibling_author,
+            requested_fields=("ip_location_text",),
+            scope_generation=scope_generation,
+            parent_scope_generation=parent_scope_generation,
+        )
+    )
+
+    assert anchor.status == sibling.status == "ok"
+    assert sibling.diagnostics["parent_snapshot_hits"] == 0
+    assert sibling.diagnostics["parent_snapshot_misses"] == 1
+    assert sibling.diagnostics["pages"] == 1
+    assert len(context.pages) == 2
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_snapshot_cache_is_disabled_without_generation_context():
+    shared_response = _page_pc_parent_response(((CID, AUTHOR_ID, "黑龙江"),))
+    pages = [
+        FakePage(page_pc_response_text=shared_response, expansion_remaining=0),
+        FakePage(page_pc_response_text=shared_response, expansion_remaining=0),
+    ]
+    context = FakeContext(lambda: pages.pop(0))
+    provider = _provider(context, reuse_parent_snapshots=True)
+    target = _comment_target(
+        requested_fields=("ip_location_text",),
+        scope_generation=None,
+        parent_scope_generation=None,
+    )
+
+    first = await provider.collect(target)
+    second = await provider.collect(target)
+
+    assert first.status == second.status == "ok"
+    assert first.diagnostics["parent_snapshot_hits"] == 0
+    assert second.diagnostics["parent_snapshot_hits"] == 0
+    assert second.diagnostics["pages"] == 1
+    assert provider._cached_parent_snapshot is None
+    assert len(context.pages) == 2
+    await provider.close()
+
+
+@pytest.mark.parametrize("generation", [True, -1, 1.5, "0"])
+def test_target_rejects_invalid_scope_generation(generation):
+    with pytest.raises(IdentityError, match="invalid_scope_generation"):
+        _comment_target(scope_generation=generation)
+
+
+@pytest.mark.asyncio
 async def test_comment_parent_snapshot_publishes_only_after_full_identity_success():
     page = FakePage(
         page_pc_response_text=_page_pc_parent_response(((CID, AUTHOR_ID, "黑龙江"),)),
@@ -1184,11 +1266,49 @@ async def test_comment_parent_snapshot_publishes_only_after_full_identity_succes
 
 
 @pytest.mark.asyncio
-async def test_parent_snapshot_growth_miss_falls_back_to_exact_cid_dom():
+async def test_parent_snapshot_identity_conflict_clears_cached_frame():
     sibling_cid = str(int(CID) + 1)
     sibling_author = str(int(AUTHOR_ID) + 1)
     shared_response = _page_pc_parent_response(
         ((CID, AUTHOR_ID, "黑龙江"), (sibling_cid, sibling_author, "浙江"))
+    )
+    page = FakePage(page_pc_response_text=shared_response, expansion_remaining=0)
+    provider = _provider(FakeContext(lambda: page), reuse_parent_snapshots=True)
+    anchor = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+    cached_snapshot = provider._cached_parent_snapshot
+    assert anchor.status == "ok"
+    assert cached_snapshot is not None
+
+    conflicting_target = _comment_target(
+        target_id=sibling_cid,
+        cid=sibling_cid,
+        author_user_id=str(int(sibling_author) + 1),
+        requested_fields=("ip_location_text",),
+    )
+    result = provider._collect_from_parent_snapshot(
+        conflicting_target,
+        {"parent_snapshot_hits": 0, "parent_snapshot_misses": 0},
+    )
+
+    assert result is not None
+    assert result.status == "identity_unverified"
+    assert result.reason == "response_author_id_mismatch"
+    assert provider._cached_parent_snapshot is None
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_snapshot_growth_miss_falls_back_to_exact_cid_dom():
+    sibling_cid = str(int(CID) + 1)
+    sibling_author = str(int(AUTHOR_ID) + 1)
+    other_cid = str(int(CID) + 2)
+    other_author = str(int(AUTHOR_ID) + 2)
+    shared_response = _page_pc_parent_response(
+        (
+            (CID, AUTHOR_ID, "黑龙江"),
+            (sibling_cid, sibling_author, "浙江"),
+            (other_cid, other_author, "吉林"),
+        )
     )
     anchor = _comment_target(requested_fields=("ip_location_text",))
     sibling = _comment_target(
@@ -1196,6 +1316,12 @@ async def test_parent_snapshot_growth_miss_falls_back_to_exact_cid_dom():
         cid=sibling_cid,
         author_user_id=sibling_author,
         requested_fields=("global_growth_level", "global_growth_icon_url"),
+    )
+    other_sibling = _comment_target(
+        target_id=other_cid,
+        cid=other_cid,
+        author_user_id=other_author,
+        requested_fields=("ip_location_text",),
     )
 
     old_pages = [
@@ -1229,6 +1355,8 @@ async def test_parent_snapshot_growth_miss_falls_back_to_exact_cid_dom():
     context = FakeContext(lambda: pages.pop(0))
     provider = _provider(context, reuse_parent_snapshots=True)
     await provider.collect(anchor)
+    cached_snapshot = provider._cached_parent_snapshot
+    assert cached_snapshot is not None
     new_result = await provider.collect(sibling)
 
     assert old_result.status == new_result.status == "ok", (
@@ -1246,6 +1374,23 @@ async def test_parent_snapshot_growth_miss_falls_back_to_exact_cid_dom():
     }
     assert new_result.diagnostics["parent_snapshot_misses"] == 1
     assert new_result.diagnostics["pages"] == 1
+    assert len(context.pages) == 2
+    assert provider._cached_parent_snapshot is cached_snapshot
+    assert sibling_cid in cached_snapshot.missed_target_ids
+
+    repeated_state = {"parent_snapshot_hits": 0, "parent_snapshot_misses": 0}
+    assert provider._collect_from_parent_snapshot(sibling, repeated_state) is None
+    assert repeated_state["parent_snapshot_misses"] == 0
+    assert provider._cached_parent_snapshot is cached_snapshot
+
+    other_result = await provider.collect(other_sibling)
+    assert other_result.status == "ok"
+    assert other_result.diagnostics["parent_snapshot_hits"] == 1
+    assert other_result.diagnostics["pages"] == 0
+    other_candidate = next(
+        candidate for candidate in other_result.candidates if candidate.field_name == "ip_location_text"
+    )
+    assert other_candidate.identity.cid == other_cid
     assert len(context.pages) == 2
     await provider.close()
 
@@ -1474,6 +1619,88 @@ async def test_comment_page_pc_missing_cid_keeps_exact_nested_expansion_active()
     assert result.status == "ok"
     assert result.diagnostics["nested_floor_requests"] == 1
     assert [candidate.field_name for candidate in result.candidates] == ["author_nickname"]
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_selector_wait_hands_off_to_verified_page_pc_without_owner(monkeypatch):
+    monkeypatch.setattr(browser_module, "_COMMENT_SELECTOR_STABLE_SECONDS", 0.05)
+    page = FakePage(
+        page_pc_response_text=_page_pc_response(),
+        has_post=False,
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 0},
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=1.0)
+
+    result = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    candidate = next(candidate for candidate in result.candidates if candidate.field_name == "ip_location_text")
+    assert candidate.source_path == "page_pc.user_list[0].ip_address"
+    assert candidate.identity.cid == CID
+    assert result.diagnostics["verified_page_pc_response_pages"] == [1]
+    assert result.diagnostics["pages"] == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_selector_wait_does_not_trust_page_pc_for_another_parent(monkeypatch):
+    monkeypatch.setattr(browser_module, "_COMMENT_SELECTOR_STABLE_SECONDS", 0.05)
+    wrong_parent = json.loads(_page_pc_response())
+    wrong_parent_pid = str(int(POST_ID) + 1)
+    wrong_parent["post_list"][0]["id"] = int(wrong_parent_pid)
+    wrong_parent["post_list"][0]["sub_post_list"]["pid"] = int(wrong_parent_pid)
+    page = FakePage(
+        page_pc_response_text=json.dumps(wrong_parent, ensure_ascii=False),
+        has_post=False,
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 0},
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=0.2)
+
+    result = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+
+    assert result.status == "timeout"
+    assert result.reason == "browser_task_timeout"
+    assert result.diagnostics["verified_page_pc_response_pages"] == []
+    assert result.diagnostics["readiness_step"] == "selector_wait"
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_selector_wait_uses_stable_visible_owners_without_marking_identity(monkeypatch):
+    monkeypatch.setattr(browser_module, "_COMMENT_SELECTOR_STABLE_SECONDS", 0.05)
+    page = FakePage(
+        html_text='<div class="pb-comment-item" data-id="99999"></div>',
+        has_post=False,
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 1},
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=1.0)
+
+    result = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+
+    assert result.status == "identity_unverified"
+    assert result.identity_verified is False
+    assert result.candidates == ()
+    assert result.diagnostics["verified_page_pc_response_pages"] == []
+    assert result.diagnostics["pages"] == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_selector_wait_preserves_gate_priority():
+    page = FakePage(
+        status=429,
+        page_pc_response_text=_page_pc_response(),
+        has_post=False,
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 1},
+    )
+    provider = _provider(FakeContext(lambda: page))
+
+    result = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+
+    assert result.status == "blocked"
+    assert result.reason == "http_429"
     await provider.close()
 
 

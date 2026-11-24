@@ -51,6 +51,7 @@ async def test_detail_failure_persists_only_normalized_integer_codes(
         task_type="full_scan_comments",
         scope_type="post_comments",
         tid=101,
+        fid=905818,
         parent_pid=202,
         generation=3,
         error=_CodeError(code),
@@ -60,6 +61,7 @@ async def test_detail_failure_persists_only_normalized_integer_codes(
     checkpoint = datastore.record_research_checkpoint.await_args.kwargs
     assert checkpoint["status"] == status
     assert checkpoint["scope_status"] == scope_status
+    assert checkpoint["fid"] == 905818
     assert checkpoint["error_code"] == stored_code
     assert checkpoint["error_type"] == "_CodeError"
     assert checkpoint["reason"] == reason

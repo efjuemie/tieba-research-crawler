@@ -513,6 +513,7 @@ async def test_postgres_fresh_parent_zero_completion_preserves_failure_and_fence
         live_parent_generation: int,
         child_status: str = "running",
         checkpoint_status: str = "failed",
+        checkpoint_fid: int | None = 77,
         later_page: bool = False,
         existing_comment: bool = False,
     ) -> tuple[str, str, int, int, int]:
@@ -563,7 +564,7 @@ async def test_postgres_fresh_parent_zero_completion_preserves_failure_and_fence
                         page_number=1,
                         task_type="full_scan_comments",
                         scope_type="post_comments",
-                        fid=77,
+                        fid=checkpoint_fid,
                         fname="synthetic-forum",
                         tid=tid,
                         parent_pid=pid,
@@ -659,7 +660,9 @@ async def test_postgres_fresh_parent_zero_completion_preserves_failure_and_fence
                     lambda sync_connection, table=table: table.create(sync_connection, checkfirst=True)
                 )
 
-        parent_key, child_key, tid, pid, fid = await seed_scope(run_ids[0], live_parent_generation=4)
+        parent_key, child_key, tid, pid, fid = await seed_scope(
+            run_ids[0], live_parent_generation=4, checkpoint_fid=None
+        )
         hint = await store.get_research_comment_parent_page_hint(
             run_ids[0], research_comments_task_key(tid, pid, 6), tid, pid, 6, 4
         )
@@ -745,6 +748,7 @@ async def test_postgres_fresh_parent_zero_completion_preserves_failure_and_fence
             pending = await session.get(PendingCommentScan, (tid, pid))
             assert checkpoint is not None
             assert checkpoint.status == "completed"
+            assert checkpoint.fid == fid
             assert checkpoint.error_type is None
             assert checkpoint.reported_count is None
             assert scope is not None

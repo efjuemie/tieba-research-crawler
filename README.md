@@ -105,6 +105,8 @@ uv run python main.py --mode backfill --resume --run-id YOUR_RUN_ID
 
 使用相同的 `--resume --run-id` 恢复时，程序继续该 run 的 API 工作和持久化网页补采任务。网页队列优先尝试尚未执行的目标，再取到期重试；每个目标最多尝试 3 次。第一次未采齐后等待 3 秒，第二次等待 5 秒；超时、临时失败和部分完成后仍缺字段都遵守此等待。耗尽后保留为 `failed_final`，不会自动重置。
 
+身份已核实且每个请求字段都有可靠结果的网页任务会进入 `completed`、`completed_with_absent_fields` 或明确的来源终态。`completed_with_absent_fields` 表示本次观察确认字段缺失或无法从页面判定，不会把缺失值写成实际数据；`not_tested` 和 `not_observed` 等未完成观察仍保留重试路径。恢复不会重置历史尝试次数。
+
 只排空已有 run 的详情待办，不继续发现主题：
 
 ```sh
@@ -118,6 +120,10 @@ uv run python main.py drain-pending --run-id YOUR_RUN_ID --limit 10 --max-second
 ### 请求频率
 
 默认 API `[rate_limit] global_rps = 0.5`，约每 2 秒提供一个 API 请求机会。调度器按 `threads → posts → posts → comments` 四槽轮转；三条通道都有待处理请求时，机会按 1:2:1 分配，空通道会让出槽位。这描述请求机会的调度次序，不代表整体吞吐倍率。评论 scope 会先保存在数据库；有界评论队列满时，dispatcher 保留待办并在队列有空位后继续投递。浏览器 `[web_fallback] rps = 0.2` 独立运行，不占用 API 预算。API 遇到 429/220034 限制或连续三次异常空响应时，会冷却 5 秒后按原有上限继续；确认的正常空终页不会触发该冷却。网页自动加载的图片等子资源不会逐个计入。修改 `config.toml` 中的限速值后，需正常停止并重启程序才会生效，运行中不会热更新。
+
+评论详情第 1 页继续使用严格空响应校验。第 2 页及以后只有在请求页码、服务端页码与页数、报告数量和 `has_more` 自洽时，空页才可作为分页证据；空中间页按首次确认的总页数继续，且受连续空页上限约束。确认的空末页会在检查点标记为 `server_confirmed_empty_terminal_page`。页码或页数变化、缺失或矛盾时，该范围保留未完成状态。
+
+启用研究持久化时，主题详情页若非空页报告 `has_more=false`，但其 `total_page` 恰好还包含下一页，程序只额外读取这一页一次。下一页必须提供一致的主题与论坛身份、页码和页数，并包含新的帖子 ID，才会继续处理；否则保留未完成检查点。该有限复核不将矛盾的 `has_more` 一概视为终页。
 
 `get_posts` 附带的评论通常仍需通过 `get_comments` 独立分页。只有原始 protobuf 明确包含楼中楼数量为零，且主题、论坛、父楼、作者和页码身份均匹配时，才跳过该父楼的 `get_comments`；checkpoint 会记录这项证据来自哪条父楼 API 响应。缺少原始响应、数据不完整或身份不匹配时仍照常请求评论。
 

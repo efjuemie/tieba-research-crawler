@@ -13,6 +13,7 @@ from tiebameow.models.dto import BaseThreadDTO, ThreadDTO, ThreadUserDTO
 
 from src.core.config import ConsumerConfig
 from src.core.datastore import DataStore
+from src.core.models import ResearchCheckpoint, ResearchTaskScope
 
 # ==================== Mock 类 ====================
 
@@ -622,6 +623,228 @@ async def test_comment_scope_claim_serializes_parent_before_child(monkeypatch, s
     assert claimed is expected
     assert locked_keys == ["thread_replies:9", "post_comments:9:100"]
     assert scope.status == ("running" if expected else status)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_fid_defaults_from_current_scope_and_rejects_conflicts(monkeypatch):
+    datastore = DataStore.__new__(DataStore)
+    scope = SimpleNamespace(generation=3, fid=905818, status="running", last_checked=None)
+
+    async def get_scope(_session, _run_id, logical_key):
+        assert logical_key == "post_comments:1:2"
+        return scope
+
+    monkeypatch.setattr(datastore, "get_research_task_scope_for_update", get_scope)
+
+    class Session:
+        def __init__(self):
+            self.added = None
+
+        async def get(self, model, _key):
+            return None
+
+        def add(self, row):
+            self.added = row
+
+    session = Session()
+    values = {
+        "fid": None,
+        "status": "failed",
+        "scope_status": "incomplete",
+        "reason": "PageIntegrityError",
+    }
+
+    assert await datastore._record_research_checkpoint_in_session(
+        session,
+        run_id="run",
+        task_key="post_comments:1:2:g3",
+        page_number=1,
+        values=values,
+        generation=3,
+    )
+    assert session.added.fid == 905818
+
+    conflict_session = Session()
+    conflict_values = {**values, "fid": 7}
+    assert not await datastore._record_research_checkpoint_in_session(
+        conflict_session,
+        run_id="run",
+        task_key="post_comments:1:2:g3",
+        page_number=1,
+        values=conflict_values,
+        generation=3,
+    )
+    assert conflict_session.added is None
+
+    for incoming_fid in (None, 905818):
+        existing_row = SimpleNamespace(fid=999, status="old")
+
+        class ExistingSession(Session):
+            async def get(self, model, _key, existing_row=existing_row):
+                return existing_row if model is ResearchCheckpoint else None
+
+        existing_session = ExistingSession()
+        conflict_values = {**values, "fid": incoming_fid}
+        assert not await datastore._record_research_checkpoint_in_session(
+            existing_session,
+            run_id="run",
+            task_key="post_comments:1:2:g3",
+            page_number=1,
+            values=conflict_values,
+            generation=3,
+        )
+        assert existing_row.fid == 999
+        assert existing_row.status == "old"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_update_preserves_existing_fid_when_new_value_is_missing():
+    datastore = DataStore.__new__(DataStore)
+    row = SimpleNamespace(fid=905818)
+
+    class Session:
+        async def get(self, model, _key):
+            return row if model is ResearchCheckpoint else None
+
+        def add(self, _row):
+            raise AssertionError("existing checkpoint should not be inserted")
+
+    assert await datastore._record_research_checkpoint_in_session(
+        Session(),
+        run_id="run",
+        task_key="post_comments:1:2",
+        page_number=1,
+        values={"fid": None, "status": "failed", "scope_status": "incomplete"},
+        generation=None,
+    )
+    assert row.fid == 905818
+
+
+@pytest.mark.asyncio
+async def test_failed_comment_context_accepts_only_legacy_null_checkpoint_fid():
+    from src.core.models import research_comments_task_key, research_posts_task_key
+
+    tid, pid, generation, parent_generation, fid = 101, 202, 6, 4, 905818
+    parent_key = research_posts_task_key(tid)
+    task_key = research_comments_task_key(tid, pid, generation)
+    parent = SimpleNamespace(
+        generation=parent_generation,
+        scope_type="thread_replies",
+        tid=tid,
+        rn=30,
+        fid=fid,
+    )
+    scope = SimpleNamespace(
+        generation=generation,
+        status="incomplete",
+        task_type="full_scan_comments",
+        scope_type="post_comments",
+        tid=tid,
+        parent_pid=pid,
+        parent_kind="reply_post",
+        parent_logical_task_key=parent_key,
+        parent_generation=parent_generation,
+        fid=fid,
+    )
+    checkpoint = SimpleNamespace(
+        status="failed",
+        scope_status="incomplete",
+        error_type="PageIntegrityError",
+        task_type="full_scan_comments",
+        scope_type="post_comments",
+        tid=tid,
+        parent_pid=pid,
+        parent_kind="reply_post",
+        fid=None,
+    )
+
+    class Session:
+        async def get(self, model, key):
+            if model is ResearchTaskScope:
+                return parent if key == ("run", parent_key) else scope
+            if model is ResearchCheckpoint:
+                return checkpoint
+            return None
+
+        async def scalar(self, _statement):
+            return None
+
+    datastore = DataStore.__new__(DataStore)
+    assert await datastore._failed_comment_scope_context(
+        Session(),
+        run_id="run",
+        task_key=task_key,
+        tid=tid,
+        parent_pid=pid,
+        generation=generation,
+        parent_generation=parent_generation,
+    ) == (parent, scope, checkpoint)
+
+    checkpoint.fid = fid + 1
+    assert await datastore._failed_comment_scope_context(
+        Session(),
+        run_id="run",
+        task_key=task_key,
+        tid=tid,
+        parent_pid=pid,
+        generation=generation,
+        parent_generation=parent_generation,
+    ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_kind", "thread_first_pid", "expected"),
+    [("first_post", 202, (1, 30)), ("first_post", 203, None), ("reply_post", 202, None)],
+)
+async def test_comment_parent_page_hint_resolves_first_post_only_by_thread_identity(
+    monkeypatch, parent_kind, thread_first_pid, expected
+):
+    parent = SimpleNamespace(rn=30)
+    scope = SimpleNamespace(parent_kind=parent_kind, fid=905818)
+    checkpoint = SimpleNamespace()
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def scalar(self, statement):
+            self.statements.append(statement)
+            return thread_first_pid if parent_kind == "first_post" else None
+
+    session = Session()
+
+    class SessionMaker:
+        def __call__(self):
+            return session
+
+    datastore = DataStore.__new__(DataStore)
+    datastore.async_sessionmaker = SessionMaker()
+
+    async def get_context(_session, **_kwargs):
+        return parent, scope, checkpoint
+
+    monkeypatch.setattr(datastore, "_failed_comment_scope_context", get_context)
+
+    hint = await datastore.get_research_comment_parent_page_hint(
+        "run", "post_comments:101:202:g6", 101, 202, 6, 4
+    )
+
+    assert hint == expected
+    if parent_kind == "first_post":
+        assert len(session.statements) == 1
+        compiled = str(session.statements[0].compile(dialect=postgresql.dialect()))
+        assert "research_thread.first_pid" in compiled
+        assert "research_thread.tid" in compiled
+        assert "research_thread.fid" in compiled
+    else:
+        assert len(session.statements) == 2
 
 
 @pytest.mark.asyncio

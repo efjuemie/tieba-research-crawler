@@ -83,6 +83,61 @@ def make_research_container(tb_client):
     return container
 
 
+def make_research_comment_page(
+    *, current_page: int, total_page: int, has_more: bool, total_count: int = 158
+) -> ResearchPage:
+    dto = make_comments_response(
+        [], current_page=current_page, total_page=total_page, has_more=has_more
+    )
+    dto.page.total_count = total_count
+    raw_page = SimpleNamespace(
+        current_page=current_page,
+        total_page=total_page,
+        total_count=total_count,
+        has_more=has_more,
+    )
+    return ResearchPage(
+        raw=SimpleNamespace(page=raw_page),
+        dto=dto,
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_comments",
+    )
+
+
+def make_research_posts_page(
+    posts,
+    *,
+    current_page: int,
+    total_page: int,
+    has_more: bool,
+    tid: int = 1,
+    fid: int = 10,
+    first_pid: int | None = 1,
+) -> ResearchPage:
+    dto = make_posts_response(
+        posts,
+        has_more=has_more,
+        current_page=current_page,
+        total_page=total_page,
+    )
+    dto.forum.fid = fid
+    raw = SimpleNamespace(
+        page=SimpleNamespace(
+            current_page=current_page,
+            total_page=total_page,
+            has_more=has_more,
+        ),
+        forum=SimpleNamespace(fid=fid),
+        thread=SimpleNamespace(fid=fid, tid=tid, pid=first_pid),
+    )
+    return ResearchPage(
+        raw=raw,
+        dto=dto,
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
+    )
+
+
 @pytest.mark.asyncio
 async def test_full_scan_posts_keeps_pending_after_unexpected_empty_page():
     """中间页异常为空时不能把一级回复扫描标成完成。"""
@@ -107,6 +162,215 @@ async def test_full_scan_posts_keeps_pending_after_unexpected_empty_page():
     await handler.handle(FullScanPostsTask(tid=1, backfill=True))
 
     datastore.remove_pending_thread_scan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_full_scan_posts_bounded_prefetches_nonempty_page_after_false_has_more():
+    first_post = make_post(pid=100, tid=1, fid=10, floor=2)
+    second_post = make_post(pid=101, tid=1, fid=10, floor=3)
+    first_page = make_research_posts_page(
+        [first_post],
+        current_page=1,
+        total_page=2,
+        has_more=False,
+        first_pid=153591092432,
+    )
+    second_page = make_research_posts_page(
+        [second_post],
+        current_page=2,
+        total_page=2,
+        has_more=False,
+        first_pid=154010138191,
+    )
+    datastore = SimpleNamespace(
+        record_research_checkpoint=AsyncMock(return_value=True),
+        remove_pending_thread_scan=AsyncMock(),
+    )
+    handler = FullScanPostsTaskHandler(
+        worker_id=0,
+        container=make_research_container(SimpleNamespace()),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler.get_posts = AsyncMock(
+        side_effect=[FetchedPage(first_page, 1), FetchedPage(second_page, 1)]
+    )
+    handler._persist_research_page = AsyncMock()
+    handler._prepare_research_page = AsyncMock()
+    handler._process_posts_on_page = AsyncMock()
+
+    await handler.handle(FullScanPostsTask(tid=1, fid=10, backfill=True))
+
+    assert [call.args[:2] for call in handler.get_posts.await_args_list] == [(1, 1), (1, 2)]
+    checkpoints = [call.kwargs for call in datastore.record_research_checkpoint.await_args_list]
+    assert checkpoints[0]["page_number"] == 1
+    assert checkpoints[0]["scope_status"] == "running"
+    assert checkpoints[0]["has_more"] is True
+    assert checkpoints[0]["next_page"] == 2
+    assert checkpoints[0]["continuation_json"]["validated_terminal_prefetch"] == {
+        "page": 2,
+        "original_has_more": False,
+        "total_pages": 2,
+    }
+    assert checkpoints[1]["page_number"] == 2
+    assert checkpoints[1]["scope_status"] == "completed"
+    assert checkpoints[1]["has_more"] is False
+    datastore.remove_pending_thread_scan.assert_awaited_once_with(1)
+
+
+@pytest.mark.asyncio
+async def test_scope_commit_keeps_bounded_prefetch_evidence(monkeypatch):
+    first_post = make_post(pid=100, tid=1, fid=10, floor=1)
+    response = make_research_posts_page(
+        [first_post], current_page=1, total_page=2, has_more=False
+    )
+    prefetch_evidence = {
+        "page": 2,
+        "original_has_more": False,
+        "total_pages": 2,
+    }
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def begin(self):
+            return self
+
+    class DataStore:
+        def __init__(self):
+            self.session = Session()
+            self.async_sessionmaker = lambda: self.session
+            self.checkpoints = []
+
+        async def get_research_task_scope_for_update(self, *_args):
+            return SimpleNamespace(generation=4, status="running")
+
+        async def get_research_first_post_pids(self, *_args, **_kwargs):
+            return {100}
+
+        async def save_items_in_session(self, *_args, **_kwargs):
+            return None
+
+        async def ensure_research_task_scope(self, **_kwargs):
+            return SimpleNamespace(
+                generation=2,
+                status="completed",
+                parent_generation=4,
+                parent_logical_task_key="thread_replies:1",
+            )
+
+        async def record_research_checkpoint(self, **values):
+            self.checkpoints.append(values)
+            return True
+
+        async def remove_pending_thread_scan_in_session(self, *_args):
+            return None
+
+    async def persist(_maker, _response, *, session, run_id=None):
+        assert session is datastore.session
+        assert run_id == "synthetic-run"
+
+    monkeypatch.setattr("src.research.persistence.persist_research_page", persist)
+    datastore = DataStore()
+    handler = FullScanPostsTaskHandler(
+        0,
+        make_research_container(SimpleNamespace()),
+        cast("Any", datastore),
+        QueueRouter(),
+    )
+    handler.ensure_users = AsyncMock()
+    handler._prepare_research_page = AsyncMock()
+    handler._enqueue_missing_web_targets_after_commit = AsyncMock()
+
+    committed, _children = await handler._commit_research_posts_page(
+        FullScanPostsTask(tid=1, run_id="synthetic-run", generation=4, fid=10, backfill=True),
+        response.dto,
+        response,
+        page_number=1,
+        cursor={"validated_terminal_prefetch": prefetch_evidence},
+        attempts=1,
+        effective_has_more=True,
+    )
+
+    assert committed is True
+    parent_checkpoint = next(
+        checkpoint for checkpoint in datastore.checkpoints if checkpoint["scope_type"] == "thread_replies"
+    )
+    assert parent_checkpoint["scope_status"] == "running"
+    assert parent_checkpoint["has_more"] is True
+    assert parent_checkpoint["next_page"] == 2
+    assert parent_checkpoint["continuation_json"]["validated_terminal_prefetch"] == prefetch_evidence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("next_page", "reason"),
+    [
+        (
+            make_research_posts_page(
+                [make_post(pid=101, tid=1, fid=10)],
+                current_page=2,
+                total_page=2,
+                has_more=False,
+                fid=11,
+            ),
+            "forum identity conflict",
+        ),
+        (
+            make_research_posts_page(
+                [make_post(pid=101, tid=1, fid=10)],
+                current_page=2,
+                total_page=2,
+                has_more=False,
+                tid=2,
+            ),
+            "thread identity conflict",
+        ),
+        (
+            make_research_posts_page(
+                [make_post(pid=101, tid=1, fid=10)],
+                current_page=2,
+                total_page=3,
+                has_more=False,
+            ),
+            "page total changed",
+        ),
+    ],
+)
+async def test_full_scan_posts_rejects_unverified_bounded_prefetch(next_page, reason):
+    first_page = make_research_posts_page(
+        [make_post(pid=100, tid=1, fid=10)],
+        current_page=1,
+        total_page=2,
+        has_more=False,
+    )
+    datastore = SimpleNamespace(
+        record_research_checkpoint=AsyncMock(return_value=True),
+        set_research_run_status_if=AsyncMock(),
+    )
+    handler = FullScanPostsTaskHandler(
+        worker_id=0,
+        container=make_research_container(SimpleNamespace()),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler.get_posts = AsyncMock(
+        side_effect=[FetchedPage(first_page, 1), FetchedPage(next_page, 1)]
+    )
+    handler._persist_research_page = AsyncMock()
+    handler._prepare_research_page = AsyncMock()
+    handler._process_posts_on_page = AsyncMock()
+
+    await handler.handle(FullScanPostsTask(tid=1, fid=10, backfill=True))
+
+    assert reason
+    assert datastore.record_research_checkpoint.await_args.kwargs["status"] == "failed"
+    assert datastore.record_research_checkpoint.await_args.kwargs["scope_status"] == "incomplete"
+    assert datastore.record_research_checkpoint.await_args.kwargs["error_type"] == "PageIntegrityError"
 
 
 @pytest.mark.asyncio
@@ -162,6 +426,314 @@ async def test_full_scan_comments_keeps_pending_after_unexpected_empty_page():
     await handler.handle(FullScanCommentsTask(tid=1, pid=100, backfill=True))
 
     datastore.remove_pending_comment_scan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_research_comment_empty_page_accepts_confirmed_deleted_tail_metadata():
+    pages = {
+        5: make_research_comment_page(current_page=5, total_page=6, has_more=True),
+        6: make_research_comment_page(current_page=6, total_page=6, has_more=False),
+    }
+    tb_client = SimpleNamespace(
+        get_comments_research=AsyncMock(side_effect=lambda _tid, _pid, pn: pages[pn])
+    )
+    datastore = SimpleNamespace(resume_research_run_if_status=AsyncMock())
+    handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+
+    middle = await handler.get_comments(1, 100, 5)
+    tail = await handler.get_comments(1, 100, 6)
+
+    assert middle.response.dto.page.current_page == 5
+    assert middle.response.dto.page.has_more is True
+    assert tail.response.dto.page.current_page == 6
+    assert tail.response.dto.page.has_more is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "page",
+    [
+        make_research_comment_page(current_page=0, total_page=0, has_more=False),
+        make_research_comment_page(current_page=5, total_page=0, has_more=True),
+        make_research_comment_page(current_page=5, total_page=6, has_more=False),
+        make_research_comment_page(current_page=5, total_page=5, has_more=True),
+    ],
+    ids=["zero-page", "missing-total-pages", "terminal-before-reported-end", "more-beyond-reported-end"],
+)
+async def test_research_comment_empty_page_rejects_untrusted_or_inconsistent_metadata(page):
+    tb_client = SimpleNamespace(get_comments_research=AsyncMock(return_value=page))
+    datastore = SimpleNamespace(resume_research_run_if_status=AsyncMock())
+    handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+
+    with pytest.raises(PageIntegrityError):
+        await handler.get_comments(1, 100, 5)
+
+
+@pytest.mark.asyncio
+async def test_full_scan_comments_continues_from_empty_intermediate_page_to_confirmed_tail():
+    pages = {
+        5: make_research_comment_page(current_page=5, total_page=6, has_more=True),
+        6: make_research_comment_page(current_page=6, total_page=6, has_more=False),
+    }
+    tb_client = SimpleNamespace(
+        get_comments_research=AsyncMock(side_effect=lambda _tid, _pid, pn: pages[pn])
+    )
+    datastore = SimpleNamespace(
+        resume_research_run_if_status=AsyncMock(),
+        record_research_checkpoint=AsyncMock(return_value=True),
+        set_research_run_status_if=AsyncMock(),
+        remove_pending_comment_scan=AsyncMock(),
+    )
+    handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler._persist_research_page = AsyncMock()
+    handler._process_comments_on_page = AsyncMock()
+
+    await handler.handle(
+        FullScanCommentsTask(
+            tid=1,
+            pid=100,
+            start_page=5,
+            run_id="synthetic-run",
+            fid=10,
+        )
+    )
+
+    assert tb_client.get_comments_research.await_args_list == [call(1, 100, 5), call(1, 100, 6)]
+    page_checkpoints = datastore.record_research_checkpoint.await_args_list
+    assert [
+        (call.kwargs["page_number"], call.kwargs["scope_status"], call.kwargs["has_more"])
+        for call in page_checkpoints
+    ] == [
+        (5, "running", True),
+        (6, "completed", False),
+    ]
+    assert page_checkpoints[0].kwargs["next_page"] == 6
+    assert page_checkpoints[1].kwargs["page_item_count"] == 0
+    assert page_checkpoints[1].kwargs["continuation_json"]["empty_tail_reason"] == (
+        "server_confirmed_empty_terminal_page"
+    )
+    datastore.remove_pending_comment_scan.assert_awaited_once_with(
+        1, 100
+    )
+
+
+@pytest.mark.asyncio
+async def test_scope_managed_comment_scan_continues_after_empty_intermediate_page():
+    pages = {
+        5: make_research_comment_page(current_page=5, total_page=6, has_more=True),
+        6: make_research_comment_page(current_page=6, total_page=6, has_more=False),
+    }
+    tb_client = SimpleNamespace(
+        get_comments_research=AsyncMock(side_effect=lambda _tid, _pid, pn: pages[pn])
+    )
+    datastore = SimpleNamespace(
+        get_research_task_scope_state=AsyncMock(
+            side_effect=[(6, "running", 4), (4, "completed", None)]
+        ),
+        claim_research_comments_scope=AsyncMock(return_value=True),
+        resume_research_run_if_status=AsyncMock(),
+        remove_pending_comment_scan=AsyncMock(),
+    )
+    handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler._commit_research_comments_page = AsyncMock(return_value=True)
+
+    await handler.handle(
+        FullScanCommentsTask(
+            tid=1,
+            pid=100,
+            start_page=5,
+            run_id="synthetic-run",
+            generation=6,
+            parent_generation=4,
+            fid=10,
+        )
+    )
+
+    assert tb_client.get_comments_research.await_args_list == [call(1, 100, 5), call(1, 100, 6)]
+    commits = handler._commit_research_comments_page.await_args_list
+    assert [commit.kwargs["page_number"] for commit in commits] == [5, 6]
+    assert commits[0].kwargs["cursor"]["empty_comment_page_total_limit"] == 6
+    assert commits[0].kwargs["cursor"]["empty_comment_page_count"] == 1
+    assert commits[1].kwargs["cursor"]["empty_tail_reason"] == (
+        "server_confirmed_empty_terminal_page"
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_comment_page_bound_survives_resume_when_total_pages_grow():
+    page = make_research_comment_page(current_page=6, total_page=7, has_more=True)
+    tb_client = SimpleNamespace(get_comments_research=AsyncMock(return_value=page))
+    datastore = SimpleNamespace(
+        get_research_resume_state=AsyncMock(
+            return_value=(
+                6,
+                "running",
+                {
+                    "empty_comment_page_total_limit": 6,
+                    "empty_comment_page_count": 1,
+                    "recent_page_fingerprints": [[]],
+                },
+            )
+        ),
+        resume_research_run_if_status=AsyncMock(),
+        record_research_checkpoint=AsyncMock(return_value=True),
+        set_research_run_status_if=AsyncMock(),
+        remove_pending_comment_scan=AsyncMock(),
+    )
+    handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler._persist_research_page = AsyncMock()
+
+    await handler.handle(
+        FullScanCommentsTask(tid=1, pid=100, run_id="synthetic-run", fid=10)
+    )
+
+    tb_client.get_comments_research.assert_awaited_once_with(1, 100, 6)
+    failure = datastore.record_research_checkpoint.await_args.kwargs
+    assert failure["page_number"] == 6
+    assert failure["scope_status"] == "incomplete"
+    assert failure["error_type"] == "PageIntegrityError"
+    datastore.remove_pending_comment_scan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_comment_scan_stops_after_ten_consecutive_empty_pages():
+    tb_client = SimpleNamespace(
+        get_comments_research=AsyncMock(
+            side_effect=lambda _tid, _pid, pn: make_research_comment_page(
+                current_page=pn, total_page=12, has_more=pn < 12
+            )
+        )
+    )
+    datastore = SimpleNamespace(
+        resume_research_run_if_status=AsyncMock(),
+        record_research_checkpoint=AsyncMock(return_value=True),
+        set_research_run_status_if=AsyncMock(),
+        remove_pending_comment_scan=AsyncMock(),
+    )
+    handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler._persist_research_page = AsyncMock()
+
+    await handler.handle(
+        FullScanCommentsTask(tid=1, pid=100, start_page=2, run_id="synthetic-run", fid=10)
+    )
+
+    assert [call.args[2] for call in tb_client.get_comments_research.await_args_list] == list(range(2, 13))
+    assert datastore.record_research_checkpoint.await_args.kwargs["page_number"] == 12
+    assert datastore.record_research_checkpoint.await_args.kwargs["scope_status"] == "incomplete"
+    datastore.remove_pending_comment_scan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scope_managed_empty_comment_commit_records_intermediate_then_terminal_page(monkeypatch):
+    from src.research import persistence
+
+    async def persist_research_page(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(persistence, "persist_research_page", persist_research_page)
+    parent_scope = SimpleNamespace(generation=4)
+    child_scope = SimpleNamespace(generation=6, parent_generation=4)
+
+    class Session:
+        def begin(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class SessionMaker:
+        def __call__(self):
+            return Session()
+
+    async def get_scope(_session, _run_id, logical_key):
+        return parent_scope if logical_key == "thread_replies:1" else child_scope
+
+    datastore = SimpleNamespace(
+        async_sessionmaker=SessionMaker(),
+        get_research_task_scope_for_update=AsyncMock(side_effect=get_scope),
+        save_items_in_session=AsyncMock(),
+        record_research_checkpoint=AsyncMock(return_value=True),
+        remove_pending_comment_scan_in_session=AsyncMock(),
+    )
+    handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(SimpleNamespace()),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler.ensure_users = AsyncMock()
+    handler._prepare_research_page = AsyncMock()
+    handler._enqueue_missing_web_targets_after_commit = AsyncMock()
+    task = FullScanCommentsTask(
+        tid=1,
+        pid=100,
+        run_id="synthetic-run",
+        generation=6,
+        parent_generation=4,
+        parent_kind="reply_post",
+        fid=10,
+    )
+
+    for page_number, has_more in ((5, True), (6, False)):
+        response = make_research_comment_page(
+            current_page=page_number, total_page=6, has_more=has_more
+        )
+        assert await handler._commit_research_comments_page(
+            task,
+            response.dto,
+            response,
+            page_number=page_number,
+            cursor={
+                "empty_comment_page_total_limit": 6,
+                "empty_comment_page_count": 1,
+            }
+            if has_more
+            else {"empty_tail_reason": "server_confirmed_empty_terminal_page"},
+            attempts=1,
+        )
+
+    checkpoints = datastore.record_research_checkpoint.await_args_list
+    assert [item.kwargs["scope_status"] for item in checkpoints] == ["running", "completed"]
+    assert [item.kwargs["has_more"] for item in checkpoints] == [True, False]
+    assert [item.kwargs["next_page"] for item in checkpoints] == [6, None]
+    assert checkpoints[0].kwargs["continuation_json"]["empty_comment_page_total_limit"] == 6
+    assert checkpoints[1].kwargs["continuation_json"]["empty_tail_reason"] == (
+        "server_confirmed_empty_terminal_page"
+    )
+    datastore.remove_pending_comment_scan_in_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio

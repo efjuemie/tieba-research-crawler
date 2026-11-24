@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from sqlalchemy import func, select
 
+from src.core.models import ResearchTaskScope
 from src.research.models import (
     ResearchComment,
     ResearchPost,
@@ -28,7 +29,9 @@ from .identity import Target
 from .tasks import (
     _GROWTH_FIELDS,
     WebEnrichmentTargetPlan,
+    _resolved_web_task_status,
     _unknown_canonical_value,
+    _unknown_requested_fields,
     enqueue_web_enrichment_tasks,
     lease_web_enrichment_tasks,
     plan_web_enrichment_targets,
@@ -138,6 +141,8 @@ def _target_from_plan(plan: WebEnrichmentTargetPlan) -> Target:
         author_user_id=plan.author_user_id,
         author_portrait=plan.author_portrait,
         requested_fields=tuple(plan.requested_fields),
+        scope_generation=getattr(plan, "scope_generation", None),
+        parent_scope_generation=getattr(plan, "parent_scope_generation", None),
     )
 
 
@@ -153,6 +158,8 @@ def _target_from_lease(lease: Any) -> Target:
         author_user_id=lease.author_user_id,
         author_portrait=lease.author_portrait,
         requested_fields=tuple(lease.requested_fields),
+        scope_generation=getattr(lease, "scope_generation", None),
+        parent_scope_generation=getattr(lease, "parent_scope_generation", None),
     )
 
 
@@ -282,7 +289,12 @@ async def run_field_backfill(
                 continue
             remaining_keys.remove(lease.task_key)
             preflight = await _preflight_web_task(sessions, lease)
-            if preflight.status == "completed":
+            if preflight.status in {
+                "completed",
+                "completed_with_absent_fields",
+                "unsupported_by_source",
+                "not_applicable",
+            }:
                 completed += 1
                 continue
             if preflight.status != "ready":
@@ -302,7 +314,7 @@ async def run_field_backfill(
                     candidates,
                     getattr(result, "field_outcomes", None),
                 )
-                outcomes.update(_already_satisfied_outcomes(preflight.satisfied_fields))
+                outcomes.update(_preflight_satisfied_outcomes(preflight))
                 reconciled = await _complete_task(
                     sessions,
                     lease.task_key,
@@ -313,7 +325,12 @@ async def run_field_backfill(
                     identity_verified=getattr(result, "identity_verified", None),
                     identity_methods=getattr(result, "identity_methods", ()),
                 )
-                if getattr(reconciled, "status", None) == "completed":
+                if getattr(reconciled, "status", None) in {
+                    "completed",
+                    "completed_with_absent_fields",
+                    "unsupported_by_source",
+                    "not_applicable",
+                }:
                     completed += 1
                 else:
                     partial += 1
@@ -327,7 +344,7 @@ async def run_field_backfill(
 
             task_status = _task_failure_status(status, reason)
             outcomes = _failure_outcomes(preflight.missing_fields, status, reason)
-            outcomes.update(_already_satisfied_outcomes(preflight.satisfied_fields))
+            outcomes.update(_preflight_satisfied_outcomes(preflight))
             await _fail_task(
                 sessions,
                 lease.task_key,
@@ -454,7 +471,7 @@ async def _process_durable_web_lease(
             candidates,
             getattr(result, "field_outcomes", None),
         )
-        outcomes.update(_already_satisfied_outcomes(preflight.satisfied_fields))
+        outcomes.update(_preflight_satisfied_outcomes(preflight))
         reconciled = await _complete_task(
             sessions,
             lease.task_key,
@@ -476,7 +493,7 @@ async def _process_durable_web_lease(
         reason_code=_safe_reason(reason or status),
         field_outcomes={
             **_failure_outcomes(preflight.missing_fields, status, reason),
-            **_already_satisfied_outcomes(preflight.satisfied_fields),
+            **_preflight_satisfied_outcomes(preflight),
         },
         diagnostics=diagnostics,
     )
@@ -516,6 +533,16 @@ async def _count_unresolved_web_tasks(sessions: Any, run_ids: Sequence[str]) -> 
                 )
             )
         ).all()
+        scopes = (
+            await session.scalars(
+                select(ResearchTaskScope).where(
+                    ResearchTaskScope.run_id.in_(tuple(run_ids))
+                )
+            )
+        ).all()
+        scopes_by_key = {
+            (scope.run_id, scope.logical_task_key): scope for scope in scopes
+        }
         models = {
             "thread": (ResearchThread, ResearchThread.tid),
             "post": (ResearchPost, ResearchPost.pid),
@@ -523,11 +550,7 @@ async def _count_unresolved_web_tasks(sessions: Any, run_ids: Sequence[str]) -> 
         }
         rows_by_type: dict[str, dict[int, Any]] = {}
         for target_type, (model, id_column) in models.items():
-            target_ids = {
-                task.target_id
-                for task in tasks
-                if task.target_type == target_type and task.status == "partially_completed"
-            }
+            target_ids = {task.target_id for task in tasks if task.target_type == target_type}
             if not target_ids:
                 rows_by_type[target_type] = {}
                 continue
@@ -539,11 +562,26 @@ async def _count_unresolved_web_tasks(sessions: Any, run_ids: Sequence[str]) -> 
             }
 
     unresolved = 0
+    tasks_by_identity: dict[tuple[Any, ...], list[Any]] = {}
     for task in tasks:
-        if task.status == "completed":
+        tasks_by_identity.setdefault(_web_task_identity_key(task), []).append(task)
+    for task in tasks:
+        if task.status in {
+            "completed",
+            "completed_with_absent_fields",
+            "unsupported_by_source",
+            "not_applicable",
+        }:
             continue
         if task.status == "partially_completed" and _partial_task_fields_satisfied(
             task, rows_by_type.get(task.target_type, {}).get(task.target_id)
+        ):
+            continue
+        if _stale_web_task_is_superseded(
+            task,
+            rows_by_type.get(task.target_type, {}).get(task.target_id),
+            tasks_by_identity.get(_web_task_identity_key(task), ()),
+            scopes_by_key,
         ):
             continue
         unresolved += 1
@@ -579,24 +617,91 @@ def _partial_task_fields_satisfied(task: Any, row: Any | None) -> bool:
     if not requested:
         return False
     field_statuses = dict(task.field_statuses_json or {})
-    if any(
-        isinstance(field_statuses.get(name), dict)
-        and field_statuses[name].get("status") == "conflict"
-        for name in requested
-    ):
+    if _resolved_web_task_status(
+        requested, field_statuses, identity_verified=task.identity_verified
+    ) is None:
         return False
     missing_reasons = dict(row.missing_reasons_json or {})
-    requested_growth = set(requested) & _GROWTH_FIELDS
-    if requested_growth and not any(
-        not _unknown_canonical_value(getattr(row, name, None), name, missing_reasons)
-        for name in _GROWTH_FIELDS
-    ):
-        return False
     return all(
         not _unknown_canonical_value(getattr(row, name, None), name, missing_reasons)
         for name in requested
-        if name not in _GROWTH_FIELDS
+        if isinstance(field_statuses.get(name), dict)
+        and field_statuses[name].get("status") in {"applied", "confirmed"}
     )
+
+
+def _web_task_identity_key(task: Any) -> tuple[Any, ...]:
+    return (
+        task.run_id,
+        task.target_type,
+        task.target_id,
+        task.tid,
+        task.fid,
+        task.author_user_id,
+        task.author_portrait,
+        task.parent_post_pid,
+    )
+
+
+def _stale_web_task_is_superseded(
+    task: Any,
+    row: Any | None,
+    candidates: Sequence[Any],
+    scopes_by_key: dict[tuple[str, str], Any],
+) -> bool:
+    expected_id = {
+        "thread": getattr(row, "tid", None),
+        "post": getattr(row, "pid", None),
+        "comment": getattr(row, "cid", None),
+    }.get(task.target_type)
+    if (
+        row is None
+        or expected_id != task.target_id
+        or row.tid != task.tid
+        or row.fid != task.fid
+        or row.author_user_id != task.author_user_id
+        or getattr(row, "author_portrait", None) != task.author_portrait
+        or (task.target_type == "comment" and row.parent_post_pid != task.parent_post_pid)
+    ):
+        return False
+    requested = tuple(task.requested_fields_json)
+    if not requested:
+        return False
+    pair_growth = _GROWTH_FIELDS.issubset(set(requested))
+    missing = set(_unknown_requested_fields(row, requested, pair_growth_fields=pair_growth))
+    if not missing:
+        return True
+    current_snapshot = _utc_datetime(row.observed_at) == _utc_datetime(task.target_observed_at)
+    current_scope = _web_task_matches_current_scope(task, scopes_by_key)
+    if current_snapshot and current_scope:
+        return False
+    return any(
+        _web_task_identity_key(candidate) == _web_task_identity_key(task)
+        and _utc_datetime(candidate.target_observed_at) == _utc_datetime(row.observed_at)
+        and _web_task_matches_current_scope(candidate, scopes_by_key)
+        and missing.issubset(set(candidate.requested_fields_json))
+        for candidate in candidates
+    )
+
+
+def _web_task_matches_current_scope(
+    task: Any, scopes_by_key: dict[tuple[str, str], Any]
+) -> bool:
+    thread_scope = scopes_by_key.get((task.run_id, f"thread_replies:{task.tid}"))
+    if thread_scope is None or (task.fid is not None and thread_scope.fid != task.fid):
+        return False
+    if task.target_type == "comment":
+        comment_scope = scopes_by_key.get(
+            (task.run_id, f"post_comments:{task.tid}:{task.parent_post_pid}")
+        )
+        return bool(
+            comment_scope is not None
+            and thread_scope.generation == task.parent_scope_generation
+            and comment_scope.generation == task.scope_generation
+            and comment_scope.parent_generation == thread_scope.generation
+            and (task.fid is None or comment_scope.fid == task.fid)
+        )
+    return thread_scope.generation == task.scope_generation
 
 
 async def _next_retry_delay(
@@ -746,7 +851,12 @@ async def drain_pending_web_enrichment(
             stopped_run_id = lease.run_id
             stopped_target_type = lease.target_type
 
-        if status == "completed":
+        if status in {
+            "completed",
+            "completed_with_absent_fields",
+            "unsupported_by_source",
+            "not_applicable",
+        }:
             completed += 1
         elif status == "partially_completed":
             partial += 1
@@ -913,7 +1023,12 @@ async def run_live_web_fallback_worker(
                 blocked_count += 1
                 stopped_run_id = lease.run_id
                 stopped_target_type = lease.target_type
-            if status == "completed":
+            if status in {
+                "completed",
+                "completed_with_absent_fields",
+                "unsupported_by_source",
+                "not_applicable",
+            }:
                 completed += 1
             elif status == "partially_completed":
                 partial += 1
@@ -1454,6 +1569,16 @@ def _already_satisfied_outcomes(fields):
     return {
         field_name: {"status": "confirmed", "reason": "already_satisfied"}
         for field_name in fields
+    }
+
+
+def _preflight_satisfied_outcomes(preflight):
+    preserved = dict(preflight.preserved_outcomes or {})
+    return {
+        **_already_satisfied_outcomes(
+            tuple(name for name in preflight.satisfied_fields if name not in preserved)
+        ),
+        **preserved,
     }
 
 

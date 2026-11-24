@@ -353,6 +353,154 @@ async def _lease_comment(maker, cid, fields):
     return summary, leases[0]
 
 
+def test_stale_web_task_is_ignored_only_after_current_evidence_replaces_it():
+    old_observed = datetime(2026, 1, 1, tzinfo=UTC)
+    current_observed = datetime(2026, 1, 2, tzinfo=UTC)
+    old_task = SimpleNamespace(
+        run_id="run",
+        target_type="post",
+        target_id=2101,
+        tid=1001,
+        fid=7654321,
+        author_user_id=501,
+        author_portrait="post-portrait",
+        parent_post_pid=None,
+        scope_generation=0,
+        parent_scope_generation=None,
+        target_observed_at=old_observed,
+        requested_fields_json=["ip_location_text"],
+    )
+    row = SimpleNamespace(
+        pid=2101,
+        cid=None,
+        tid=1001,
+        fid=7654321,
+        author_user_id=501,
+        author_portrait="post-portrait",
+        parent_post_pid=None,
+        observed_at=current_observed,
+        ip_location_text=None,
+        missing_reasons_json={},
+    )
+    scopes = {
+        ("run", "thread_replies:1001"): SimpleNamespace(generation=1, fid=7654321)
+    }
+    replacement = SimpleNamespace(
+        **{
+            **vars(old_task),
+            "scope_generation": 1,
+            "target_observed_at": current_observed,
+            "requested_fields_json": ["ip_location_text", "author_nickname"],
+        }
+    )
+
+    assert service._stale_web_task_is_superseded(old_task, row, [old_task, replacement], scopes)
+
+
+def test_stale_web_task_stays_unresolved_without_covered_current_work():
+    old_observed = datetime(2026, 1, 1, tzinfo=UTC)
+    current_observed = datetime(2026, 1, 2, tzinfo=UTC)
+    task = SimpleNamespace(
+        run_id="run",
+        target_type="post",
+        target_id=2101,
+        tid=1001,
+        fid=7654321,
+        author_user_id=501,
+        author_portrait="post-portrait",
+        parent_post_pid=None,
+        scope_generation=0,
+        parent_scope_generation=None,
+        target_observed_at=old_observed,
+        requested_fields_json=["ip_location_text"],
+    )
+    row = SimpleNamespace(
+        pid=2101,
+        cid=None,
+        tid=1001,
+        fid=7654321,
+        author_user_id=501,
+        author_portrait="post-portrait",
+        parent_post_pid=None,
+        observed_at=current_observed,
+        ip_location_text=None,
+        missing_reasons_json={},
+    )
+    scopes = {
+        ("run", "thread_replies:1001"): SimpleNamespace(generation=1, fid=7654321)
+    }
+    subset = SimpleNamespace(
+        **{
+            **vars(task),
+            "scope_generation": 1,
+            "target_observed_at": current_observed,
+            "requested_fields_json": ["author_nickname"],
+        }
+    )
+
+    assert not service._stale_web_task_is_superseded(task, row, [subset], scopes)
+    assert not service._stale_web_task_is_superseded(task, row, [], scopes)
+
+    row.ip_location_text = "Vancouver"
+    assert service._stale_web_task_is_superseded(task, row, [], scopes)
+
+    row.ip_location_text = None
+    row.author_user_id = 999
+    assert not service._stale_web_task_is_superseded(task, row, [subset], scopes)
+
+
+def test_same_snapshot_scope_refresh_requires_current_generation_replacement():
+    observed = datetime(2026, 1, 2, tzinfo=UTC)
+    task = SimpleNamespace(
+        run_id="run",
+        target_type="post",
+        target_id=2101,
+        tid=1001,
+        fid=7654321,
+        author_user_id=501,
+        author_portrait="post-portrait",
+        parent_post_pid=None,
+        scope_generation=0,
+        parent_scope_generation=None,
+        target_observed_at=observed,
+        requested_fields_json=["ip_location_text"],
+    )
+    row = SimpleNamespace(
+        pid=2101,
+        cid=None,
+        tid=1001,
+        fid=7654321,
+        author_user_id=501,
+        author_portrait="post-portrait",
+        parent_post_pid=None,
+        observed_at=observed,
+        ip_location_text=None,
+        missing_reasons_json={},
+    )
+    scopes = {
+        ("run", "thread_replies:1001"): SimpleNamespace(generation=1, fid=7654321)
+    }
+    replacement = SimpleNamespace(
+        **{
+            **vars(task),
+            "scope_generation": 1,
+            "requested_fields_json": ["ip_location_text", "author_nickname"],
+        }
+    )
+
+    assert not service._stale_web_task_is_superseded(task, row, [], scopes)
+    assert service._stale_web_task_is_superseded(task, row, [replacement], scopes)
+
+    replacement.requested_fields_json = ["author_nickname"]
+    assert not service._stale_web_task_is_superseded(task, row, [replacement], scopes)
+
+    row.ip_location_text = "Vancouver"
+    current_scopes = {
+        ("run", "thread_replies:1001"): SimpleNamespace(generation=0, fid=7654321)
+    }
+    assert service._stale_web_task_is_superseded(task, row, [], current_scopes)
+
+
 @pytest.mark.asyncio
 async def test_verified_field_applies_by_exact_post_and_source_is_sanitized(reconcile_db):
     engine, maker = reconcile_db
@@ -383,11 +531,11 @@ async def test_verified_field_applies_by_exact_post_and_source_is_sanitized(reco
 @pytest.mark.asyncio
 async def test_durable_preflight_skips_task_filled_by_api_before_browser(reconcile_db):
     engine, maker = reconcile_db
-    _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
     with Session(engine) as session, session.begin():
         post = session.get(ResearchPost, 2101)
         post.author_nickname = "API refreshed title"
         post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
 
     class Provider:
         async def collect(self, _target):
@@ -410,16 +558,16 @@ async def test_durable_preflight_skips_task_filled_by_api_before_browser(reconci
 @pytest.mark.asyncio
 async def test_durable_preflight_collects_only_missing_fields_after_api_refresh(reconcile_db):
     engine, maker = reconcile_db
-    _summary, lease = await _lease_post(
-        maker,
-        2101,
-        ["global_growth_level", "global_growth_icon_url", "ip_location_text"],
-    )
     with Session(engine) as session, session.begin():
         post = session.get(ResearchPost, 2101)
         post.global_growth_level = 12
         post.global_growth_icon_url = "https://growth.example.test/icon.png"
         post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    _summary, lease = await _lease_post(
+        maker,
+        2101,
+        ["global_growth_level", "global_growth_icon_url", "ip_location_text"],
+    )
     targets = []
 
     class Provider:
@@ -459,11 +607,11 @@ async def test_durable_preflight_collects_only_missing_fields_after_api_refresh(
 @pytest.mark.asyncio
 async def test_single_growth_field_preflight_keeps_legacy_request_scope(reconcile_db):
     engine, maker = reconcile_db
-    _summary, lease = await _lease_post(maker, 2101, ["global_growth_level"])
     with Session(engine) as session, session.begin():
         post = session.get(ResearchPost, 2101)
         post.global_growth_level = 12
         post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    _summary, lease = await _lease_post(maker, 2101, ["global_growth_level"])
 
     class Provider:
         async def collect(self, _target):
@@ -481,16 +629,16 @@ async def test_single_growth_field_preflight_keeps_legacy_request_scope(reconcil
 @pytest.mark.asyncio
 async def test_preflight_satisfied_fields_are_rechecked_at_merge(reconcile_db):
     engine, maker = reconcile_db
-    _summary, lease = await _lease_post(
-        maker,
-        2101,
-        ["global_growth_level", "global_growth_icon_url", "ip_location_text"],
-    )
     with Session(engine) as session, session.begin():
         post = session.get(ResearchPost, 2101)
         post.global_growth_level = 12
         post.global_growth_icon_url = "https://growth.example.test/icon.png"
         post.observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    _summary, lease = await _lease_post(
+        maker,
+        2101,
+        ["global_growth_level", "global_growth_icon_url", "ip_location_text"],
+    )
 
     class Provider:
         async def collect(self, _target):
@@ -508,13 +656,13 @@ async def test_preflight_satisfied_fields_are_rechecked_at_merge(reconcile_db):
 
     status, _result = await service._process_durable_web_lease(maker, Provider(), lease)
 
-    assert status == "partially_completed"
+    assert status == "failed_final"
     with Session(engine) as session:
         post = session.get(ResearchPost, 2101)
         task = session.get(ResearchWebEnrichmentTask, lease.task_key)
-        assert post.ip_location_text == "Vancouver"
-        assert task.status == "partially_completed"
-        assert task.field_statuses_json["global_growth_level"]["status"] == "not_tested"
+        assert post.ip_location_text is None
+        assert task.status == "failed_final"
+        assert task.last_error == "target_observed_at_changed"
 
 
 @pytest.mark.asyncio
@@ -721,7 +869,7 @@ async def test_stop_during_preflight_does_not_start_web_visit(reconcile_db, monk
 
 
 @pytest.mark.asyncio
-async def test_api_refresh_during_web_visit_is_not_overwritten(reconcile_db):
+async def test_api_refresh_during_web_visit_rejects_stale_web_observation(reconcile_db):
     engine, maker = reconcile_db
     _summary, lease = await _lease_post(maker, 2101, ["author_nickname"])
 
@@ -740,13 +888,13 @@ async def test_api_refresh_during_web_visit_is_not_overwritten(reconcile_db):
 
     status, _result = await service._process_durable_web_lease(maker, Provider(), lease)
 
-    assert status == "partially_completed"
+    assert status == "failed_final"
     with Session(engine) as session:
         post = session.get(ResearchPost, 2101)
         task = session.get(ResearchWebEnrichmentTask, lease.task_key)
         assert post.author_nickname == "API arrived during visit"
-        assert task.status == "partially_completed"
-        assert task.field_statuses_json["author_nickname"]["status"] == "conflict"
+        assert task.status == "failed_final"
+        assert task.last_error == "target_observed_at_changed"
 
 
 @pytest.mark.asyncio
@@ -1374,6 +1522,105 @@ async def test_growth_icon_satisfies_pair_without_filling_unknown_numeric_level(
             "status": "absent_on_page",
             "reason": "global_growth_level_zero_is_unknown",
         }
+
+
+@pytest.mark.asyncio
+async def test_absent_field_evidence_carries_to_same_snapshot_superset_task(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, first_lease = await _lease_post(maker, 2101, ["ip_location_text"])
+    first_result = await complete_web_enrichment_task(
+        maker,
+        first_lease.task_key,
+        first_lease.lease_token,
+        [],
+        field_outcomes={
+            "ip_location_text": {
+                "status": "absent_on_page",
+                "reason": "ip_location_not_present",
+            }
+        },
+        identity_verified=True,
+    )
+    assert first_result.status == "completed_with_absent_fields"
+
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        first_lease.run_id,
+        ["ip_location_text", "author_nickname"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+    assert summary.created_count == 1
+    assert summary.task_keys[0] != first_lease.task_key
+
+    new_lease = (
+        await lease_web_enrichment_tasks(
+            maker,
+            first_lease.run_id,
+            "superset-worker",
+            task_keys=summary.task_keys,
+        )
+    )[0]
+    preflight = await preflight_web_enrichment_task(
+        maker, new_lease.task_key, new_lease.lease_token
+    )
+
+    assert preflight.status == "ready"
+    assert preflight.missing_fields == ("author_nickname",)
+    assert preflight.preserved_outcomes == {
+        "ip_location_text": {
+            "status": "absent_on_page",
+            "reason": "ip_location_not_present",
+        }
+    }
+    with Session(engine) as session:
+        new_task = session.get(ResearchWebEnrichmentTask, new_lease.task_key)
+        assert new_task.identity_verified is True
+        assert new_task.field_statuses_json["ip_location_text"] == {
+            "status": "absent_on_page",
+            "reason": "ip_location_not_present",
+        }
+
+
+@pytest.mark.asyncio
+async def test_applied_field_is_not_inherited_when_canonical_value_is_missing(reconcile_db):
+    engine, maker = reconcile_db
+    _summary, first_lease = await _lease_post(maker, 2101, ["author_nickname"])
+    first_result = await complete_web_enrichment_task(
+        maker,
+        first_lease.task_key,
+        first_lease.lease_token,
+        [_candidate(first_lease, "author_nickname", "Verified title")],
+    )
+    assert first_result.status == "completed"
+    with Session(engine) as session, session.begin():
+        session.get(ResearchPost, 2101).author_nickname = None
+
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        first_lease.run_id,
+        ["author_nickname", "ip_location_text"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+    assert summary.created_count == 1
+    lease = (
+        await lease_web_enrichment_tasks(
+            maker,
+            first_lease.run_id,
+            "superset-worker",
+            task_keys=summary.task_keys,
+        )
+    )[0]
+    preflight = await preflight_web_enrichment_task(maker, lease.task_key, lease.lease_token)
+
+    assert preflight.status == "ready"
+    assert set(preflight.missing_fields) == {"author_nickname", "ip_location_text"}
+    assert preflight.preserved_outcomes == {}
 
 
 @pytest.mark.asyncio

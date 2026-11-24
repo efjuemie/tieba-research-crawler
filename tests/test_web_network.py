@@ -209,6 +209,40 @@ def test_verified_parent_snapshot_reuses_original_request_for_sibling_cid():
     assert candidate.identity.context_id == context.context_id
 
 
+def test_verified_parent_snapshot_keeps_identity_when_growth_is_missing_for_exact_cid():
+    anchor = _target(requested_fields=("ip_location_text",))
+    sibling_cid = str(int(CID) + 1)
+    sibling_author = str(int(AUTHOR_ID) + 1)
+    sibling = _target(
+        target_id=sibling_cid,
+        cid=sibling_cid,
+        author_user_id=sibling_author,
+        requested_fields=("global_growth_level",),
+    )
+    payload = _payload()
+    sibling_item = deepcopy(payload["data"]["post_list"][0])
+    sibling_item["id"] = int(sibling_cid)
+    sibling_item["author_id"] = int(sibling_author)
+    sibling_item["author"]["id"] = int(sibling_author)
+    sibling_item["author"].pop("user_growth")
+    payload["data"]["post_list"].append(sibling_item)
+    context = _context(anchor)
+
+    snapshot = verify_parent_snapshot(anchor, json.dumps(payload, ensure_ascii=False), context)
+    assert snapshot is not None
+
+    result = extract_from_parent_snapshot(sibling, snapshot)
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.candidates == ()
+    assert result.identity_evidence.cid == sibling_cid
+    assert result.field_outcomes["global_growth_level"] == {
+        "status": "not_tested",
+        "reason": "not_observed_in_response",
+    }
+
+
 def test_verified_parent_snapshot_rejects_other_parent_and_duplicate_target():
     anchor = _target(requested_fields=("ip_location_text",))
     payload = _payload()

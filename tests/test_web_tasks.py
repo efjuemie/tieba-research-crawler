@@ -18,12 +18,59 @@ from src.research.models import (
 )
 from src.research.web_fallback.reconcile import fail_web_enrichment_task
 from src.research.web_fallback.tasks import (
+    _field_outcome_resolved,
     _normalize_requested_fields,
+    _resolved_web_task_status,
     cancel_web_enrichment_task,
     enqueue_web_enrichment_tasks,
     lease_web_enrichment_tasks,
     resume_web_enrichment_tasks,
 )
+
+
+def test_web_task_terminal_status_requires_verified_resolved_field_evidence():
+    absent = {"ip_location_text": {"status": "absent_on_page", "reason": "ip_location_not_present"}}
+    assert (
+        _resolved_web_task_status(
+            ("ip_location_text",), absent, identity_verified=True
+        )
+        == "completed_with_absent_fields"
+    )
+    assert _resolved_web_task_status(
+        ("ip_location_text",), absent, identity_verified=False
+    ) is None
+    assert not _field_outcome_resolved(
+        "ip_location_text", {"status": "needs_evidence", "reason": "ip_location_not_present"}
+    )
+    assert _resolved_web_task_status(
+        ("ip_location_text",),
+        {"ip_location_text": {"status": "not_tested", "reason": "not_observed_in_bounded_page"}},
+        identity_verified=True,
+    ) is None
+    assert _resolved_web_task_status(
+        ("global_growth_icon_url", "global_growth_level"),
+        {
+            "global_growth_icon_url": {"status": "absent_on_page", "reason": "no_icon"},
+            "global_growth_level": {"status": "needs_evidence", "reason": "numeric_level_not_exposed_in_page"},
+        },
+        identity_verified=True,
+    ) == "completed_with_absent_fields"
+    assert _resolved_web_task_status(
+        ("global_growth_icon_url", "global_growth_level"),
+        {
+            "global_growth_icon_url": {"status": "absent_on_page", "reason": "no_icon"},
+            "global_growth_level": {"status": "needs_evidence", "reason": "ambiguous_level"},
+        },
+        identity_verified=True,
+    ) is None
+    assert _resolved_web_task_status(
+        ("ip_location_text", "global_growth_icon_url", "global_growth_level"),
+        {
+            "ip_location_text": {"status": "absent_on_page", "reason": "not_present"},
+            "global_growth_icon_url": {"status": "applied"},
+        },
+        identity_verified=True,
+    ) is None
 
 
 class _AsyncTransaction:
@@ -459,6 +506,59 @@ async def test_untried_target_precedes_older_due_high_priority_retry(research_db
     )
     assert [lease.target_id for lease in leases] == [2102, 2101]
     assert {lease.task_key for lease in leases} == set(summary.task_keys)
+
+
+@pytest.mark.asyncio
+async def test_comment_leasing_keeps_same_parent_targets_adjacent(research_db):
+    engine, maker = research_db
+    with Session(engine) as session, session.begin():
+        session.add(
+            ResearchComment(
+                cid=3099,
+                tid=1001,
+                parent_post_pid=2102,
+                fid=7654321,
+                text="synthetic earlier-id comment",
+                author_user_id=888,
+                source_api="aiotieba.get_comments",
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                source_payload_json={},
+                missing_reasons_json={},
+            )
+        )
+        session.add(
+            ResearchTaskScope(
+                run_id="run-web-001",
+                logical_task_key="post_comments:1001:2102",
+                generation=0,
+                task_type="comments",
+                scope_type="post_comments",
+                fid=7654321,
+                tid=1001,
+                parent_pid=2102,
+                parent_generation=0,
+                status="completed",
+            )
+        )
+
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="comment",
+        target_ids=[3101, 3102, 3099],
+        tid=1001,
+    )
+    leases = await lease_web_enrichment_tasks(
+        maker, "run-web-001", "parent-affinity-worker", limit=3
+    )
+
+    assert {lease.task_key for lease in leases} == set(summary.task_keys)
+    assert [(lease.parent_post_pid, lease.target_id) for lease in leases] == [
+        (2101, 3101),
+        (2101, 3102),
+        (2102, 3099),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1072,7 +1172,7 @@ async def test_retry_delay_increases_and_stops_after_three_attempts(research_db)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("existing_status", ["failed_retryable", "blocked", "failed_final"])
-async def test_timestamp_only_refresh_reuses_task_without_resetting_history(research_db, existing_status):
+async def test_observed_at_refresh_creates_a_new_task_without_mutating_old_history(research_db, existing_status):
     engine, maker = research_db
     fields = ["ip_location_text"]
     original = await enqueue_web_enrichment_tasks(
@@ -1106,16 +1206,63 @@ async def test_timestamp_only_refresh_reuses_task_without_resetting_history(rese
         only_missing_fields=True,
     )
 
-    assert refreshed.task_keys == (task_key,)
-    assert refreshed.created_count == 0
-    assert refreshed.deduplicated_count == 1
+    assert refreshed.task_keys != (task_key,)
+    assert refreshed.created_count == 1
+    assert refreshed.deduplicated_count == 0
     with Session(engine) as session:
         tasks = session.scalars(select(ResearchWebEnrichmentTask)).all()
         task = session.get(ResearchWebEnrichmentTask, task_key)
-        assert len(tasks) == 1
+        new_task = session.get(ResearchWebEnrichmentTask, refreshed.task_keys[0])
+        assert len(tasks) == 2
         assert task.status == existing_status
         assert task.attempts == attempts
         assert task.next_retry_at.replace(tzinfo=UTC) == next_retry_at if next_retry_at else task.next_retry_at is None
+        assert new_task.status == "pending_web"
+        assert new_task.attempts == 0
+        assert new_task.target_observed_at.replace(tzinfo=UTC) == datetime(2026, 1, 2, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_same_snapshot_retry_reuses_task_and_attempt_history(research_db):
+    engine, maker = research_db
+    created = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+    task_key = created.task_keys[0]
+    with Session(engine) as session, session.begin():
+        task = session.get(ResearchWebEnrichmentTask, task_key)
+        task.status = "failed_retryable"
+        task.attempts = 1
+        task.lease_generation = 1
+        task.field_statuses_json = {
+            "ip_location_text": {"status": "not_tested", "reason": "timeout"}
+        }
+
+    retry = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+        only_missing_fields=True,
+    )
+
+    assert retry.task_keys == (task_key,)
+    assert retry.created_count == 0
+    assert retry.deduplicated_count == 1
+    with Session(engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, task_key)
+        assert task.status == "failed_retryable"
+        assert task.attempts == 1
+        assert task.lease_generation == 1
+        assert task.field_statuses_json["ip_location_text"]["status"] == "not_tested"
 
 
 @pytest.mark.asyncio
@@ -1123,7 +1270,7 @@ async def test_timestamp_only_refresh_reuses_task_without_resetting_history(rese
     "diagnostics",
     [{"status": "already_satisfied", "pages": 0}, {"status": "ok", "pages": 1}],
 )
-async def test_completed_task_reopens_same_key_when_field_later_missing(research_db, diagnostics):
+async def test_completed_task_is_preserved_when_new_snapshot_needs_field(research_db, diagnostics):
     engine, maker = research_db
     summary = await enqueue_web_enrichment_tasks(
         maker,
@@ -1155,25 +1302,27 @@ async def test_completed_task_reopens_same_key_when_field_later_missing(research
         only_missing_fields=True,
     )
 
-    assert refreshed.task_keys == (task_key,)
-    assert refreshed.created_count == 0
+    assert refreshed.task_keys != (task_key,)
+    assert refreshed.created_count == 1
     with Session(engine) as session:
         task = session.get(ResearchWebEnrichmentTask, task_key)
-        assert task.status == "pending_web"
+        new_task = session.get(ResearchWebEnrichmentTask, refreshed.task_keys[0])
+        assert task.status == "completed"
         assert task.attempts == 1
-        assert task.lease_generation == 1
+        assert new_task.status == "pending_web"
+        assert new_task.attempts == 0
     leases = await lease_web_enrichment_tasks(
         maker,
         "run-web-001",
         "retry-preflight-completed",
-        task_keys=(task_key,),
+        task_keys=refreshed.task_keys,
     )
     assert len(leases) == 1
-    assert leases[0].lease_generation == 2
+    assert leases[0].lease_generation == 1
 
 
 @pytest.mark.asyncio
-async def test_preflight_completed_task_at_attempt_limit_becomes_audited_final(research_db):
+async def test_preflight_completed_task_at_attempt_limit_does_not_block_new_snapshot(research_db):
     engine, maker = research_db
     summary = await enqueue_web_enrichment_tasks(
         maker,
@@ -1184,9 +1333,9 @@ async def test_preflight_completed_task_at_attempt_limit_becomes_audited_final(r
         tid=1001,
         only_missing_fields=True,
     )
-    task_key = summary.task_keys[0]
+    old_task_key = summary.task_keys[0]
     with Session(engine) as session, session.begin():
-        task = session.get(ResearchWebEnrichmentTask, task_key)
+        task = session.get(ResearchWebEnrichmentTask, old_task_key)
         task.status = "completed"
         task.attempts = 3
         task.max_attempts = 3
@@ -1206,16 +1355,20 @@ async def test_preflight_completed_task_at_attempt_limit_becomes_audited_final(r
         only_missing_fields=True,
     )
 
-    assert refreshed.task_keys == (task_key,)
+    assert refreshed.task_keys != (old_task_key,)
+    assert refreshed.created_count == 1
     with Session(engine) as session:
-        task = session.get(ResearchWebEnrichmentTask, task_key)
+        old_task = session.get(ResearchWebEnrichmentTask, old_task_key)
+        new_task = session.get(ResearchWebEnrichmentTask, refreshed.task_keys[0])
         failures = session.scalars(
             select(ResearchWebEnrichmentFailure).where(
-                ResearchWebEnrichmentFailure.task_key == task_key,
+                ResearchWebEnrichmentFailure.task_key == old_task_key,
                 ResearchWebEnrichmentFailure.reason_code
                 == "web_attempt_limit_exhausted_after_api_refresh",
             )
         ).all()
-        assert task.status == "failed_final"
-        assert task.attempts == 3
-        assert len(failures) == 1
+        assert old_task.status == "completed"
+        assert old_task.attempts == 3
+        assert new_task.status == "pending_web"
+        assert new_task.attempts == 0
+        assert failures == []

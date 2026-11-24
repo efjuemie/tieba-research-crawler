@@ -390,6 +390,25 @@ def test_page_pc_comment_extracts_growth_from_exact_user_without_nested_request(
     assert candidates["global_growth_icon_url"].source_path.startswith("page_pc.user_list[0].")
 
 
+def test_page_pc_comment_missing_growth_keeps_exact_cid_identity():
+    target = _comment_target(requested_fields=("global_growth_level", "global_growth_icon_url"))
+
+    result = _extract(extract_page_pc_comment, _payload(), target)
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.candidates == ()
+    assert result.identity_evidence.cid == CID
+    assert result.field_outcomes["global_growth_level"] == {
+        "status": "not_tested",
+        "reason": "not_observed_in_response",
+    }
+    assert result.field_outcomes["global_growth_icon_url"] == {
+        "status": "not_tested",
+        "reason": "growth_icon_not_exposed_in_response",
+    }
+
+
 def test_page_pc_comment_extracts_exact_reply_prefix_name_and_uid():
     payload = _payload()
     comment = payload["post_list"][0]["sub_post_list"]["sub_post_list"][0]

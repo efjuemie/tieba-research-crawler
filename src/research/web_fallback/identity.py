@@ -67,6 +67,8 @@ class Target:
     author_user_id: str | int | None = None
     author_portrait: str | None = None
     requested_fields: tuple[str, ...] = ()
+    scope_generation: int | None = None
+    parent_scope_generation: int | None = None
 
     def __post_init__(self) -> None:
         if self.target_type not in {"thread", "post", "comment"}:
@@ -75,6 +77,12 @@ class Target:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, parse_positive_id(value))
+        for name in ("scope_generation", "parent_scope_generation"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise IdentityError("invalid_scope_generation")
         if self.target_type == "thread":
             if self.target_id != self.tid or self.pid is not None or self.cid is not None:
                 raise IdentityError("thread_target_shape_mismatch")

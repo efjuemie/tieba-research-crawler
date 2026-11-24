@@ -41,7 +41,9 @@ from .tasks import (
     _THREAD_LIST_METADATA_FIELDS,
     LEGACY_WEB_FIELD_TYPES,
     WEB_FIELD_TYPES,
+    _field_outcome_resolved,
     _record_failure_audit,
+    _resolved_web_task_status,
     _safe_reason,
     _thread_list_metadata_matches,
     _unknown_canonical_value,
@@ -74,6 +76,7 @@ class WebTaskPreflight:
     status: str
     missing_fields: tuple[str, ...] = ()
     satisfied_fields: tuple[str, ...] = ()
+    preserved_outcomes: dict[str, dict[str, str]] | None = None
     reason: str | None = None
     preflight_skipped: bool = False
 
@@ -537,10 +540,13 @@ async def _record_rejected_response(
             safe_reason != "lease_expired"
             and lease_matches
         ):
+            prior_identity_verified = task.identity_verified
             task.status = status
             task.last_error_type = status
             task.last_error = safe_reason
-            task.identity_verified = status != "identity_unverified"
+            task.identity_verified = (
+                False if status == "identity_unverified" else prior_identity_verified
+            )
             task.identity_reason = safe_reason if status == "identity_unverified" else None
             task.lease_token = None
             task.lease_owner = None
@@ -549,8 +555,15 @@ async def _record_rejected_response(
             task.updated_at = occurred_at
             task.last_diagnostics_json = with_elapsed_seconds(diagnostics, task.leased_at, occurred_at)
             if requested_fields is not None:
+                previous = dict(task.field_statuses_json or {})
                 task.field_statuses_json = {
-                    name: {"status": status, "reason": safe_reason} for name in requested_fields
+                    name: (
+                        dict(previous[name])
+                        if prior_identity_verified is True
+                        and _field_outcome_resolved(name, previous.get(name))
+                        else {"status": status, "reason": safe_reason}
+                    )
+                    for name in requested_fields
                 }
             task.leased_at = None
         if lease_generation is not None:
@@ -607,6 +620,8 @@ async def preflight_web_enrichment_task(
 
             required_content_source, marker_observed_at = await _lock_and_validate_scopes(session, task)
             _model, _conditions, row = await _lock_target(session, task)
+            if _utc(row.observed_at) != _utc(task.target_observed_at):
+                raise _ReconcileRejectedError("failed_final", "target_observed_at_changed")
             required_content_source = _validate_current_content_source(
                 task, row, required_content_source, marker_observed_at
             )
@@ -623,6 +638,20 @@ async def preflight_web_enrichment_task(
                 requested_fields,
                 pair_growth_fields=_GROWTH_FIELDS.issubset(set(requested_fields)),
             )
+            current_field_statuses = dict(task.field_statuses_json or {})
+            preserved_outcomes = {
+                name: dict(current_field_statuses[name])
+                for name in requested_fields
+                if task.identity_verified is True
+                and _field_outcome_resolved(name, current_field_statuses.get(name))
+                and (
+                    current_field_statuses[name].get("status") not in {"applied", "confirmed"}
+                    or not _unknown_canonical_value(
+                        getattr(row, name, None), name, dict(row.missing_reasons_json or {})
+                    )
+                )
+            }
+            missing_fields = tuple(name for name in missing_fields if name not in preserved_outcomes)
             satisfied_fields = tuple(name for name in requested_fields if name not in missing_fields)
             if missing_fields:
                 return WebTaskPreflight(
@@ -630,13 +659,19 @@ async def preflight_web_enrichment_task(
                     status="ready",
                     missing_fields=missing_fields,
                     satisfied_fields=satisfied_fields,
+                    preserved_outcomes=preserved_outcomes,
                 )
 
-            task.field_statuses_json = {
-                name: {"status": "confirmed", "reason": "already_satisfied"}
+            outcomes = {
+                name: preserved_outcomes.get(
+                    name, {"status": "confirmed", "reason": "already_satisfied"}
+                )
                 for name in requested_fields
             }
-            task.status = "completed"
+            task.field_statuses_json = outcomes
+            task.status = _resolved_web_task_status(
+                requested_fields, outcomes, identity_verified=True
+            ) or "completed"
             task.identity_verified = True
             task.identity_reason = None
             task.last_error_type = None
@@ -651,13 +686,14 @@ async def preflight_web_enrichment_task(
             task.updated_at = current_time
             attempt = await session.get(ResearchWebEnrichmentAttempt, (task_key, task.lease_generation))
             if attempt is not None:
-                attempt.status = "completed"
+                attempt.status = task.status
                 attempt.finished_at = current_time
                 attempt.diagnostics_json = with_elapsed_seconds(diagnostics, attempt.started_at, current_time)
             return WebTaskPreflight(
                 task_key=task_key,
-                status="completed",
+                status=task.status,
                 satisfied_fields=tuple(requested_fields),
+                preserved_outcomes=preserved_outcomes,
                 reason="already_satisfied",
                 preflight_skipped=True,
             )
@@ -729,6 +765,8 @@ async def complete_web_enrichment_task(
 
             required_content_source, marker_observed_at = await _lock_and_validate_scopes(session, task)
             model, conditions, row = await _lock_target(session, task)
+            if _utc(row.observed_at) != _utc(task.target_observed_at):
+                raise _ReconcileRejectedError("failed_final", "target_observed_at_changed")
             required_content_source = _validate_current_content_source(
                 task, row, required_content_source, marker_observed_at
             )
@@ -1126,28 +1164,6 @@ async def complete_web_enrichment_task(
                     candidate_status_by_field[field_name] = outcomes.get(
                         field_name, {"status": "not_tested"}
                     )["status"]
-            requested_statuses = [candidate_status_by_field[name] for name in requested_fields]
-            growth_requested = set(requested_fields) & _GROWTH_FIELDS
-            growth_satisfied = growth_requested == _GROWTH_FIELDS and any(
-                candidate_status_by_field[name] in {"applied", "confirmed"}
-                for name in _GROWTH_FIELDS
-            )
-            non_growth_statuses = [
-                candidate_status_by_field[name]
-                for name in requested_fields
-                if name not in _GROWTH_FIELDS
-            ]
-            if all(status in {"applied", "confirmed"} for status in requested_statuses) or (
-                growth_satisfied
-                and all(status in {"applied", "confirmed"} for status in non_growth_statuses)
-            ):
-                task_status = "completed"
-            elif all(status == "unsupported_by_source" for status in requested_statuses):
-                task_status = "unsupported_by_source"
-            elif all(status == "not_applicable" for status in requested_statuses):
-                task_status = "not_applicable"
-            else:
-                task_status = "partially_completed"
             task.field_statuses_json = {
                 name: {
                     "status": outcomes.get(name, {"status": candidate_status_by_field[name]}).get("status"),
@@ -1155,6 +1171,9 @@ async def complete_web_enrichment_task(
                 }
                 for name in requested_fields
             }
+            task_status = _resolved_web_task_status(
+                requested_fields, task.field_statuses_json, identity_verified=True
+            ) or "partially_completed"
             task.status = task_status
             task.identity_verified = True
             task.identity_reason = None
@@ -1263,6 +1282,7 @@ async def fail_web_enrichment_task(
         if task.lease_until is None or _utc(task.lease_until) <= current_time:
             return "expired_lease"
         requested_fields = tuple(task.requested_fields_json)
+        prior_identity_verified = task.identity_verified
         outcomes = _outcomes_by_field(requested_fields, field_outcomes)
         task_status = status
         next_retry: datetime | None = None
@@ -1273,13 +1293,23 @@ async def fail_web_enrichment_task(
                 backoff = retry_after if retry_after is not None else (3 if task.attempts == 1 else 5)
                 next_retry = current_time + timedelta(seconds=backoff)
         for field_name in requested_fields:
-            outcomes.setdefault(field_name, {"status": status, "reason": reason})
+            previous = dict(task.field_statuses_json or {}).get(field_name)
+            if (
+                field_name not in outcomes
+                and prior_identity_verified is True
+                and _field_outcome_resolved(field_name, previous)
+            ):
+                outcomes[field_name] = dict(previous)
+            else:
+                outcomes.setdefault(field_name, {"status": status, "reason": reason})
         task.field_statuses_json = outcomes
         task.status = task_status
         task.last_error_type = task_status
         task.last_error = reason
         task.next_retry_at = next_retry
-        task.identity_verified = False if task_status == "identity_unverified" else None
+        task.identity_verified = (
+            False if task_status == "identity_unverified" else prior_identity_verified
+        )
         task.identity_reason = reason if task_status == "identity_unverified" else None
         task.lease_token = None
         task.lease_owner = None

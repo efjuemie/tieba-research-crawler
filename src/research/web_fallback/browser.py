@@ -40,6 +40,8 @@ _TRANSPORT_ERRORS = (ConnectionResetError, BrokenPipeError, EOFError, asyncio.In
 _COMMENT_GROWTH_HYDRATION_WAIT_SECONDS = 2.0
 _COMMENT_GROWTH_HYDRATION_POLL_SECONDS = 0.05
 _MAX_COMMENT_GROWTH_HOVERS = 3
+_COMMENT_SELECTOR_STABLE_SECONDS = 2.5
+_COMMENT_SELECTOR_STABLE_SAMPLES = 3
 _PAGE_READINESS_DIAGNOSTIC_TIMEOUT_SECONDS = 0.75
 _PAGE_READINESS_DIAGNOSTIC_GRACE_SECONDS = 1.0
 _PAGE_READINESS_BLOCK_NOTICE_TIMEOUT_SECONDS = 0.2
@@ -79,6 +81,16 @@ _PAGE_READINESS_DIAGNOSTIC_SCRIPT = """(selectors) => {
     counts[key] = {count: nodes.length, visible: nodes.filter(visible).length};
   }
   return {readyState: document.readyState, selectors: counts};
+}"""
+
+_COMMENT_SELECTOR_STABILITY_SCRIPT = """() => {
+  const visible = (node) => {
+    const rect = node.getBoundingClientRect();
+    const style = getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const owners = Array.from(document.querySelectorAll('.pb-comment-item'));
+  return {readyState: document.readyState, visibleOwnerCount: owners.filter(visible).length};
 }"""
 
 _COMMENT_GROWTH_HOVER_POINTS_SCRIPT = r"""({parentPid, portrait, limit}) => {
@@ -170,10 +182,23 @@ class _CachedPostPage:
 @dataclass(slots=True)
 class _CachedParentSnapshot:
     run_id: str | None
-    group_key: tuple[str | None, str, str]
+    group_key: tuple[str | None, str, str, int, int]
     snapshots: list[Any]
     cached_at: float
     target_count: int = 1
+    missed_target_ids: set[str] = field(default_factory=set)
+
+
+def _parent_snapshot_group_key(target: Target) -> tuple[str | None, str, str, int, int]:
+    if target.scope_generation is None or target.parent_scope_generation is None:
+        raise ValueError("parent snapshot reuse requires both scope generations")
+    return (
+        str(target.fid) if target.fid is not None else None,
+        str(target.tid),
+        str(target.parent_post_pid),
+        target.scope_generation,
+        target.parent_scope_generation,
+    )
 
 
 class BrowserProviderConfigurationError(RuntimeError):
@@ -272,6 +297,7 @@ class PlaywrightWebFallbackProvider:
             "observed_subresource_requests": 0,
             "nested_floor_requests": 0,
             "page_pc_requests": 0,
+            "verified_page_pc_response_pages": [],
             "user_card_requests": 0,
             "pages": 0,
             "page_cache_hits": 0,
@@ -428,6 +454,16 @@ class PlaywrightWebFallbackProvider:
                 response_status=response.status,
             )
             network_results.append(result)
+            if (
+                path == PAGE_PC_PATH
+                and target.target_type == "comment"
+                and response_page_number is not None
+                and result.status == "ok"
+                and result.identity_verified
+            ):
+                verified_pages = state["verified_page_pc_response_pages"]
+                if response_page_number not in verified_pages:
+                    verified_pages.append(response_page_number)
             if (
                 self._reuse_parent_snapshots
                 and path in {NESTED_FLOOR_PATH, PAGE_PC_PATH}
@@ -614,7 +650,20 @@ class PlaywrightWebFallbackProvider:
                 page_url = _target_page_url(target, page_number)
                 state["operation_phase"] = "page_navigation"
                 async with self._budget(state):
-                    self._cached_parent_snapshot = None
+                    cached_parent = self._cached_parent_snapshot
+                    target_key = str(target.cid if target.cid is not None else target.target_id)
+                    preserve_growth_miss = (
+                        target.target_type == "comment"
+                        and target.scope_generation is not None
+                        and target.parent_scope_generation is not None
+                        and cached_parent is not None
+                        and cached_parent.run_id == self._run_scope_id
+                        and cached_parent.group_key == _parent_snapshot_group_key(target)
+                        and time.monotonic() - cached_parent.cached_at <= _PARENT_SNAPSHOT_TTL_SECONDS
+                        and target_key in cached_parent.missed_target_ids
+                    )
+                    if not preserve_growth_miss:
+                        self._cached_parent_snapshot = None
                     response = await page.goto(
                         page_url,
                         wait_until="domcontentloaded",
@@ -751,8 +800,10 @@ class PlaywrightWebFallbackProvider:
                     False,
                 )
             if identity_mismatch:
+                self._cached_parent_snapshot = None
                 return BrowserRunResult("identity_unverified", "network_request_context_unavailable", (), dict(state))
             if state.get("identity_failure"):
+                self._cached_parent_snapshot = None
                 return BrowserRunResult("identity_unverified", state["identity_failure"], (), dict(state))
             if any(
                 result.status == "identity_unverified"
@@ -760,6 +811,7 @@ class PlaywrightWebFallbackProvider:
                 not in {"cid_missing_from_response", "parent_post_missing_from_response"}
                 for result in network_results
             ):
+                self._cached_parent_snapshot = None
                 return BrowserRunResult("identity_unverified", "network_identity_mismatch", (), dict(state))
 
             if (
@@ -818,6 +870,8 @@ class PlaywrightWebFallbackProvider:
                     False,
                 )
             if target.target_type == "comment":
+                if dom_result is not None and dom_result.status == "identity_unverified":
+                    self._cached_parent_snapshot = None
                 reason = next(
                     (result.reason for result in reversed(network_results) if result.reason),
                     "target_cid_not_observed",
@@ -901,13 +955,12 @@ class PlaywrightWebFallbackProvider:
                             raise
 
     def _cache_parent_snapshots(self, target: Target, snapshots: list[Any]) -> None:
+        if target.scope_generation is None or target.parent_scope_generation is None:
+            self._cached_parent_snapshot = None
+            return
         if not snapshots:
             return
-        group_key = (
-            str(target.fid) if target.fid is not None else None,
-            str(target.tid),
-            str(target.parent_post_pid),
-        )
+        group_key = _parent_snapshot_group_key(target)
         cached = self._cached_parent_snapshot
         if (
             cached is not None
@@ -915,9 +968,13 @@ class PlaywrightWebFallbackProvider:
             and cached.group_key == group_key
             and time.monotonic() - cached.cached_at <= _PARENT_SNAPSHOT_TTL_SECONDS
         ):
+            added_snapshot = False
             for snapshot in snapshots:
                 if all(existing.source_path != snapshot.source_path for existing in cached.snapshots):
                     cached.snapshots.append(snapshot)
+                    added_snapshot = True
+            if added_snapshot:
+                cached.missed_target_ids.clear()
         else:
             self._cached_parent_snapshot = _CachedParentSnapshot(
                 self._run_scope_id,
@@ -930,12 +987,17 @@ class PlaywrightWebFallbackProvider:
         self, target: Target, state: dict[str, Any]
     ) -> BrowserRunResult | None:
         cached = self._cached_parent_snapshot
-        if not self._reuse_parent_snapshots or target.target_type != "comment":
+        if (
+            not self._reuse_parent_snapshots
+            or target.target_type != "comment"
+            or target.scope_generation is None
+            or target.parent_scope_generation is None
+        ):
             self._cached_parent_snapshot = None
             return None
         if cached is None:
             return None
-        group_key = (str(target.fid) if target.fid is not None else None, str(target.tid), str(target.parent_post_pid))
+        group_key = _parent_snapshot_group_key(target)
         if (
             cached.run_id != self._run_scope_id
             or cached.group_key != group_key
@@ -945,6 +1007,10 @@ class PlaywrightWebFallbackProvider:
             self._cached_parent_snapshot = None
             state["parent_snapshot_misses"] = 1
             return None
+        target_key = str(target.cid if target.cid is not None else target.target_id)
+        if target_key in cached.missed_target_ids:
+            return None
+        cached.target_count += 1
         results = []
         identity_failure = None
         for snapshot in cached.snapshots:
@@ -977,16 +1043,13 @@ class PlaywrightWebFallbackProvider:
             return None
 
         growth_fields = {"global_growth_level", "global_growth_icon_url"}
-        if (
-            set(target.requested_fields) & growth_fields
-            and not any(
-                candidate.field_name in growth_fields
-                for result in results
-                for candidate in result.candidates
-            )
+        if set(target.requested_fields) & growth_fields and not any(
+            candidate.field_name in growth_fields for result in results for candidate in result.candidates
         ):
-            self._cached_parent_snapshot = None
+            cached.missed_target_ids.add(target_key)
             state["parent_snapshot_misses"] = 1
+            if cached.target_count >= _PARENT_SNAPSHOT_MAX_TARGETS:
+                self._cached_parent_snapshot = None
             return None
 
         candidates_by_field = {}
@@ -1016,7 +1079,6 @@ class PlaywrightWebFallbackProvider:
                 candidates_by_field.setdefault(candidate.field_name, candidate)
         for field_name in candidates_by_field:
             outcomes.pop(field_name, None)
-        cached.target_count += 1
         if cached.target_count >= _PARENT_SNAPSHOT_MAX_TARGETS:
             self._cached_parent_snapshot = None
         state["parent_snapshot_hits"] = 1
@@ -1043,6 +1105,9 @@ class PlaywrightWebFallbackProvider:
         loop = asyncio.get_running_loop()
         previous_html = None
         stable_count = 0
+        comment_readiness_signature = None
+        comment_readiness_stable_since = None
+        comment_readiness_samples = 0
         while loop.time() < page_deadline:
             if loop.time() >= task_deadline:
                 return "timeout"
@@ -1076,9 +1141,12 @@ class PlaywrightWebFallbackProvider:
             else:
                 state["readiness_step"] = "selector_wait"
                 owner = page.locator(f'.pb-comment-item[data-id="{target.parent_post_pid}"]')
-                if await owner.count() == 1:
+                owner_count = await owner.count()
+                wrapper_count = None
+                if owner_count == 1:
                     wrapper = owner.locator(":scope > .comment-content > .lzl-wrapper")
-                    if await wrapper.count() == 1:
+                    wrapper_count = await wrapper.count()
+                    if wrapper_count == 1:
                         expansion = wrapper.locator(":scope > .show-more-lzl")
                         nested_items = wrapper.locator(":scope > .pb-lzl-item")
                         if (
@@ -1095,6 +1163,44 @@ class PlaywrightWebFallbackProvider:
                         else:
                             previous_html = html_text
                             stable_count = 0
+                        comment_readiness_signature = None
+                        comment_readiness_stable_since = None
+                        comment_readiness_samples = 0
+                if owner_count != 1 or wrapper_count != 1:
+                    try:
+                        readiness_state = await page.evaluate(_COMMENT_SELECTOR_STABILITY_SCRIPT)
+                    except Exception:
+                        readiness_state = None
+                    if isinstance(readiness_state, dict):
+                        document_state = readiness_state.get("readyState")
+                        visible_owner_count = readiness_state.get("visibleOwnerCount")
+                        page_pc_verified = page_number in state.get("verified_page_pc_response_pages", ())
+                        ready_signature = (
+                            document_state,
+                            visible_owner_count,
+                        )
+                        if (
+                            document_state == "complete"
+                            and type(visible_owner_count) is int
+                            and visible_owner_count >= 0
+                            and (visible_owner_count > 0 or page_pc_verified)
+                        ):
+                            if ready_signature == comment_readiness_signature:
+                                comment_readiness_samples += 1
+                            else:
+                                comment_readiness_signature = ready_signature
+                                comment_readiness_stable_since = loop.time()
+                                comment_readiness_samples = 1
+                            if (
+                                comment_readiness_samples >= _COMMENT_SELECTOR_STABLE_SAMPLES
+                                and comment_readiness_stable_since is not None
+                                and loop.time() - comment_readiness_stable_since >= _COMMENT_SELECTOR_STABLE_SECONDS
+                            ):
+                                return "ready"
+                        else:
+                            comment_readiness_signature = None
+                            comment_readiness_stable_since = None
+                            comment_readiness_samples = 0
             remaining = min(page_deadline, task_deadline) - loop.time()
             if remaining > 0:
                 await asyncio.sleep(min(0.05, remaining))
