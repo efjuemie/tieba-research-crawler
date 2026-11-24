@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from cashews import Cache, add_prefix
 from sqlalchemy import BigInteger, String, and_, case, cast, delete, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 from tiebameow.models.orm import Comment, Forum, Post, Thread, User
@@ -76,6 +77,21 @@ REVALIDATABLE_EMPTY_COMMENT_PAGE_ONE_REASONS = frozenset(
         "Comment detail empty response is not a confirmed terminal page for page 1.",
     }
 )
+
+
+def _insert_for_session(session: AsyncSession, model: type[Any]) -> Any:
+    """Return a dialect-matched INSERT builder for conflict-safe upserts."""
+    dialect_name = "postgresql"
+    get_bind = getattr(session, "get_bind", None)
+    if callable(get_bind):
+        try:
+            bind = get_bind()
+        except Exception:
+            bind = None
+        dialect_name = getattr(getattr(bind, "dialect", None), "name", "postgresql")
+    if dialect_name == "sqlite":
+        return sqlite_insert(model)
+    return insert(model)
 
 
 def _research_forum_ids(forums_json: Any) -> tuple[set[int], bool]:
@@ -968,6 +984,42 @@ class DataStore:
                     floor = await session.scalar(select(Post.floor).where(Post.tid == tid, Post.pid == parent_pid))
             return (floor, parent.rn) if type(floor) is int and floor > 0 else None
 
+    async def get_research_comment_parent_dense_page_hint(
+        self,
+        tid: int,
+        parent_floor: int,
+        parent_rn: int,
+    ) -> int | None:
+        """Estimate the dense post page for a parent floor after deleted earlier floors."""
+        from src.research.models import ResearchPost
+
+        if (
+            type(tid) is not int
+            or tid <= 0
+            or type(parent_floor) is not int
+            or parent_floor < 1
+            or type(parent_rn) is not int
+            or parent_rn < 1
+        ):
+            return None
+        if parent_floor == 1:
+            return 1
+        async with self.async_sessionmaker() as session:
+            rank = await session.scalar(
+                select(func.count(ResearchPost.pid)).where(
+                    ResearchPost.tid == tid,
+                    ResearchPost.floor <= parent_floor,
+                )
+            )
+            if type(rank) is not int or rank <= 0:
+                rank = await session.scalar(
+                    select(func.count(Post.pid)).where(
+                        Post.tid == tid,
+                        Post.floor <= parent_floor,
+                    )
+                )
+        return max(1, (rank - 1) // parent_rn + 1) if type(rank) is int and rank > 0 else None
+
     async def complete_failed_comment_scope_from_parent_zero(
         self,
         *,
@@ -992,7 +1044,8 @@ class DataStore:
             or type(parent_rn) is not int
             or parent_rn < 1
             or type(parent_page) is not int
-            or parent_page != (parent_floor - 1) // parent_rn + 1
+            or parent_page < 1
+            or parent_page > (parent_floor - 1) // parent_rn + 1
             or current_failure.get("error_type") != "PageIntegrityError"
             or current_failure.get("reason") not in REVALIDATABLE_EMPTY_COMMENT_PAGE_ONE_REASONS
             or not source_observed_at
@@ -1199,28 +1252,35 @@ class DataStore:
         scope = await self.get_research_task_scope_for_update(session, run_id, logical_task_key)
         now = datetime.now(UTC)
         if scope is None:
-            scope = ResearchTaskScope(
-                run_id=run_id,
-                logical_task_key=logical_task_key,
-                generation=0,
-                task_type=task_type,
-                scope_type=scope_type,
-                fid=fid,
-                fname=fname,
-                tid=tid,
-                parent_pid=parent_pid,
-                parent_kind=parent_kind,
-                is_good=is_good,
-                backfill=backfill,
-                rn=rn,
-                parent_logical_task_key=parent_logical_task_key,
-                parent_generation=parent_generation,
-                status="pending",
-                last_checked=now,
+            insert_stmt = (
+                _insert_for_session(session, ResearchTaskScope)
+                .values(
+                    run_id=run_id,
+                    logical_task_key=logical_task_key,
+                    generation=0,
+                    task_type=task_type,
+                    scope_type=scope_type,
+                    fid=fid,
+                    fname=fname,
+                    tid=tid,
+                    parent_pid=parent_pid,
+                    parent_kind=parent_kind,
+                    is_good=is_good,
+                    backfill=backfill,
+                    rn=rn,
+                    parent_logical_task_key=parent_logical_task_key,
+                    parent_generation=parent_generation,
+                    status="pending",
+                    last_checked=now,
+                )
+                .on_conflict_do_nothing(index_elements=["run_id", "logical_task_key"])
             )
-            session.add(scope)
-            await session.flush()
-            return scope
+            insert_result = await session.execute(insert_stmt)
+            scope = await self.get_research_task_scope_for_update(session, run_id, logical_task_key)
+            if scope is None:
+                return None
+            if insert_result.rowcount:
+                return scope
 
         if parent_logical_task_key is not None and scope.parent_generation not in (None, parent_generation):
             return None
@@ -1337,11 +1397,25 @@ class DataStore:
                 if not batch:
                     break
                 last_tid = batch[-1].tid
+                managed_keys = set(
+                    (
+                        await session.scalars(
+                            select(ResearchTaskScope.logical_task_key).where(
+                                ResearchTaskScope.logical_task_key.in_(
+                                    [research_posts_task_key(pending.tid) for pending in batch]
+                                )
+                            )
+                        )
+                    ).all()
+                )
                 for pending in batch:
+                    logical_key = research_posts_task_key(pending.tid)
+                    if logical_key in managed_keys:
+                        continue
                     await self._ensure_research_task_scope_in_session(
                         session,
                         run_id=run_id,
-                        logical_task_key=research_posts_task_key(pending.tid),
+                        logical_task_key=logical_key,
                         task_type="full_scan_posts",
                         scope_type="thread_replies",
                         fid=pending.fid,
@@ -1478,7 +1552,21 @@ class DataStore:
                 if not batch:
                     break
                 last_pair = (batch[-1].tid, batch[-1].pid)
+                managed_keys = set(
+                    (
+                        await session.scalars(
+                            select(ResearchTaskScope.logical_task_key).where(
+                                ResearchTaskScope.logical_task_key.in_(
+                                    [research_comments_task_key(pending.tid, pending.pid) for pending in batch]
+                                )
+                            )
+                        )
+                    ).all()
+                )
                 for pending in batch:
+                    comment_key = research_comments_task_key(pending.tid, pending.pid)
+                    if comment_key in managed_keys:
+                        continue
                     parent_key = research_posts_task_key(pending.tid)
                     parent = await self.get_research_task_scope_for_update(session, run_id, parent_key)
                     if parent is None:
@@ -1507,7 +1595,7 @@ class DataStore:
                     await self._ensure_research_task_scope_in_session(
                         session,
                         run_id=run_id,
-                        logical_task_key=research_comments_task_key(pending.tid, pending.pid),
+                        logical_task_key=comment_key,
                         task_type="full_scan_comments",
                         scope_type="post_comments",
                         fid=pending.fid,
@@ -2273,6 +2361,7 @@ class DataStore:
         """
         if not thread_dtos:
             return {}
+        thread_dtos = list({dto.tid: dto for dto in thread_dtos}.values())
         thread_models = [Thread.from_dto(dto) for dto in thread_dtos]
         pending_scans = [
             PendingThreadScan(tid=dto.tid, fid=dto.fid, fname=dto.fname, backfill=backfill)

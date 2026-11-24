@@ -71,6 +71,9 @@ if TYPE_CHECKING:
     from .router import QueueRouter
 
 
+_MAX_PARENT_ZERO_REVALIDATION_PROBES = 4
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class FetchedPage:
     response: Any
@@ -2905,16 +2908,72 @@ class FullScanCommentsTaskHandler(TaskHandler):
         parent_floor, parent_rn = hint
         if type(parent_floor) is not int or parent_floor < 1 or type(parent_rn) is not int or parent_rn < 1:
             return False
-        parent_page = (parent_floor - 1) // parent_rn + 1
-        fetched = await self.get_posts(task.tid, parent_page, rn=parent_rn, with_comments=False)
-        page = self._dto(fetched.response)
-        matches = [post for post in page.objs if post.pid == task.pid]
-        if len(matches) != 1:
+        floor_page = (parent_floor - 1) // parent_rn + 1
+        dense_page: int | None = None
+        if parent_floor > 1:
+            get_dense_hint = getattr(self.datastore, "get_research_comment_parent_dense_page_hint", None)
+            if get_dense_hint is not None:
+                dense_page = await get_dense_hint(task.tid, parent_floor, parent_rn)
+
+        low = 1
+        high = floor_page
+        candidate_page = (
+            dense_page
+            if type(dense_page) is int and low <= dense_page <= high
+            else floor_page
+        )
+        visited_pages: set[int] = set()
+        matched: tuple[FetchedPage, Any, Any, int] | None = None
+        for _ in range(_MAX_PARENT_ZERO_REVALIDATION_PROBES):
+            if candidate_page < low or candidate_page > high or candidate_page in visited_pages:
+                break
+            visited_pages.add(candidate_page)
+            try:
+                fetched = await self.get_posts(task.tid, candidate_page, rn=parent_rn, with_comments=False)
+            except PageIntegrityError:
+                if candidate_page <= low:
+                    return False
+                high = min(high, candidate_page - 1)
+                if low > high:
+                    return False
+                candidate_page = (low + high) // 2
+                continue
+
+            page = self._dto(fetched.response)
+            matches = [post for post in page.objs if post.pid == task.pid]
+            if len(matches) == 1:
+                matched = (fetched, page, matches[0], candidate_page)
+                break
+
+            total_pages = getattr(getattr(page, "page", None), "total_page", None)
+            if type(total_pages) is int and total_pages >= 1:
+                high = min(high, total_pages)
+            page_floors = [
+                post.floor
+                for post in page.objs
+                if type(getattr(post, "floor", None)) is int and post.floor > 0
+            ]
+            if not page_floors:
+                break
+            min_floor, max_floor = min(page_floors), max(page_floors)
+            if min_floor <= parent_floor <= max_floor:
+                break
+            if parent_floor < min_floor:
+                high = min(high, candidate_page - 1)
+            else:
+                low = max(low, candidate_page + 1)
+            if low > high:
+                break
+            candidate_page = (low + high) // 2
+
+        if matched is None:
             return False
+
+        fetched, page, matched_post, parent_page = matched
         evidence = _explicit_zero_evidence_for_post(
             fetched.response,
             page,
-            matches[0],
+            matched_post,
             task,
             parent_page,
         )
@@ -2934,7 +2993,7 @@ class FullScanCommentsTaskHandler(TaskHandler):
             parent_pid=task.pid,
             generation=task.generation,
             parent_generation=task.parent_generation,
-            fid=matches[0].fid,
+            fid=matched_post.fid,
             parent_floor=parent_floor,
             parent_rn=parent_rn,
             parent_page=parent_page,

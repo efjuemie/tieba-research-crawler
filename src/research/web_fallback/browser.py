@@ -42,6 +42,7 @@ _COMMENT_GROWTH_HYDRATION_POLL_SECONDS = 0.05
 _MAX_COMMENT_GROWTH_HOVERS = 3
 _COMMENT_SELECTOR_STABLE_SECONDS = 2.5
 _COMMENT_SELECTOR_STABLE_SAMPLES = 3
+_THREAD_NETWORK_READY_STABLE_SECONDS = 0.5
 _DELETED_THREAD_PAGE_MARKERS = (
     "帖子可能已被删除",
     "很抱歉，该贴已被删除",
@@ -857,10 +858,11 @@ class PlaywrightWebFallbackProvider:
                 )
 
             if (
-                target.target_type == "post"
+                target.target_type in {"thread", "post"}
                 and any(result.identity_verified for result in network_results)
                 and dom_result is not None
                 and not dom_result.identity_verified
+                and dom_result.status != "identity_unverified"
             ):
                 dom_result = None
 
@@ -1153,6 +1155,9 @@ class PlaywrightWebFallbackProvider:
         error_previous_html = None
         error_stable_since = None
         error_stable_samples = 0
+        thread_net_previous_html = None
+        thread_net_stable_since = None
+        thread_net_stable_samples = 0
         while loop.time() < page_deadline:
             if loop.time() >= task_deadline:
                 return "timeout"
@@ -1191,6 +1196,25 @@ class PlaywrightWebFallbackProvider:
                     return "ready"
                 if _page_content_unavailable_reason(page.url, html_text) is not None:
                     return "content_unavailable"
+                if target.target_type == "thread" and any(
+                    result.identity_verified for result in current_results
+                ):
+                    if html_text == thread_net_previous_html:
+                        thread_net_stable_samples += 1
+                    else:
+                        thread_net_previous_html = html_text
+                        thread_net_stable_since = loop.time()
+                        thread_net_stable_samples = 1
+                    if (
+                        thread_net_stable_samples >= _COMMENT_SELECTOR_STABLE_SAMPLES
+                        and thread_net_stable_since is not None
+                        and loop.time() - thread_net_stable_since >= _THREAD_NETWORK_READY_STABLE_SECONDS
+                    ):
+                        return "network_ready"
+                else:
+                    thread_net_previous_html = None
+                    thread_net_stable_since = None
+                    thread_net_stable_samples = 0
                 if page_pc_nonzero_error:
                     if html_text == error_previous_html:
                         error_stable_samples += 1

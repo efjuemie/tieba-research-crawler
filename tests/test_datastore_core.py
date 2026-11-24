@@ -1,19 +1,24 @@
 """DataStore 核心功能测试。"""
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from conftest import make_thread
+from conftest import make_post, make_thread
+from sqlalchemy import create_engine, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import InterfaceError
+from sqlalchemy.orm import Session
 from tiebameow.models.dto import BaseThreadDTO, ThreadDTO, ThreadUserDTO
+from tiebameow.models.orm import Base
+from tiebameow.models.orm import Post as BasePost
 
 from src.core.config import ConsumerConfig
 from src.core.datastore import DataStore
-from src.core.models import ResearchCheckpoint, ResearchTaskScope
+from src.core.models import PendingCommentScan, PendingThreadScan, ResearchCheckpoint, ResearchTaskScope
+from src.research.models import ResearchPost
 
 # ==================== Mock 类 ====================
 
@@ -1062,3 +1067,372 @@ async def test_complete_failed_comment_scope_from_parent_zero_reason_allowlist(
         assert scope.reason == "fresh_parent_api_explicit_zero"
         assert checkpoint.status == "completed"
         assert checkpoint.fid == 10
+
+
+class _LocalSQLiteTx:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self._tx = None
+
+    async def __aenter__(self):
+        self._tx = self._session.begin()
+        self._tx.__enter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        assert self._tx is not None
+        return self._tx.__exit__(exc_type, exc, traceback)
+
+
+class _LocalSQLiteAsyncSession:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        self._session.close()
+
+    def begin(self):
+        return _LocalSQLiteTx(self._session)
+
+    def get_bind(self):
+        return self._session.get_bind()
+
+    async def execute(self, statement):
+        return self._session.execute(statement)
+
+    async def scalar(self, statement):
+        return self._session.scalar(statement)
+
+    async def scalars(self, statement):
+        return self._session.scalars(statement)
+
+    async def get(self, entity, ident):
+        return self._session.get(entity, ident)
+
+    async def flush(self):
+        self._session.flush()
+
+
+class _LocalSQLiteSessionMaker:
+    def __init__(self, engine) -> None:
+        self._engine = engine
+
+    def __call__(self):
+        return _LocalSQLiteAsyncSession(Session(self._engine))
+
+
+def _make_local_sqlite_sessions(*tables):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine, tables=list(tables))
+    return engine, _LocalSQLiteSessionMaker(engine)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh", [False, True])
+async def test_ensure_research_task_scope_handles_concurrent_insert_conflict(refresh):
+    existing_scope = ResearchTaskScope(
+        run_id="run-1",
+        logical_task_key="thread_replies:101",
+        generation=0,
+        task_type="full_scan_posts",
+        scope_type="thread_replies",
+        fid=10,
+        fname="bar",
+        tid=101,
+        backfill=True,
+        rn=30,
+        status="pending",
+    )
+    session = SimpleNamespace(
+        add=lambda _obj: (_ for _ in ()).throw(AssertionError("session.add should not be used")),
+        flush=lambda: (_ for _ in ()).throw(AssertionError("session.flush should not be used")),
+        execute=lambda _stmt: None,
+    )
+    executed_statements = []
+
+    async def fake_execute(statement):
+        executed_statements.append(statement)
+        return SimpleNamespace(rowcount=0)
+
+    session.execute = fake_execute
+    datastore = DataStore.__new__(DataStore)
+    lock_calls = 0
+
+    async def fake_get_for_update(_session, _run_id, _key):
+        nonlocal lock_calls
+        lock_calls += 1
+        return None if lock_calls == 1 else existing_scope
+
+    datastore.get_research_task_scope_for_update = fake_get_for_update  # type: ignore[method-assign]
+
+    scope = await datastore._ensure_research_task_scope_in_session(
+        cast("Any", session),
+        run_id="run-1",
+        logical_task_key="thread_replies:101",
+        task_type="full_scan_posts",
+        scope_type="thread_replies",
+        fid=10,
+        fname="bar",
+        tid=101,
+        parent_pid=None,
+        parent_kind=None,
+        is_good=None,
+        backfill=True,
+        rn=30,
+        parent_logical_task_key=None,
+        parent_generation=None,
+        refresh=refresh,
+    )
+
+    assert scope is existing_scope
+    assert lock_calls == 2
+    assert len(executed_statements) == (2 if refresh else 1)
+    compiled_insert = str(executed_statements[0].compile(dialect=postgresql.dialect()))
+    assert "ON CONFLICT (run_id, logical_task_key) DO NOTHING" in compiled_insert
+    assert existing_scope.generation == (1 if refresh else 0)
+
+
+@pytest.mark.asyncio
+async def test_save_threads_and_pending_scans_deduplicates_duplicate_tids():
+    DataStore._cache = None
+    dummy_session = DummySession(existing_ids=set())
+    container = DummyContainer(dummy_session, DummyRedis())
+    datastore = DataStore(cast("Any", container))
+    datastore.cache = cast("Any", DummyCache())
+    scope_calls: list[dict[str, Any]] = []
+
+    async def fake_ensure(_session, **kwargs):
+        scope_calls.append(kwargs)
+        return SimpleNamespace(generation=0)
+
+    datastore._ensure_research_task_scope_in_session = fake_ensure  # type: ignore[method-assign]
+
+    first = make_thread(tid=321, reply_num=111)
+    latest = make_thread(tid=321, reply_num=222)
+    generations = await datastore.save_threads_and_pending_scans(
+        [first, latest],
+        backfill=True,
+        upsert_threads=True,
+        research_run_id="run-1",
+    )
+
+    assert generations == {321: 0}
+    assert len(scope_calls) == 1
+    assert len(dummy_session.statements) == 2
+    compiled = dummy_session.statements[0].compile(dialect=postgresql.dialect())  # type: ignore[attr-defined]
+    reply_nums = [
+        value
+        for key, value in compiled.params.items()
+        if key == "reply_num" or key.startswith("reply_num_m")
+    ]
+    assert reply_nums == [222]
+
+
+@pytest.mark.asyncio
+async def test_adopt_legacy_research_scopes_skips_other_run_managed_rows_and_adopts_unowned():
+    engine, sessions = _make_local_sqlite_sessions(
+        PendingThreadScan.__table__,
+        PendingCommentScan.__table__,
+        ResearchTaskScope.__table__,
+        ResearchCheckpoint.__table__,
+    )
+    try:
+        with Session(engine) as seed:
+            seed.add_all(
+                [
+                    ResearchTaskScope(
+                        run_id="run-old",
+                        logical_task_key="thread_replies:101",
+                        generation=0,
+                        task_type="full_scan_posts",
+                        scope_type="thread_replies",
+                        fid=10,
+                        fname="bar",
+                        tid=101,
+                        status="completed",
+                    ),
+                    ResearchTaskScope(
+                        run_id="run-old",
+                        logical_task_key="post_comments:101:201",
+                        generation=0,
+                        task_type="full_scan_comments",
+                        scope_type="post_comments",
+                        fid=10,
+                        fname="bar",
+                        tid=101,
+                        parent_pid=201,
+                        parent_logical_task_key="thread_replies:101",
+                        parent_generation=0,
+                        status="incomplete",
+                    ),
+                    PendingThreadScan(tid=101, fid=10, fname="bar", backfill=True),
+                    PendingThreadScan(tid=102, fid=10, fname="bar", backfill=True),
+                    PendingCommentScan(tid=101, pid=201, fid=10, fname="bar", backfill=True, task_kind="full"),
+                    PendingCommentScan(tid=103, pid=301, fid=10, fname="bar", backfill=True, task_kind="full"),
+                ]
+            )
+            seed.commit()
+
+        datastore = DataStore.__new__(DataStore)
+        datastore.async_sessionmaker = cast("Any", sessions)
+        await datastore.adopt_legacy_research_scopes("run-new", {10})
+
+        with Session(engine) as check:
+            adopted = {
+                (row.logical_task_key, row.status, row.parent_generation)
+                for row in check.scalars(
+                    select(ResearchTaskScope).where(ResearchTaskScope.run_id == "run-new")
+                ).all()
+            }
+        assert adopted == {
+            ("thread_replies:102", "pending", None),
+            ("thread_replies:103", "completed", None),
+            ("post_comments:103:301", "pending", 0),
+        }
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_get_research_comment_parent_dense_page_hint_uses_research_or_canonical_posts():
+    engine, sessions = _make_local_sqlite_sessions(
+        BasePost.__table__,
+        ResearchPost.__table__,
+    )
+    try:
+        observed = datetime.now(UTC)
+        with Session(engine) as seed:
+            # 12 canonical posts with floors up to 20 (sparse due to deletions)
+            for index in range(1, 13):
+                post_dto = make_post(pid=1000 + index, tid=9, fid=10, floor=index * 10, reply_num=0)
+                seed.add(BasePost.from_dto(post_dto))
+            # 7 research posts with floor <= 40 for tid=10 (rank 7 with rn=5 -> page 2)
+            for index in range(1, 8):
+                seed.add(
+                    ResearchPost(
+                        pid=2000 + index,
+                        tid=10,
+                        fid=10,
+                        fname="bar",
+                        floor=index * 5,
+                        source_api="aiotieba.get_posts",
+                        observed_at=observed,
+                        source_payload_json={},
+                        missing_reasons_json={},
+                    )
+                )
+            seed.commit()
+
+        datastore = DataStore.__new__(DataStore)
+        datastore.async_sessionmaker = cast("Any", sessions)
+
+        assert await datastore.get_research_comment_parent_dense_page_hint(10, 40, 5) == 2
+        assert await datastore.get_research_comment_parent_dense_page_hint(9, 100, 3) == 4
+        assert await datastore.get_research_comment_parent_dense_page_hint(999, 50, 30) is None
+        assert await datastore.get_research_comment_parent_dense_page_hint(9, 1, 30) == 1
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_page", "expected"),
+    [
+        (1, True),
+        (9, True),
+        (15, True),
+        (0, False),
+        (16, False),
+    ],
+)
+async def test_complete_failed_comment_scope_from_parent_zero_accepts_shifted_pages_within_bounds(
+    monkeypatch, parent_page, expected
+):
+    datastore = DataStore.__new__(DataStore)
+    scope = SimpleNamespace(
+        fid=10,
+        status="incomplete",
+        reason="PageIntegrityError",
+        last_checked=None,
+    )
+    checkpoint = SimpleNamespace(
+        status="failed",
+        scope_status="incomplete",
+        error_type="PageIntegrityError",
+        error_code=None,
+        reason="PageIntegrityError",
+        attempts=1,
+        has_more=None,
+        next_page=1,
+        total_pages=None,
+        reported_count=None,
+        reported_count_missing_reason=None,
+        page_item_count=None,
+        continuation_json={},
+        fid=None,
+        last_checked=None,
+    )
+    parent = SimpleNamespace(rn=30)
+
+    class _FakeSession:
+        def __call__(self):
+            return self
+
+        def begin(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args):
+            return None
+
+    async def fake_context(*_args, **_kwargs):
+        return (parent, scope, checkpoint)
+
+    async def fake_remove(*_args, **_kwargs):
+        return None
+
+    datastore.async_sessionmaker = _FakeSession()
+    monkeypatch.setattr(datastore, "_failed_comment_scope_context", fake_context)
+    monkeypatch.setattr(datastore, "remove_pending_comment_scan_in_session", fake_remove)
+
+    evidence: dict[str, object] = {
+        "tid": 9,
+        "pid": 101,
+        "fid": 10,
+        "author_user_id": 555,
+        "source_page": parent_page,
+        "reported_count": 0,
+        "count_field_present": True,
+        "source_api": "aiotieba.get_posts",
+        "evidence_kind": "protobuf_wire_explicit_zero",
+        "count_field_path": "data.post_list.sub_post_number",
+        "count_wire_field_number": 13,
+    }
+    completed = await datastore.complete_failed_comment_scope_from_parent_zero(
+        run_id="synthetic-run",
+        task_key="post_comments:9:101:g3",
+        tid=9,
+        parent_pid=101,
+        generation=3,
+        parent_generation=2,
+        fid=10,
+        parent_floor=443,
+        parent_rn=30,
+        parent_page=parent_page,
+        source_observed_at="2026-11-24T00:00:00+00:00",
+        current_failure={
+            "error_type": "PageIntegrityError",
+            "reason": "Comment detail empty response is missing or has zero page identity for page 1.",
+        },
+        evidence=evidence,
+    )
+
+    assert completed is expected

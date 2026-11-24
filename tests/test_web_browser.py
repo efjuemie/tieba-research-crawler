@@ -2633,3 +2633,40 @@ async def test_nonzero_page_pc_error_exits_fast_instead_of_timing_out(monkeypatc
         "ip_location_text": {"status": "not_tested", "reason": "response_error_code_nonzero"}
     }
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_with_verified_page_pc_and_missing_richtext_exits_fast_as_network_ready(monkeypatch):
+    monkeypatch.setattr(browser_module, "_THREAD_NETWORK_READY_STABLE_SECONDS", 0.02)
+    payload = json.loads(_page_pc_response())
+    payload["thread"]["author"] = {
+        "id": int(AUTHOR_ID),
+        "ip_address": "合成地区",
+        "user_growth": {"level_id": 5},
+    }
+    modern_thread_html = """
+    <html><body><div class="image-text">
+      <div class="pb-content-wrap"></div>
+      <div class="pc-pb-first-floor-interactive"></div>
+    </div></body></html>
+    """
+    page = FakePage(
+        html_text=modern_thread_html,
+        page_pc_response_text=json.dumps(payload, ensure_ascii=False),
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 0},
+    )
+    provider = _provider(FakeContext(lambda: page), timeout_seconds=1.0)
+
+    result = await provider.collect(
+        _thread_target(requested_fields=("ip_location_text", "global_growth_level", "reply_count"))
+    )
+
+    assert result.status == "ok"
+    assert result.identity_verified is True
+    assert result.diagnostics["pages"] == 1
+    assert result.field_outcomes == {}
+    by_field = {candidate.field_name: candidate for candidate in result.candidates}
+    assert by_field["ip_location_text"].normalized_value == "合成地区"
+    assert by_field["global_growth_level"].normalized_value == 5
+    assert by_field["reply_count"].normalized_value == 8
+    await provider.close()

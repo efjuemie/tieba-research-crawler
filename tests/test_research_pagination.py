@@ -998,6 +998,260 @@ async def test_failed_comment_identity_revalidation_rejects_unproven_parent_page
 
 
 @pytest.mark.asyncio
+async def test_failed_comment_revalidation_uses_dense_hint_on_shifted_thread():
+    post = make_post(pid=101, tid=9, fid=10, floor=443, reply_num=0)
+    evidence = {
+        "tid": 9,
+        "pid": post.pid,
+        "fid": 10,
+        "author_user_id": post.author_id,
+        "reported_count": 0,
+        "count_field_present": True,
+        "source_api": "aiotieba.get_posts",
+        "evidence_kind": "protobuf_wire_explicit_zero",
+        "source_page": 9,
+        "count_field_path": "data.post_list.sub_post_number",
+        "count_wire_field_number": 13,
+    }
+    response = ResearchPage(
+        raw=SimpleNamespace(),
+        dto=make_posts_response([post], current_page=9, total_page=10),
+        observed_at=datetime.now(UTC),
+        source_api="aiotieba.get_posts",
+        zero_comment_evidence={post.pid: evidence},
+    )
+    datastore = SimpleNamespace(
+        get_research_comment_parent_page_hint=AsyncMock(return_value=(443, 30)),
+        get_research_comment_parent_dense_page_hint=AsyncMock(return_value=9),
+        complete_failed_comment_scope_from_parent_zero=AsyncMock(return_value=True),
+    )
+    container = make_research_container(SimpleNamespace())
+    container.revalidate_failed_comment_page_zero = True
+    handler = FullScanCommentsTaskHandler(0, container, cast("Any", datastore), QueueRouter())
+    handler.get_posts = AsyncMock(return_value=FetchedPage(response=response, attempts=1))
+    task = FullScanCommentsTask(
+        tid=9,
+        pid=101,
+        run_id="synthetic-run",
+        generation=3,
+        parent_generation=2,
+        fid=10,
+    )
+
+    completed = await handler._revalidate_failed_comment_page_from_parent_zero(
+        task,
+        PageIntegrityError("Comment detail empty response is missing or has zero page identity for page 1."),
+        run_id="synthetic-run",
+        task_key="post_comments:9:101:g3",
+    )
+
+    assert completed is True
+    datastore.get_research_comment_parent_dense_page_hint.assert_awaited_once_with(9, 443, 30)
+    handler.get_posts.assert_awaited_once_with(9, 9, rn=30, with_comments=False)
+    completion = datastore.complete_failed_comment_scope_from_parent_zero.await_args.kwargs
+    assert completion["parent_page"] == 9
+    assert completion["parent_floor"] == 443
+    assert completion["evidence"] == evidence
+
+
+@pytest.mark.asyncio
+async def test_failed_comment_revalidation_binary_searches_shifted_pages_and_stops_when_crossed():
+    target_post = make_post(pid=101, tid=9, fid=10, floor=443, reply_num=0)
+    evidence = {
+        "tid": 9,
+        "pid": target_post.pid,
+        "fid": 10,
+        "author_user_id": target_post.author_id,
+        "reported_count": 0,
+        "count_field_present": True,
+        "source_api": "aiotieba.get_posts",
+        "evidence_kind": "protobuf_wire_explicit_zero",
+        "source_page": 8,
+        "count_field_path": "data.post_list.sub_post_number",
+        "count_wire_field_number": 13,
+    }
+    pages = {
+        10: FetchedPage(
+            response=ResearchPage(
+                raw=SimpleNamespace(),
+                dto=make_posts_response([make_post(pid=210, tid=9, fid=10, floor=460)], current_page=10, total_page=12),
+                observed_at=datetime.now(UTC),
+                source_api="aiotieba.get_posts",
+            ),
+            attempts=1,
+        ),
+        5: FetchedPage(
+            response=ResearchPage(
+                raw=SimpleNamespace(),
+                dto=make_posts_response([make_post(pid=205, tid=9, fid=10, floor=300)], current_page=5, total_page=12),
+                observed_at=datetime.now(UTC),
+                source_api="aiotieba.get_posts",
+            ),
+            attempts=1,
+        ),
+        7: FetchedPage(
+            response=ResearchPage(
+                raw=SimpleNamespace(),
+                dto=make_posts_response([make_post(pid=207, tid=9, fid=10, floor=430)], current_page=7, total_page=12),
+                observed_at=datetime.now(UTC),
+                source_api="aiotieba.get_posts",
+            ),
+            attempts=1,
+        ),
+        8: FetchedPage(
+            response=ResearchPage(
+                raw=SimpleNamespace(),
+                dto=make_posts_response([target_post], current_page=8, total_page=12),
+                observed_at=datetime.now(UTC),
+                source_api="aiotieba.get_posts",
+                zero_comment_evidence={target_post.pid: evidence},
+            ),
+            attempts=1,
+        ),
+    }
+
+    async def fake_get_posts(_tid, pn, **_kwargs):
+        return pages[pn]
+
+    datastore = SimpleNamespace(
+        get_research_comment_parent_page_hint=AsyncMock(return_value=(443, 30)),
+        get_research_comment_parent_dense_page_hint=AsyncMock(return_value=10),
+        complete_failed_comment_scope_from_parent_zero=AsyncMock(return_value=True),
+    )
+    container = make_research_container(SimpleNamespace())
+    container.revalidate_failed_comment_page_zero = True
+    handler = FullScanCommentsTaskHandler(0, container, cast("Any", datastore), QueueRouter())
+    handler.get_posts = AsyncMock(side_effect=fake_get_posts)
+    task = FullScanCommentsTask(
+        tid=9,
+        pid=101,
+        run_id="synthetic-run",
+        generation=3,
+        parent_generation=2,
+        fid=10,
+    )
+
+    completed = await handler._revalidate_failed_comment_page_from_parent_zero(
+        task,
+        PageIntegrityError("Comment detail empty response is not a confirmed terminal page for page 1."),
+        run_id="synthetic-run",
+        task_key="post_comments:9:101:g3",
+    )
+
+    assert completed is True
+    assert [call_args.args[1] for call_args in handler.get_posts.await_args_list] == [10, 5, 7, 8]
+    assert datastore.complete_failed_comment_scope_from_parent_zero.await_args.kwargs["parent_page"] == 8
+
+    # Stop immediately when the page floor range brackets parent_floor without matching pid.
+    crossed_page = FetchedPage(
+        response=ResearchPage(
+            raw=SimpleNamespace(),
+            dto=make_posts_response(
+                [
+                    make_post(pid=301, tid=9, fid=10, floor=420),
+                    make_post(pid=302, tid=9, fid=10, floor=460),
+                ],
+                current_page=9,
+                total_page=10,
+            ),
+            observed_at=datetime.now(UTC),
+            source_api="aiotieba.get_posts",
+        ),
+        attempts=1,
+    )
+    crossed_store = SimpleNamespace(
+        get_research_comment_parent_page_hint=AsyncMock(return_value=(443, 30)),
+        get_research_comment_parent_dense_page_hint=AsyncMock(return_value=9),
+        complete_failed_comment_scope_from_parent_zero=AsyncMock(return_value=True),
+    )
+    crossed_handler = FullScanCommentsTaskHandler(0, container, cast("Any", crossed_store), QueueRouter())
+    crossed_handler.get_posts = AsyncMock(return_value=crossed_page)
+
+    crossed_completed = await crossed_handler._revalidate_failed_comment_page_from_parent_zero(
+        task,
+        PageIntegrityError("Comment detail empty response is missing or has zero page identity for page 1."),
+        run_id="synthetic-run",
+        task_key="post_comments:9:101:g3",
+    )
+
+    assert crossed_completed is False
+    crossed_handler.get_posts.assert_awaited_once_with(9, 9, rn=30, with_comments=False)
+    crossed_store.complete_failed_comment_scope_from_parent_zero.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_comment_revalidation_recovers_from_over_range_page_integrity_error():
+    target_post = make_post(pid=101, tid=9, fid=10, floor=443, reply_num=0)
+    evidence = {
+        "tid": 9,
+        "pid": target_post.pid,
+        "fid": 10,
+        "author_user_id": target_post.author_id,
+        "reported_count": 0,
+        "count_field_present": True,
+        "source_api": "aiotieba.get_posts",
+        "evidence_kind": "protobuf_wire_explicit_zero",
+        "source_page": 8,
+        "count_field_path": "data.post_list.sub_post_number",
+        "count_wire_field_number": 13,
+    }
+    page_seven = FetchedPage(
+        response=ResearchPage(
+            raw=SimpleNamespace(),
+            dto=make_posts_response([make_post(pid=207, tid=9, fid=10, floor=400)], current_page=7, total_page=8),
+            observed_at=datetime.now(UTC),
+            source_api="aiotieba.get_posts",
+        ),
+        attempts=1,
+    )
+    valid_page = FetchedPage(
+        response=ResearchPage(
+            raw=SimpleNamespace(),
+            dto=make_posts_response([target_post], current_page=8, total_page=8),
+            observed_at=datetime.now(UTC),
+            source_api="aiotieba.get_posts",
+            zero_comment_evidence={target_post.pid: evidence},
+        ),
+        attempts=1,
+    )
+
+    async def fake_get_posts(_tid, pn, **_kwargs):
+        if pn == 15:
+            raise PageIntegrityError("Post page empty response is not a confirmed terminal page for page 15.")
+        if pn == 7:
+            return page_seven
+        return valid_page
+
+    datastore = SimpleNamespace(
+        get_research_comment_parent_page_hint=AsyncMock(return_value=(443, 30)),
+        complete_failed_comment_scope_from_parent_zero=AsyncMock(return_value=True),
+    )
+    container = make_research_container(SimpleNamespace())
+    container.revalidate_failed_comment_page_zero = True
+    handler = FullScanCommentsTaskHandler(0, container, cast("Any", datastore), QueueRouter())
+    handler.get_posts = AsyncMock(side_effect=fake_get_posts)
+    task = FullScanCommentsTask(
+        tid=9,
+        pid=101,
+        run_id="synthetic-run",
+        generation=3,
+        parent_generation=2,
+        fid=10,
+    )
+
+    completed = await handler._revalidate_failed_comment_page_from_parent_zero(
+        task,
+        PageIntegrityError("Comment detail empty response is missing or has zero page identity for page 1."),
+        run_id="synthetic-run",
+        task_key="post_comments:9:101:g3",
+    )
+
+    assert completed is True
+    assert [call_args.args[1] for call_args in handler.get_posts.await_args_list] == [15, 7, 8]
+    assert datastore.complete_failed_comment_scope_from_parent_zero.await_args.kwargs["parent_page"] == 8
+
+
+@pytest.mark.asyncio
 async def test_positive_comment_page_does_not_trigger_parent_zero_revalidation():
     comments = [make_comment(cid=1000 + index, pid=101, tid=9) for index in range(5)]
     response = SimpleNamespace(dto=make_comments_response(comments), source_api=None)
