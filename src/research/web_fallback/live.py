@@ -61,9 +61,17 @@ async def enqueue_missing_web_targets(
     return tuple(summaries)
 
 
-async def discover_missing_web_targets(sessions: Any, run_ids: Sequence[str]) -> int:
+async def discover_missing_web_targets(
+    sessions: Any,
+    run_ids: Sequence[str],
+    *,
+    min_thread_create_time: datetime | None = None,
+) -> int:
     """Rescan persisted canonical rows after API producers stop or at startup."""
     created = 0
+    extra_kwargs: dict[str, Any] = (
+        {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
+    )
     for run_id in tuple(dict.fromkeys(run_ids)):
         for target_type in ("thread", "post", "comment"):
             summary = await enqueue_web_enrichment_tasks(
@@ -73,6 +81,7 @@ async def discover_missing_web_targets(sessions: Any, run_ids: Sequence[str]) ->
                 target_type=target_type,
                 only_missing_fields=True,
                 pair_growth_fields=True,
+                **extra_kwargs,
             )
             created += summary.created_count
     return created

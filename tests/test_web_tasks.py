@@ -1,8 +1,9 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from conftest import make_thread
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 from tiebameow.models.orm import Base
 from tiebameow.models.orm import Forum as BaseForum
@@ -20,6 +21,8 @@ from src.research.models import (
     ResearchWebEnrichmentFailure,
     ResearchWebEnrichmentTask,
 )
+from src.research.web_fallback import service as web_service_mod
+from src.research.web_fallback import tasks as web_tasks_mod
 from src.research.web_fallback.reconcile import fail_web_enrichment_task
 from src.research.web_fallback.tasks import (
     _field_outcome_resolved,
@@ -1479,3 +1482,354 @@ async def test_lease_web_enrichment_tasks_filters_by_min_thread_create_time():
         limit=10,
     )
     assert [lease.tid for lease in unfiltered] == [1001]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_web_enrichment_tasks_scopes_by_target_ids_and_min_thread_create_time():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            BaseForum.__table__,
+            BaseThread.__table__,
+            ResearchRun.__table__,
+            ResearchTaskScope.__table__,
+            *RESEARCH_TABLES,
+        ],
+    )
+    maker = _AsyncSessionMaker(engine)
+    cutoff = datetime(2021, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+    with Session(engine) as session, session.begin():
+        session.add(BaseForum(fid=7654321, fname="synthetic"))
+        session.add(
+            ResearchRun(
+                run_id="run-scope-narrow",
+                mode="reply_backfill",
+                scope_key="7654321",
+                forums_json=[{"fid": 7654321, "fname": "synthetic"}],
+                status="running",
+            )
+        )
+        session.add_all(
+            [
+                BaseThread.from_dto(
+                    make_thread(
+                        tid=1001,
+                        fid=7654321,
+                        fname="synthetic",
+                        create_time=datetime(2020, 12, 31, 23, 59, 59, tzinfo=SHANGHAI_TZ),
+                    )
+                ),
+                BaseThread.from_dto(
+                    make_thread(
+                        tid=1002,
+                        fid=7654321,
+                        fname="synthetic",
+                        create_time=cutoff,
+                    )
+                ),
+            ]
+        )
+        session.add_all(
+            [
+                ResearchThread(
+                    tid=1001,
+                    first_pid=2100,
+                    fid=7654321,
+                    title="old",
+                    author_user_id=501,
+                    author_portrait="p1",
+                    source_api="aiotieba.get_posts",
+                    observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchThread(
+                    tid=1002,
+                    first_pid=2200,
+                    fid=7654321,
+                    title="new",
+                    author_user_id=502,
+                    author_portrait="p2",
+                    source_api="aiotieba.get_posts",
+                    observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchPost(
+                    pid=2101,
+                    tid=1001,
+                    fid=7654321,
+                    floor=2,
+                    author_user_id=501,
+                    author_portrait="p1",
+                    source_api="aiotieba.get_posts",
+                    observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchPost(
+                    pid=2201,
+                    tid=1002,
+                    fid=7654321,
+                    floor=2,
+                    author_user_id=502,
+                    author_portrait="p2",
+                    source_api="aiotieba.get_posts",
+                    observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchComment(
+                    cid=3101,
+                    tid=1001,
+                    parent_post_pid=2101,
+                    fid=7654321,
+                    author_user_id=501,
+                    author_portrait="p1",
+                    source_api="aiotieba.get_comments",
+                    observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchComment(
+                    cid=3201,
+                    tid=1002,
+                    parent_post_pid=2201,
+                    fid=7654321,
+                    author_user_id=502,
+                    author_portrait="p2",
+                    source_api="aiotieba.get_comments",
+                    observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchTaskScope(
+                    run_id="run-scope-narrow",
+                    logical_task_key="thread_replies:1001",
+                    generation=0,
+                    task_type="posts",
+                    scope_type="thread_replies",
+                    fid=7654321,
+                    tid=1001,
+                    status="completed",
+                ),
+                ResearchTaskScope(
+                    run_id="run-scope-narrow",
+                    logical_task_key="thread_replies:1002",
+                    generation=0,
+                    task_type="posts",
+                    scope_type="thread_replies",
+                    fid=7654321,
+                    tid=1002,
+                    status="completed",
+                ),
+                ResearchTaskScope(
+                    run_id="run-scope-narrow",
+                    logical_task_key="post_comments:1001:2101",
+                    generation=0,
+                    task_type="comments",
+                    scope_type="post_comments",
+                    fid=7654321,
+                    tid=1001,
+                    parent_pid=2101,
+                    parent_generation=0,
+                    status="completed",
+                ),
+                ResearchTaskScope(
+                    run_id="run-scope-narrow",
+                    logical_task_key="post_comments:1002:2201",
+                    generation=0,
+                    task_type="comments",
+                    scope_type="post_comments",
+                    fid=7654321,
+                    tid=1002,
+                    parent_pid=2201,
+                    parent_generation=0,
+                    status="completed",
+                ),
+                ResearchTaskScope(
+                    run_id="run-scope-narrow",
+                    logical_task_key="post_comments:1002:2202",
+                    generation=0,
+                    task_type="comments",
+                    scope_type="post_comments",
+                    fid=7654321,
+                    tid=1002,
+                    parent_pid=2202,
+                    parent_generation=0,
+                    status="completed",
+                ),
+            ]
+        )
+
+    scope_queries: list[tuple[str, object]] = []
+
+    def _capture_sql(_conn, _cursor, statement, parameters, _context, _executemany):
+        if "FROM research_task_scope" in statement:
+            scope_queries.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", _capture_sql)
+    try:
+        post_summary = await enqueue_web_enrichment_tasks(
+            maker,
+            "run-scope-narrow",
+            ["ip_location_text"],
+            target_type="post",
+            target_ids=[2201],
+            only_missing_fields=True,
+        )
+        assert post_summary.created_count == 1
+        assert [p.target_id for p in post_summary.planned_targets] == [2201]
+        assert len(scope_queries) == 1
+        post_sql, post_params = scope_queries[0]
+        assert "research_task_scope.tid IN" in post_sql
+        assert "research_task_scope.scope_type =" in post_sql
+        assert "post_comments" not in str(post_params)
+        assert 1002 in post_params
+        assert 1001 not in post_params
+
+        scope_queries.clear()
+        comment_summary = await enqueue_web_enrichment_tasks(
+            maker,
+            "run-scope-narrow",
+            ["ip_location_text"],
+            target_type="comment",
+            target_ids=[3201],
+            only_missing_fields=True,
+        )
+        assert comment_summary.created_count == 1
+        assert [p.target_id for p in comment_summary.planned_targets] == [3201]
+        assert len(scope_queries) == 1
+        comment_sql, comment_params = scope_queries[0]
+        assert "research_task_scope.tid IN" in comment_sql
+        assert "research_task_scope.parent_pid IN" in comment_sql
+        assert 1002 in comment_params
+        assert 2201 in comment_params
+        assert 2202 not in comment_params
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture_sql)
+
+    filtered_discovery = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-scope-narrow",
+        ["ip_location_text"],
+        only_missing_fields=True,
+        min_thread_create_time=cutoff,
+    )
+    assert all(plan.tid == 1002 for plan in filtered_discovery.planned_targets)
+    assert filtered_discovery.created_count == 1  # only thread 1002 is newly created; 2201 & 3201 already exist
+
+
+@pytest.mark.asyncio
+async def test_enqueue_web_enrichment_tasks_bulk_skips_noop_existing_tasks_and_keeps_transitions(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(
+        engine,
+        tables=[ResearchRun.__table__, ResearchTaskScope.__table__, *RESEARCH_TABLES],
+    )
+    maker = _AsyncSessionMaker(engine)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    with Session(engine) as session, session.begin():
+        session.add(
+            ResearchRun(
+                run_id="run-bulk-dedup",
+                mode="backfill",
+                scope_key="7654321",
+                forums_json=[{"fid": 7654321, "fname": "synthetic"}],
+                status="completed",
+            )
+        )
+        session.add(
+            ResearchTaskScope(
+                run_id="run-bulk-dedup",
+                logical_task_key="thread_replies:1001",
+                generation=0,
+                task_type="posts",
+                scope_type="thread_replies",
+                fid=7654321,
+                tid=1001,
+                status="completed",
+            )
+        )
+        for pid, floor in ((2101, 2), (2102, 3), (2103, 4)):
+            session.add(
+                ResearchPost(
+                    pid=pid,
+                    tid=1001,
+                    fid=7654321,
+                    floor=floor,
+                    author_user_id=501 + floor,
+                    author_portrait=f"p{floor}",
+                    source_api="aiotieba.get_posts",
+                    observed_at=now,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                )
+            )
+
+    first = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-bulk-dedup",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101, 2102, 2103],
+        only_missing_fields=True,
+    )
+    assert first.created_count == 3
+
+    key_2101, key_2102, key_2103 = first.task_keys
+    with Session(engine) as session, session.begin():
+        # 2101 stays pending_web; 2102 needs pending_api_detail -> pending_web;
+        # 2103 needs completed -> pending_web.
+        session.get(ResearchWebEnrichmentTask, key_2102).status = "pending_api_detail"
+        task_2103 = session.get(ResearchWebEnrichmentTask, key_2103)
+        task_2103.status = "completed"
+        task_2103.completed_at = now
+
+    persisted_target_ids: list[int] = []
+    original_persist = web_tasks_mod._persist_enqueued_task
+
+    async def spy_persist(session_maker, task, **kwargs):
+        persisted_target_ids.append(task["target_id"])
+        return await original_persist(session_maker, task, **kwargs)
+
+    monkeypatch.setattr(web_tasks_mod, "_persist_enqueued_task", spy_persist)
+
+    second = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-bulk-dedup",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101, 2102, 2103],
+        only_missing_fields=True,
+    )
+    assert second.created_count == 0
+    assert second.deduplicated_count == 3
+    assert persisted_target_ids == [2102, 2103]
+    with Session(engine) as session:
+        assert session.get(ResearchWebEnrichmentTask, key_2101).status == "pending_web"
+        assert session.get(ResearchWebEnrichmentTask, key_2102).status == "pending_web"
+        assert session.get(ResearchWebEnrichmentTask, key_2103).status == "pending_web"
+
+
+@pytest.mark.asyncio
+async def test_lease_web_enrichment_tasks_default_lease_and_worker_lease_sizing(research_db):
+    _engine, maker = research_db
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="thread",
+        target_ids=[1001],
+        only_missing_fields=True,
+    )
+    assert summary.created_count == 1
+    now = datetime(2026, 1, 2, 0, 0, tzinfo=UTC)
+    leases = await lease_web_enrichment_tasks(maker, "run-web-001", "lease-default-check", now=now)
+    assert len(leases) == 1
+    with Session(_engine) as session:
+        task = session.get(ResearchWebEnrichmentTask, summary.task_keys[0])
+        assert task.lease_until.replace(tzinfo=UTC) == now + timedelta(seconds=240)
+    assert web_service_mod._web_lease_seconds(SimpleNamespace(timeout_seconds=90.0)) == 240
+    assert web_service_mod._web_lease_seconds(SimpleNamespace(timeout_seconds=180.0)) == 300

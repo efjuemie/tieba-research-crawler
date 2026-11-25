@@ -501,16 +501,24 @@ async def _process_durable_web_lease(
     return task_status, result
 
 
+def _web_lease_seconds(browser_config: Any | None) -> int:
+    timeout_seconds = float(getattr(browser_config, "timeout_seconds", 90.0) or 90.0)
+    return max(240, int(timeout_seconds) + 120)
+
+
 async def _lease_one_web_task(
     sessions: Any,
     run_ids: Sequence[str],
     worker_id: str,
     *,
     min_thread_create_time: datetime | None = None,
+    lease_seconds: int | None = None,
 ):
-    extra_kwargs: dict[str, Any] = (
-        {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
-    )
+    extra_kwargs: dict[str, Any] = {}
+    if min_thread_create_time is not None:
+        extra_kwargs["min_thread_create_time"] = min_thread_create_time
+    if lease_seconds is not None:
+        extra_kwargs["lease_seconds"] = lease_seconds
     for run_id in run_ids:
         leases = await lease_web_enrichment_tasks(
             sessions,
@@ -1008,6 +1016,10 @@ async def run_live_web_fallback_worker(
     extra_filter_kwargs: dict[str, Any] = (
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
+    lease_seconds = _web_lease_seconds(browser_config)
+    lease_kwargs = dict(extra_filter_kwargs)
+    if lease_seconds > 240:
+        lease_kwargs["lease_seconds"] = lease_seconds
     try:
         while not stop_event.is_set() and not (
             api_done_event is not None and api_done_event.is_set()
@@ -1018,7 +1030,7 @@ async def run_live_web_fallback_worker(
                 sessions,
                 current_run_ids,
                 "live-web-fallback",
-                **extra_filter_kwargs,
+                **lease_kwargs,
             )
             if lease is None:
                 if api_done_event is not None and api_done_event.is_set():

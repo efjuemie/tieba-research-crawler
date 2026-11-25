@@ -1272,7 +1272,11 @@ async def main(
                 discovery_error = error
                 logger.exception("WEB startup discovery failed: {}", error)
         try:
-            created = await discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids)
+            created = await discover_missing_web_targets(
+                datastore.async_sessionmaker,
+                web_run_ids,
+                **extra_filter_kwargs,
+            )
             if created:
                 logger.info("Queued {} missing metadata targets after API producers stopped.", created)
         except Exception as error:
@@ -1436,7 +1440,11 @@ async def main(
             web_worker_task.add_done_callback(_report_web_worker_exit)
             tasks.append(web_worker_task)
             web_discovery_task = asyncio.create_task(
-                discover_missing_web_targets(datastore.async_sessionmaker, web_run_ids),
+                discover_missing_web_targets(
+                    datastore.async_sessionmaker,
+                    web_run_ids,
+                    **extra_filter_kwargs,
+                ),
                 name="web-startup-discovery",
             )
             tasks.append(web_discovery_task)

@@ -186,3 +186,20 @@ async def test_discovery_rescans_only_selected_runs_and_paired_missing_fields(mo
     ]
     assert all(fields == live.MISSING_CONTENT_FIELDS for _run_id, fields, _kwargs in calls)
     assert all(kwargs["only_missing_fields"] and kwargs["pair_growth_fields"] for _run_id, _fields, kwargs in calls)
+    assert all("min_thread_create_time" not in kwargs for _run_id, _fields, kwargs in calls)
+
+
+@pytest.mark.asyncio
+async def test_discovery_forwards_min_thread_create_time_only_when_set(monkeypatch):
+    calls = []
+
+    async def enqueue(_sessions, run_id, fields, **kwargs):
+        calls.append((run_id, fields, kwargs))
+        return SimpleNamespace(created_count=0)
+
+    monkeypatch.setattr(live, "enqueue_web_enrichment_tasks", enqueue)
+    cutoff = datetime(2021, 1, 1, 0, 0, tzinfo=UTC)
+    await live.discover_missing_web_targets(object(), ("run-a",), min_thread_create_time=cutoff)
+
+    assert len(calls) == 3
+    assert all(kwargs["min_thread_create_time"] == cutoff for _run_id, _fields, kwargs in calls)

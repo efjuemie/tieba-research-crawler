@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import operator
@@ -667,6 +668,23 @@ async def _persist_enqueued_task(
         return False, True, task["task_key"]
 
 
+def _is_noop_existing_web_task(
+    existing_status: str,
+    existing_error: str | None,
+    existing_error_type: str | None,
+    *,
+    planned_status: str,
+    only_missing_fields: bool,
+) -> bool:
+    if existing_status == "pending_web":
+        return existing_error is None and existing_error_type is None
+    if existing_status in {"pending_api_detail", "partially_completed"}:
+        return planned_status != "pending_web"
+    if existing_status == "completed":
+        return not (planned_status == "pending_web" and only_missing_fields)
+    return True
+
+
 async def enqueue_web_enrichment_tasks(
     async_sessionmaker_: async_sessionmaker,
     run_id: str,
@@ -683,6 +701,7 @@ async def enqueue_web_enrichment_tasks(
     max_attempts: int = 3,
     only_missing_fields: bool = False,
     pair_growth_fields: bool = False,
+    min_thread_create_time: datetime | None = None,
 ) -> EnqueueSummary:
     """Create deduplicated field tasks only for content represented in this run.
 
@@ -716,22 +735,100 @@ async def enqueue_web_enrichment_tasks(
         run = await session.get(ResearchRun, run_id)
         if run is None:
             raise ValueError(f"Unknown research run: {run_id}.")
+        if ids is not None and not ids:
+            return EnqueueSummary(run_id, 0, 0, 0, skipped, (), ())
         use_postgres_array = session.get_bind().dialect.name == "postgresql"
+
+        required_scope_types = (
+            ("thread_replies",) if target_type in {"thread", "post"} else ("thread_replies", "post_comments")
+        )
+        scoped_tids: set[int] | None = {tid_filter} if tid_filter is not None else None
+        scoped_parent_pids: set[int] | None = None
+        if scoped_tids is None and ids is not None and target_type is not None:
+            if target_type == "thread":
+                scoped_tids = set(ids)
+            elif target_type == "post":
+                post_tids_stmt = select(ResearchPost.tid).distinct().where(
+                    _membership_predicate(ResearchPost.pid, ids, use_postgres_array=use_postgres_array)
+                )
+                if fid is not None:
+                    post_tids_stmt = post_tids_stmt.where(ResearchPost.fid == fid)
+                scoped_tids = {
+                    int(value) for value in (await session.scalars(post_tids_stmt)).all() if value is not None
+                }
+            else:
+                comment_pairs_stmt = select(ResearchComment.tid, ResearchComment.parent_post_pid).distinct().where(
+                    _membership_predicate(ResearchComment.cid, ids, use_postgres_array=use_postgres_array)
+                )
+                if fid is not None:
+                    comment_pairs_stmt = comment_pairs_stmt.where(ResearchComment.fid == fid)
+                if parent_pid_filter is not None:
+                    comment_pairs_stmt = comment_pairs_stmt.where(
+                        ResearchComment.parent_post_pid == parent_pid_filter
+                    )
+                comment_pairs = (await session.execute(comment_pairs_stmt)).all()
+                scoped_tids = {int(pair[0]) for pair in comment_pairs if pair[0] is not None}
+                scoped_parent_pids = {int(pair[1]) for pair in comment_pairs if pair[1] is not None}
+
+        if scoped_tids is not None and not scoped_tids:
+            return EnqueueSummary(run_id, 0, 0, 0, skipped, (), ())
+        if parent_pid_filter is not None:
+            scoped_parent_pids = (
+                {parent_pid_filter}
+                if scoped_parent_pids is None
+                else scoped_parent_pids & {parent_pid_filter}
+            )
+            if not scoped_parent_pids:
+                return EnqueueSummary(run_id, 0, 0, 0, skipped, (), ())
+
+        scope_filters: list[Any] = [ResearchTaskScope.run_id == run_id]
+        if scoped_tids is not None:
+            scope_filters.append(
+                _membership_predicate(
+                    ResearchTaskScope.tid,
+                    sorted(scoped_tids),
+                    use_postgres_array=use_postgres_array,
+                )
+            )
+        if min_thread_create_time is not None:
+            scope_filters.append(
+                ~exists(
+                    select(1).where(
+                        Thread.tid == ResearchTaskScope.tid,
+                        Thread.create_time.is_not(None),
+                        Thread.create_time < min_thread_create_time,
+                    )
+                )
+            )
+        if required_scope_types == ("thread_replies",):
+            scope_filters.append(ResearchTaskScope.scope_type == "thread_replies")
+        elif scoped_parent_pids is not None:
+            scope_filters.append(
+                (ResearchTaskScope.scope_type == "thread_replies")
+                | (
+                    (ResearchTaskScope.scope_type == "post_comments")
+                    & _membership_predicate(
+                        ResearchTaskScope.parent_pid,
+                        sorted(scoped_parent_pids),
+                        use_postgres_array=use_postgres_array,
+                    )
+                )
+            )
+        else:
+            scope_filters.append(ResearchTaskScope.scope_type.in_(required_scope_types))
 
         scope_rows = (
             await session.scalars(
                 select(ResearchTaskScope)
-                .where(
-                    ResearchTaskScope.run_id == run_id,
-                    ResearchTaskScope.scope_type.in_(("thread_replies", "post_comments")),
-                    *([ResearchTaskScope.tid == tid_filter] if tid_filter is not None else []),
-                )
+                .where(*scope_filters)
                 .order_by(ResearchTaskScope.logical_task_key)
             )
         ).all()
         thread_scopes: dict[int, ResearchTaskScope] = {}
         comment_scopes: dict[tuple[int, int], ResearchTaskScope] = {}
-        for scope in scope_rows:
+        for idx, scope in enumerate(scope_rows):
+            if idx and idx % 500 == 0:
+                await asyncio.sleep(0)
             if scope.tid is None:
                 continue
             if scope.scope_type == "thread_replies":
@@ -752,6 +849,8 @@ async def enqueue_web_enrichment_tasks(
             if target_type is not None and set(requested) - _target_fields(current_type):
                 raise ValueError(f"Some requested fields are unsupported for {current_type}.")
             valid_tids = sorted(thread_scopes)
+            if not valid_tids:
+                continue
             stmt = None
             if current_type == "thread":
                 stmt = select(ResearchThread).where(
@@ -786,6 +885,8 @@ async def enqueue_web_enrichment_tasks(
                     if scope.tid in thread_scopes
                     and scope.parent_generation == thread_scopes[scope.tid].generation
                 ]
+                if not possible_parent_scopes:
+                    continue
                 tids = sorted({scope.tid for scope in possible_parent_scopes})
                 pids = sorted({scope.parent_pid for scope in possible_parent_scopes if scope.parent_pid is not None})
                 stmt = select(ResearchComment).where(
@@ -829,7 +930,9 @@ async def enqueue_web_enrichment_tasks(
                 ).all()
                 content_markers = {marker.owner_id: marker for marker in marker_rows}
 
-            for row in entities:
+            for idx, row in enumerate(entities):
+                if idx and idx % 500 == 0:
+                    await asyncio.sleep(0)
                 target_tid = row.tid
                 thread_scope = thread_scopes.get(target_tid)
                 if thread_scope is None:
@@ -966,10 +1069,50 @@ async def enqueue_web_enrichment_tasks(
             )
 
         dialect = session.get_bind().dialect.name
+    existing_by_key: dict[str, tuple[str, str | None, str | None]] = {}
+    planned_keys = [task["task_key"] for task in planned]
+    for chunk_start in range(0, len(planned_keys), 500):
+        key_chunk = planned_keys[chunk_start : chunk_start + 500]
+        async with async_sessionmaker_() as session:
+            existing_rows = (
+                await session.execute(
+                    select(
+                        ResearchWebEnrichmentTask.task_key,
+                        ResearchWebEnrichmentTask.status,
+                        ResearchWebEnrichmentTask.last_error,
+                        ResearchWebEnrichmentTask.last_error_type,
+                    ).where(
+                        _membership_predicate(
+                            ResearchWebEnrichmentTask.task_key,
+                            key_chunk,
+                            use_postgres_array=use_postgres_array,
+                        )
+                    )
+                )
+            ).all()
+        for existing_key, existing_status, existing_error, existing_error_type in existing_rows:
+            existing_by_key[existing_key] = (existing_status, existing_error, existing_error_type)
+        if chunk_start + 500 < len(planned_keys):
+            await asyncio.sleep(0)
+
     created = 0
     deduplicated = 0
     task_keys: list[str] = []
-    for task in planned:
+    for idx, task in enumerate(planned):
+        existing_info = existing_by_key.get(task["task_key"])
+        if existing_info is not None and _is_noop_existing_web_task(
+            existing_info[0],
+            existing_info[1],
+            existing_info[2],
+            planned_status=task["status"],
+            only_missing_fields=only_missing_fields,
+        ):
+            task["status"] = existing_info[0]
+            deduplicated += 1
+            task_keys.append(task["task_key"])
+            if (idx + 1) % 500 == 0:
+                await asyncio.sleep(0)
+            continue
         was_created, was_deduplicated, task_key = await _persist_enqueued_task(
             async_sessionmaker_,
             task,
@@ -980,6 +1123,8 @@ async def enqueue_web_enrichment_tasks(
         created += was_created
         deduplicated += was_deduplicated
         task_keys.append(task_key)
+        if (idx + 1) % 500 == 0:
+            await asyncio.sleep(0)
 
     plans = _planned_targets(planned)
 
@@ -1050,7 +1195,7 @@ async def lease_web_enrichment_tasks(
     worker_id: str,
     *,
     limit: int = 1,
-    lease_seconds: int = 120,
+    lease_seconds: int = 240,
     task_keys: Sequence[str] | None = None,
     now: datetime | None = None,
     min_thread_create_time: datetime | None = None,
