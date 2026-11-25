@@ -15,6 +15,7 @@ from .tasks import EnqueueSummary, enqueue_web_enrichment_tasks
 if TYPE_CHECKING:
     import asyncio
     from collections.abc import Sequence
+    from datetime import datetime
     from typing import Any
 
 MISSING_CONTENT_FIELDS = (
@@ -145,11 +146,15 @@ async def run_live_web_worker(
     browser_profile: str,
     request_budget: Any | None = None,
     browser_config: Any | None = None,
+    min_thread_create_time: datetime | None = None,
 ) -> Any:
     """Run WEB work alongside API producers, then drain only on normal API completion."""
     from .service import run_live_web_fallback_worker
 
     stable_run_ids = tuple(dict.fromkeys(run_ids))
+    extra_kwargs: dict[str, Any] = (
+        {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
+    )
     return await run_live_web_fallback_worker(
         sessions,
         lambda: stable_run_ids,
@@ -160,6 +165,7 @@ async def run_live_web_worker(
         browser_config=browser_config,
         headed=True,
         wait_for_login=True,
+        **extra_kwargs,
     )
 
 

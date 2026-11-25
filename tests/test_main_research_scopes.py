@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from tiebameow.utils.time_utils import SHANGHAI_TZ
 
 import main as app_main
 from main import _dispatch_pending_comment_scopes, _recover_pending_tasks
@@ -428,3 +430,68 @@ async def test_reply_backfill_prepares_separate_run_only_with_research_enabled()
             run_id=None,
         )
     assert datastore.start_args is None
+
+
+def test_min_thread_create_time_conversion_and_validation():
+    assert app_main._min_thread_create_time(None) is None
+    assert app_main._min_thread_create_time(2021) == datetime(2021, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+    for bad_year in (1989, 2101):
+        with pytest.raises(ValueError, match="between 1990 and 2100"):
+            app_main._min_thread_create_time(bad_year)
+
+
+@pytest.mark.asyncio
+async def test_recover_and_dispatch_forward_min_thread_create_time_only_when_set():
+    cutoff = datetime(2021, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+    seen_recover_kwargs: list[dict[str, Any]] = []
+    seen_dispatch_kwargs: list[dict[str, Any]] = []
+
+    class CaptureStore:
+        async def adopt_legacy_research_scopes(self, _run_id, _fids):
+            return None
+
+        async def iter_pending_research_task_scopes(self, _run_id, _fids, **kwargs):
+            if kwargs.get("scope_type") == "post_comments" and kwargs.get("status") == "pending":
+                seen_dispatch_kwargs.append(kwargs)
+            else:
+                seen_recover_kwargs.append(kwargs)
+            if False:
+                yield []
+
+    store = CaptureStore()
+    router = QueueRouter()
+    producers_done = asyncio.Event()
+    producers_done.set()
+
+    await _recover_pending_tasks(store, router, {7}, research_run_id="run-synthetic")
+    await _dispatch_pending_comment_scopes(
+        store,
+        router,
+        {7},
+        "run-synthetic",
+        producers_done=producers_done,
+    )
+    assert all("min_thread_create_time" not in kw for kw in seen_recover_kwargs)
+    assert all("min_thread_create_time" not in kw for kw in seen_dispatch_kwargs)
+
+    seen_recover_kwargs.clear()
+    seen_dispatch_kwargs.clear()
+    await _recover_pending_tasks(
+        store,
+        router,
+        {7},
+        research_run_id="run-synthetic",
+        min_thread_create_time=cutoff,
+    )
+    await _dispatch_pending_comment_scopes(
+        store,
+        router,
+        {7},
+        "run-synthetic",
+        producers_done=producers_done,
+        min_thread_create_time=cutoff,
+    )
+    assert seen_recover_kwargs
+    assert seen_dispatch_kwargs
+    assert all(kw["min_thread_create_time"] == cutoff for kw in seen_recover_kwargs)
+    assert all(kw["min_thread_create_time"] == cutoff for kw in seen_dispatch_kwargs)

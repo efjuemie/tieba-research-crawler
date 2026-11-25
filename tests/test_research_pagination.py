@@ -20,6 +20,7 @@ from tiebameow.client.tieba_client import RetriableApiError
 from tiebameow.models.dto import PostUserDTO
 from tiebameow.models.orm import Comment as CommentModel
 from tiebameow.models.orm import Post as PostModel
+from tiebameow.utils.time_utils import SHANGHAI_TZ
 
 from src.research.client import ResearchPage
 from src.scraper.router import QueueRouter
@@ -2701,3 +2702,226 @@ async def test_exhausted_detail_rate_limit_failure_is_checkpointed_incomplete():
     assert checkpoint["scope_status"] == "incomplete"
     assert checkpoint["next_page"] == 2
     datastore.set_research_run_status_if.assert_not_awaited()
+
+
+def _make_legacy_zero_comment_page(comments: list[Any]) -> ResearchPage:
+    dto_template = make_comments_response(comments, has_more=False, current_page=0, total_page=0)
+    page_info = dto_template.page.model_copy(
+        update={
+            "current_page": 0,
+            "total_page": 0,
+            "total_count": 0,
+            "has_more": False,
+        }
+    )
+    dto_page = dto_template.model_copy(update={"page": page_info})
+    raw_page = SimpleNamespace(
+        objs=[SimpleNamespace(cid=comment.cid, pid=comment.pid, tid=comment.tid) for comment in comments],
+        page=SimpleNamespace(
+            current_page=0,
+            total_page=0,
+            total_count=0,
+            has_more=False,
+        ),
+        forum=SimpleNamespace(fid=10, fname="bar"),
+    )
+    return ResearchPage(raw_page, dto_page, datetime.now(UTC), "aiotieba.get_comments")
+
+
+@pytest.mark.asyncio
+async def test_legacy_zero_page_comments_single_and_multi_page_complete_without_truncation():
+    tid = 3484431880
+    pid = 62491655139
+    multi_pages = {
+        1: _make_legacy_zero_comment_page(
+            [make_comment(cid=7001, pid=pid, tid=tid), make_comment(cid=7002, pid=pid, tid=tid)]
+        ),
+        2: _make_legacy_zero_comment_page([make_comment(cid=7003, pid=pid, tid=tid)]),
+        3: _make_legacy_zero_comment_page([]),
+    }
+    tb_client = SimpleNamespace(
+        get_comments_research=AsyncMock(side_effect=lambda _tid, _pid, pn: multi_pages[pn])
+    )
+    datastore = SimpleNamespace(
+        get_research_task_scope_state=AsyncMock(side_effect=[(0, "pending", 0), (0, "completed", None)]),
+        claim_research_comments_scope=AsyncMock(return_value=True),
+        resume_research_run_if_status=AsyncMock(),
+        remove_pending_comment_scan=AsyncMock(),
+    )
+    handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+    handler._commit_research_comments_page = AsyncMock(return_value=True)
+
+    await handler.handle(
+        FullScanCommentsTask(
+            tid=tid,
+            pid=pid,
+            run_id="synthetic-run",
+            generation=0,
+            parent_generation=0,
+            fid=10,
+        )
+    )
+
+    assert tb_client.get_comments_research.await_args_list == [
+        call(tid, pid, 1),
+        call(tid, pid, 2),
+        call(tid, pid, 3),
+    ]
+    commits = handler._commit_research_comments_page.await_args_list
+    assert [commit.kwargs["page_number"] for commit in commits] == [1, 2, 3]
+    assert commits[0].kwargs["has_more_override"] is True
+    assert commits[0].kwargs["cursor"]["legacy_zero_page_continuation"] is True
+    assert commits[1].kwargs["has_more_override"] is True
+    assert commits[1].kwargs["cursor"]["legacy_zero_page_continuation"] is True
+    assert "has_more_override" not in commits[2].kwargs
+    assert commits[2].kwargs["cursor"] == {"empty_tail_reason": "legacy_zero_page_empty_tail"}
+
+    # Non-scope-managed mode also probes until the empty tail and completes cleanly.
+    single_pages = {
+        1: _make_legacy_zero_comment_page([make_comment(cid=8001, pid=pid, tid=tid)]),
+        2: _make_legacy_zero_comment_page([]),
+    }
+    legacy_client = SimpleNamespace(
+        get_comments_research=AsyncMock(side_effect=lambda _tid, _pid, pn: single_pages[pn])
+    )
+    legacy_datastore = SimpleNamespace(
+        resume_research_run_if_status=AsyncMock(),
+        save_items=AsyncMock(),
+        push_object_event=AsyncMock(),
+        remove_pending_comment_scan=AsyncMock(),
+        record_research_checkpoint=AsyncMock(return_value=True),
+    )
+    legacy_handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(legacy_client),
+        datastore=cast("Any", legacy_datastore),
+        router=QueueRouter(),
+    )
+    legacy_handler.ensure_users = AsyncMock()
+    legacy_handler._persist_research_page = AsyncMock()
+    legacy_handler._process_comments_on_page = AsyncMock()
+    await legacy_handler.handle(FullScanCommentsTask(tid=tid, pid=pid, backfill=True))
+
+    checkpoints = [c.kwargs for c in legacy_datastore.record_research_checkpoint.await_args_list]
+    assert [(c["page_number"], c["has_more"], c["scope_status"]) for c in checkpoints] == [
+        (1, True, "running"),
+        (2, False, "completed"),
+    ]
+    assert checkpoints[1]["continuation_json"] == {"empty_tail_reason": "legacy_zero_page_empty_tail"}
+
+    # Page 1 empty all-zero response must still be rejected as missing page identity.
+    empty_p1_client = SimpleNamespace(
+        get_comments_research=AsyncMock(return_value=_make_legacy_zero_comment_page([]))
+    )
+    empty_p1_handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(empty_p1_client),
+        datastore=cast("Any", SimpleNamespace(resume_research_run_if_status=AsyncMock())),
+        router=QueueRouter(),
+    )
+    with pytest.raises(PageIntegrityError, match="missing or has zero page identity"):
+        await empty_p1_handler.get_comments(tid, pid, 1)
+
+    # Non-all-zero page 0 (e.g., total_page > 0) must still fail page-number check.
+    broken_dto = make_comments_response([make_comment(cid=9001, pid=pid, tid=tid)], current_page=0, total_page=1)
+    broken_raw = SimpleNamespace(
+        objs=[SimpleNamespace(cid=9001, pid=pid, tid=tid)],
+        page=SimpleNamespace(current_page=0, total_page=1, total_count=1, has_more=False),
+        forum=SimpleNamespace(fid=10, fname="bar"),
+    )
+    broken_client = SimpleNamespace(
+        get_comments_research=AsyncMock(
+            return_value=ResearchPage(broken_raw, broken_dto, datetime.now(UTC), "aiotieba.get_comments")
+        )
+    )
+    broken_handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=make_research_container(broken_client),
+        datastore=cast("Any", SimpleNamespace(resume_research_run_if_status=AsyncMock())),
+        router=QueueRouter(),
+    )
+    with pytest.raises(PageIntegrityError, match="returned page 0 when page 1 was requested"):
+        await broken_handler.get_comments(tid, pid, 1)
+
+
+@pytest.mark.asyncio
+async def test_threads_handler_min_thread_create_time_defers_older_details_and_keeps_metadata():
+    older_new = make_thread(
+        tid=101,
+        fid=10,
+        reply_num=5,
+        create_time=datetime(2020, 12, 31, 23, 59, 59, tzinfo=SHANGHAI_TZ),
+    )
+    cutoff_new = make_thread(
+        tid=102,
+        fid=10,
+        reply_num=3,
+        create_time=datetime(2021, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ),
+    )
+    newer_new = make_thread(
+        tid=103,
+        fid=10,
+        reply_num=2,
+        create_time=datetime(2022, 5, 1, 12, 0, 0, tzinfo=SHANGHAI_TZ),
+    )
+    older_existing = make_thread(
+        tid=104,
+        fid=10,
+        reply_num=7,
+        create_time=datetime(2019, 6, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ),
+        last_time=datetime(2024, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ),
+    )
+    dto_page = make_threads_response([older_new, cutoff_new, newer_new, older_existing], has_more=False)
+    raw_page = SimpleNamespace(
+        objs=[SimpleNamespace(tid=t.tid, fid=10) for t in dto_page.objs],
+        page=SimpleNamespace(current_page=1, total_page=1, has_more=False),
+        forum=SimpleNamespace(fid=10, fname="bar"),
+    )
+    tb_client = SimpleNamespace(
+        get_threads_research=AsyncMock(
+            return_value=ResearchPage(raw_page, dto_page, datetime.now(UTC), "aiotieba.get_threads")
+        )
+    )
+    saved_batches: list[list[int]] = []
+
+    async def save_scans(threads, **_kwargs):
+        saved_batches.append([t.tid for t in threads])
+        return {t.tid: 0 for t in threads}
+
+    datastore = SimpleNamespace(
+        filter_new_ids=AsyncMock(return_value={101, 102, 103}),
+        save_threads_and_pending_scans=AsyncMock(side_effect=save_scans),
+        get_threads_by_tids=AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    tid=104,
+                    reply_num=7,
+                    last_time=datetime(2020, 6, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ),
+                )
+            ]
+        ),
+        get_pending_thread_scan_tids=AsyncMock(return_value=set()),
+        needs_research_thread_detail=AsyncMock(return_value={104}),
+        record_research_checkpoint=AsyncMock(return_value=True),
+        resume_research_run_if_status=AsyncMock(),
+    )
+    container = make_research_container(tb_client)
+    container.min_thread_create_time = datetime(2021, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+    router = QueueRouter()
+    handler = ThreadsTaskHandler(0, container, cast("Any", datastore), router)
+    handler.ensure_users = AsyncMock()
+    handler._persist_research_page = AsyncMock()
+    handler._enqueue_missing_web_targets = AsyncMock()
+
+    await handler.handle(ScanThreadsTask(fid=10, fname="bar", pn=1, rn=100, backfill=True, sort_mode="reply"))
+
+    # Metadata & pending scopes are preserved for both eligible and deferred threads.
+    assert saved_batches == [[101, 102, 103], [104]]
+    enqueued_tids = sorted(task.content.tid for task in router.posts_queue._q._queue)
+    assert enqueued_tids == [102, 103]
+    handler._enqueue_missing_web_targets.assert_awaited_once_with("synthetic-run", thread_ids=(102, 103))

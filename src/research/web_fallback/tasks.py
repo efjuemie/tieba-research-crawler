@@ -10,10 +10,11 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from sqlalchemy import and_, any_, bindparam, select, text
+from sqlalchemy import and_, any_, bindparam, exists, select, text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from tiebameow.models.orm import Thread
 
 from src.core.models import (
     ResearchRun,
@@ -1052,6 +1053,7 @@ async def lease_web_enrichment_tasks(
     lease_seconds: int = 120,
     task_keys: Sequence[str] | None = None,
     now: datetime | None = None,
+    min_thread_create_time: datetime | None = None,
 ) -> list[WebEnrichmentTaskLease]:
     """Lease due tasks in a short transaction; caller performs HTTP after return."""
     if not worker_id or len(worker_id) > 128:
@@ -1087,6 +1089,17 @@ async def lease_web_enrichment_tasks(
         )
         if task_keys is not None:
             eligible = and_(eligible, ResearchWebEnrichmentTask.task_key.in_(set(task_keys)))
+        if min_thread_create_time is not None:
+            eligible = and_(
+                eligible,
+                ~exists(
+                    select(1).where(
+                        Thread.tid == ResearchWebEnrichmentTask.tid,
+                        Thread.create_time.is_not(None),
+                        Thread.create_time < min_thread_create_time,
+                    )
+                ),
+            )
         result = await session.execute(
             select(ResearchWebEnrichmentTask)
             .where(eligible)

@@ -27,6 +27,7 @@ from aiotieba.enums import PostSortType, ThreadSortType
 from tiebameow.client.tieba_client import RetriableApiError, UnretriableApiError
 from tiebameow.models.orm import Comment, Post, User
 from tiebameow.utils.logger import logger
+from tiebameow.utils.time_utils import SHANGHAI_TZ
 
 from ..core.datastore import REVALIDATABLE_EMPTY_COMMENT_PAGE_ONE_REASONS
 from ..core.error_codes import normalize_checkpoint_error_code
@@ -94,6 +95,14 @@ def _positive_int_id(value: Any) -> int | None:
     else:
         return None
     return parsed if parsed > 0 else None
+
+
+def _thread_meets_min_create_time(create_time: Any, cutoff: Any) -> bool:
+    if cutoff is None or create_time is None:
+        return True
+    normalized_create = create_time.replace(tzinfo=SHANGHAI_TZ) if create_time.tzinfo is None else create_time
+    normalized_cutoff = cutoff.replace(tzinfo=SHANGHAI_TZ) if cutoff.tzinfo is None else cutoff
+    return normalized_create >= normalized_cutoff
 
 
 _MAX_CONSECUTIVE_EMPTY_COMMENT_PAGES = 10
@@ -426,13 +435,21 @@ class TaskHandler(ABC):
             raise PageIntegrityError(f"Post page first-post detail returned tid {raw_tid} instead of {tid}.")
         return fetched
 
-    async def get_comments(self, tid: int, pid: int, pn: int = 1) -> FetchedPage:
+    async def get_comments(
+        self,
+        tid: int,
+        pid: int,
+        pn: int = 1,
+        *,
+        allow_legacy_zero_page_empty_terminal: bool = False,
+    ) -> FetchedPage:
         """带限流的 get_comments_dto 调用（支持多代理轮换）。
 
         Args:
             tid: 主题贴 ID。
             pid: 回复 ID。
             pn: 页码，默认为 1。
+            allow_legacy_zero_page_empty_terminal: 是否允许在已有非空归档零页码之后接受第 2+ 页的空零页码终结页。
 
         Returns:
             CommentsDTO: 楼中楼列表数据。
@@ -446,12 +463,16 @@ class TaskHandler(ABC):
         )
         page = self._dto(fetched.response)
         objects = getattr(page, "objs", None)
-        if self.research_enabled and not objects:
-            raw_page = getattr(getattr(fetched.response, "raw", None), "page", None)
+        page_data = getattr(page, "page", None)
+        raw_page = getattr(getattr(fetched.response, "raw", None), "page", None)
+        is_legacy_zero_page = self._is_legacy_zero_page_comment_response(page_data, raw_page=raw_page)
+        allow_legacy_empty = pn > 1 and allow_legacy_zero_page_empty_terminal and is_legacy_zero_page
+        if self.research_enabled and not objects and not allow_legacy_empty:
             await self._validate_research_empty_page(
                 "comment detail", page, pn, "page", raw_page=raw_page
             )
-        self._validate_page_number("comment detail", pn, page.page.current_page)
+        if not (is_legacy_zero_page and (bool(objects) or allow_legacy_empty)):
+            self._validate_page_number("comment detail", pn, page.page.current_page)
         wrong_scope = {(comment.tid, comment.pid) for comment in page.objs if comment.tid != tid or comment.pid != pid}
         if wrong_scope:
             raise PageIntegrityError(
@@ -965,7 +986,11 @@ class TaskHandler(ABC):
     ) -> dict[str, object]:
         continuation = cls._continuation_from_page(page_ids, previous, has_more=has_more)
         if has_more and previous is not None:
-            for name in ("empty_comment_page_total_limit", "empty_comment_page_count"):
+            for name in (
+                "empty_comment_page_total_limit",
+                "empty_comment_page_count",
+                "legacy_zero_page_continuation",
+            ):
                 if name in previous:
                     continuation[name] = previous[name]
         return continuation
@@ -1031,6 +1056,31 @@ class TaskHandler(ABC):
             if raw_has_more
             else page_number == raw_total_page
         )
+
+    @staticmethod
+    def _is_legacy_zero_page_comment_response(page: Any, *, raw_page: Any = None) -> bool:
+        if page is None:
+            return False
+        page_fields = (
+            getattr(page, "current_page", None),
+            getattr(page, "total_page", None),
+            getattr(page, "total_count", None),
+        )
+        if any(type(value) is not int or value != 0 for value in page_fields):
+            return False
+        if getattr(page, "has_more", None) is not False:
+            return False
+        if raw_page is not None:
+            raw_fields = (
+                getattr(raw_page, "current_page", None),
+                getattr(raw_page, "total_page", None),
+                getattr(raw_page, "total_count", None),
+            )
+            if any(type(value) is not int or value != 0 for value in raw_fields):
+                return False
+            if getattr(raw_page, "has_more", None) is not False:
+                return False
+        return True
 
     @staticmethod
     def _validate_repeated_page(ids: list[int], cursor: dict[str, object], *, has_more: bool, scope: str) -> None:
@@ -1377,7 +1427,18 @@ class ThreadsTaskHandler(TaskHandler):
             await self._process_old_threads(threads_data, old_tids, task_content.backfill)
 
         run_id = getattr(self.container, "research_run_id", None)
-        await self._enqueue_missing_web_targets(run_id, thread_ids=tuple(all_tids))
+        min_create_time = getattr(self.container, "min_thread_create_time", None)
+        web_thread_ids = (
+            tuple(
+                thread.tid
+                for thread in threads_data.objs
+                if _thread_meets_min_create_time(thread.create_time, min_create_time)
+            )
+            if min_create_time is not None
+            else tuple(all_tids)
+        )
+        if web_thread_ids or min_create_time is None:
+            await self._enqueue_missing_web_targets(run_id, thread_ids=web_thread_ids)
 
         if task_content.backfill and run_id and hasattr(self.datastore, "record_research_checkpoint"):
             task_key = research_thread_list_task_key(task_content.fid, is_good, sort_mode, task_content.rn)
@@ -1560,6 +1621,7 @@ class ThreadsTaskHandler(TaskHandler):
         generations = generations or {}
 
         priority = Priority.BACKFILL_POSTS if backfill else Priority.MEDIUM
+        min_create_time = getattr(self.container, "min_thread_create_time", None)
 
         for thread in new_threads:
             SCRAPED_ITEMS.labels(type="thread", forum=thread.fname).inc(1)
@@ -1569,6 +1631,15 @@ class ThreadsTaskHandler(TaskHandler):
 
             if thread.reply_num == 0 and not backfill and not self.research_enabled:
                 self.log.debug("Thread tid={} has no replies, saved metadata only.", thread.tid)
+                continue
+
+            if not _thread_meets_min_create_time(thread.create_time, min_create_time):
+                self.log.debug(
+                    "Deferred detail scan for older thread tid={} create_time={} below min_thread_create_time={}.",
+                    thread.tid,
+                    thread.create_time,
+                    min_create_time,
+                )
                 continue
 
             new_task_content = FullScanPostsTask(
@@ -1611,6 +1682,7 @@ class ThreadsTaskHandler(TaskHandler):
             research_detail_tids = await self.datastore.needs_research_thread_detail(old_tids)
 
         priority = Priority.BACKFILL_POSTS if backfill else Priority.HIGH
+        min_create_time = getattr(self.container, "min_thread_create_time", None)
 
         for thread_data in old_threads:
             stored_thread = stored_threads_map.get(thread_data.tid)
@@ -1625,6 +1697,7 @@ class ThreadsTaskHandler(TaskHandler):
                     thread_data.tid,
                 )
                 continue
+            meets_cutoff = _thread_meets_min_create_time(thread_data.create_time, min_create_time)
             needs_full_research_scan = thread_data.tid in research_detail_tids or content_changed
             if needs_full_research_scan:
                 run_id = getattr(self.container, "research_run_id", None)
@@ -1636,6 +1709,15 @@ class ThreadsTaskHandler(TaskHandler):
                     refresh_research_run_id=run_id,
                 )
                 generations = generations or {}
+                if not meets_cutoff:
+                    self.log.debug(
+                        "Deferred research detail scan for older thread tid={} create_time={} "
+                        "below min_thread_create_time={}.",
+                        thread_data.tid,
+                        thread_data.create_time,
+                        min_create_time,
+                    )
+                    continue
                 full_task = FullScanPostsTask(
                     tid=thread_data.tid,
                     backfill=backfill,
@@ -1652,6 +1734,15 @@ class ThreadsTaskHandler(TaskHandler):
                     continue
                 self.log.info("[{}吧] Scheduled research detail scan for tid={}", thread_data.fname, thread_data.tid)
             elif stored_thread and thread_data.last_time > stored_thread.last_time:
+                if not meets_cutoff:
+                    self.log.debug(
+                        "Deferred incremental scan for older thread tid={} create_time={} "
+                        "below min_thread_create_time={}.",
+                        thread_data.tid,
+                        thread_data.create_time,
+                        min_create_time,
+                    )
+                    continue
                 self.log.debug(
                     "Thread tid={} has updates. Reply count: {} -> {}",
                     thread_data.tid,
@@ -2793,6 +2884,7 @@ class FullScanCommentsTaskHandler(TaskHandler):
         page_number: int,
         cursor: dict[str, object],
         attempts: int,
+        has_more_override: bool | None = None,
     ) -> bool:
         from ..research.persistence import persist_research_page
 
@@ -2828,12 +2920,15 @@ class FullScanCommentsTaskHandler(TaskHandler):
                 session,
                 [Comment.from_dto(comment) for comment in page.objs],
             )
-            has_more = page.page.has_more
+            has_more = page.page.has_more if has_more_override is None else has_more_override
             scope_status = "running" if has_more else "completed"
             continuation = self._comment_continuation_from_page(
                 [comment.cid for comment in page.objs], cursor, has_more=has_more
             )
-            if cursor.get("empty_tail_reason") == "server_confirmed_empty_terminal_page":
+            if cursor.get("empty_tail_reason") in {
+                "server_confirmed_empty_terminal_page",
+                "legacy_zero_page_empty_tail",
+            }:
                 continuation["empty_tail_reason"] = cursor["empty_tail_reason"]
             committed = await self.datastore.record_research_checkpoint(
                 run_id=run_id,
@@ -3063,6 +3158,7 @@ class FullScanCommentsTaskHandler(TaskHandler):
         try:
             empty_page_total_limit = None
             empty_page_count = 0
+            legacy_zero_page_continuation = bool(cursor.get("legacy_zero_page_continuation"))
             if "empty_comment_page_total_limit" in cursor or "empty_comment_page_count" in cursor:
                 saved_limit = cursor.get("empty_comment_page_total_limit")
                 saved_count = cursor.get("empty_comment_page_count")
@@ -3110,8 +3206,22 @@ class FullScanCommentsTaskHandler(TaskHandler):
                     raise PageIntegrityError(
                         f"Comment pagination exceeded its confirmed total-page bound {empty_page_total_limit}."
                     )
-                fetched = await self.get_comments(tid, pid, pn)
+                fetched = (
+                    await self.get_comments(
+                        tid,
+                        pid,
+                        pn,
+                        allow_legacy_zero_page_empty_terminal=True,
+                    )
+                    if pn > 1 and legacy_zero_page_continuation
+                    else await self.get_comments(tid, pid, pn)
+                )
                 page = self._dto(fetched.response)
+                raw_page = getattr(getattr(fetched.response, "raw", None), "page", None)
+                is_legacy_zero_page = self._is_legacy_zero_page_comment_response(
+                    page.page,
+                    raw_page=raw_page,
+                )
                 self._validate_terminal_metadata(
                     "comment detail", pn, page.page.has_more, page.page.total_page
                 )
@@ -3124,25 +3234,30 @@ class FullScanCommentsTaskHandler(TaskHandler):
                     )
 
                 if not page.objs:
-                    raw_page = getattr(getattr(fetched.response, "raw", None), "page", None)
-                    if not self._is_confirmed_comment_empty(
-                        page.page,
-                        pn,
-                        raw_page=raw_page,
-                    ):
-                        raise PageIntegrityError(f"Unexpected empty comment page for tid={tid} pid={pid} pn={pn}.")
-                    empty_page_total_limit = empty_page_total_limit or page.page.total_page
-                    empty_page_count += 1
-                    if empty_page_count > _MAX_CONSECUTIVE_EMPTY_COMMENT_PAGES:
-                        raise PageIntegrityError(
-                            "Comment pagination exceeded the consecutive empty-page limit."
-                        )
-                    page_cursor = dict(cursor) if page.page.has_more else {}
-                    if page.page.has_more:
-                        page_cursor["empty_comment_page_total_limit"] = empty_page_total_limit
-                        page_cursor["empty_comment_page_count"] = empty_page_count
-                    elif pn > 1:
-                        page_cursor["empty_tail_reason"] = "server_confirmed_empty_terminal_page"
+                    is_legacy_empty_terminal = (
+                        pn > 1 and legacy_zero_page_continuation and is_legacy_zero_page
+                    )
+                    if is_legacy_empty_terminal:
+                        page_cursor = {"empty_tail_reason": "legacy_zero_page_empty_tail"}
+                    else:
+                        if not self._is_confirmed_comment_empty(
+                            page.page,
+                            pn,
+                            raw_page=raw_page,
+                        ):
+                            raise PageIntegrityError(f"Unexpected empty comment page for tid={tid} pid={pid} pn={pn}.")
+                        empty_page_total_limit = empty_page_total_limit or page.page.total_page
+                        empty_page_count += 1
+                        if empty_page_count > _MAX_CONSECUTIVE_EMPTY_COMMENT_PAGES:
+                            raise PageIntegrityError(
+                                "Comment pagination exceeded the consecutive empty-page limit."
+                            )
+                        page_cursor = dict(cursor) if page.page.has_more else {}
+                        if page.page.has_more:
+                            page_cursor["empty_comment_page_total_limit"] = empty_page_total_limit
+                            page_cursor["empty_comment_page_count"] = empty_page_count
+                        elif pn > 1:
+                            page_cursor["empty_tail_reason"] = "server_confirmed_empty_terminal_page"
                     await self._record_validated_research_page("comments", pn, page)
                     if scope_managed:
                         committed = await self._commit_research_comments_page(
@@ -3162,7 +3277,9 @@ class FullScanCommentsTaskHandler(TaskHandler):
                         cursor = self._comment_continuation_from_page(
                             [], cursor, has_more=page.page.has_more
                         )
-                        if page.page.has_more:
+                        if is_legacy_empty_terminal:
+                            cursor["empty_tail_reason"] = "legacy_zero_page_empty_tail"
+                        elif page.page.has_more:
                             cursor["empty_comment_page_total_limit"] = empty_page_total_limit
                             cursor["empty_comment_page_count"] = empty_page_count
                         elif pn > 1:
@@ -3203,15 +3320,23 @@ class FullScanCommentsTaskHandler(TaskHandler):
                 empty_page_count = 0
                 if empty_page_total_limit is not None:
                     cursor["empty_comment_page_count"] = 0
+                page_ids = [comment.cid for comment in page.objs]
+                legacy_zero_page_continuation = is_legacy_zero_page
+                effective_has_more = True if is_legacy_zero_page else page.page.has_more
                 self._validate_repeated_page(
-                    [comment.cid for comment in page.objs],
+                    page_ids,
                     cursor,
-                    has_more=page.page.has_more,
+                    has_more=effective_has_more,
                     scope=f"comments tid={tid} parent_pid={pid}",
                 )
                 await self._record_validated_research_page("comments", pn, page)
+                continuation_input = dict(cursor)
+                if is_legacy_zero_page:
+                    continuation_input["legacy_zero_page_continuation"] = True
+                else:
+                    continuation_input.pop("legacy_zero_page_continuation", None)
                 cursor = self._comment_continuation_from_page(
-                    [comment.cid for comment in page.objs], cursor, has_more=page.page.has_more
+                    page_ids, continuation_input, has_more=effective_has_more
                 )
                 if scope_managed:
                     committed = await self._commit_research_comments_page(
@@ -3221,6 +3346,11 @@ class FullScanCommentsTaskHandler(TaskHandler):
                         page_number=pn,
                         cursor=cursor,
                         attempts=fetched.attempts,
+                        **(
+                            {"has_more_override": effective_has_more}
+                            if effective_has_more != page.page.has_more
+                            else {}
+                        ),
                     )
                     if not committed:
                         return
@@ -3238,10 +3368,10 @@ class FullScanCommentsTaskHandler(TaskHandler):
                         parent_kind=parent_kind,
                         fid=page.forum.fid,
                         status="completed",
-                        scope_status="running" if page.page.has_more else "completed",
+                        scope_status="running" if effective_has_more else "completed",
                         attempts=fetched.attempts,
-                        has_more=page.page.has_more,
-                        next_page=pn + 1 if page.page.has_more else None,
+                        has_more=effective_has_more,
+                        next_page=pn + 1 if effective_has_more else None,
                         total_pages=page.page.total_page,
                         reported_count=page.page.total_count,
                         reported_count_missing_reason=(
@@ -3250,7 +3380,7 @@ class FullScanCommentsTaskHandler(TaskHandler):
                         page_item_count=len(page.objs),
                         continuation_json=cursor,
                     )
-                if not page.page.has_more:
+                if not effective_has_more:
                     break
                 if self._stop_requested():
                     return

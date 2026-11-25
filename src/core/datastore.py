@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from cashews import Cache, add_prefix
-from sqlalchemy import BigInteger, String, and_, case, cast, delete, func, literal, or_, select, update
+from sqlalchemy import BigInteger, String, and_, case, cast, delete, exists, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -1329,6 +1329,7 @@ class DataStore:
         limit: int | None = None,
         scope_type: Literal["post_comments", "thread_replies"] | None = None,
         status: str | None = None,
+        min_thread_create_time: datetime | None = None,
     ) -> AsyncIterator[list[ResearchTaskScope]]:
         """Yield current detail scopes in bounded, comments-first batches.
 
@@ -1367,6 +1368,16 @@ class DataStore:
                     )
                     if tid is not None:
                         filters.append(ResearchTaskScope.tid == tid)
+                    if min_thread_create_time is not None:
+                        filters.append(
+                            ~exists(
+                                select(1).where(
+                                    Thread.tid == ResearchTaskScope.tid,
+                                    Thread.create_time.is_not(None),
+                                    Thread.create_time < min_thread_create_time,
+                                )
+                            )
+                        )
                     result = await session.execute(
                         select(ResearchTaskScope)
                         .where(*filters)

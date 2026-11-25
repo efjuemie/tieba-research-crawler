@@ -12,10 +12,12 @@ import asyncio
 import platform
 import signal
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any, Literal
 
 from prometheus_client import start_http_server
 from tiebameow.utils.logger import init_logger, logger
+from tiebameow.utils.time_utils import SHANGHAI_TZ
 
 from src.core import DataStore, initialize_application
 from src.core.models import REPLY_BACKFILL_MODE
@@ -49,12 +51,21 @@ async def _cancel_and_reap_tasks(tasks: list[asyncio.Task], aggregate: asyncio.F
             pass
 
 
+def _min_thread_create_time(min_thread_year: int | None) -> datetime | None:
+    if min_thread_year is None:
+        return None
+    if min_thread_year < 1990 or min_thread_year > 2100:
+        raise ValueError("--min-thread-year must be between 1990 and 2100.")
+    return datetime(min_thread_year, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+
+
 async def _recover_pending_tasks(
     datastore: DataStore,
     router: QueueRouter,
     responsible_fids: set[int],
     *,
     research_run_id: str | None = None,
+    min_thread_create_time: datetime | None = None,
 ) -> None:
     """启动时恢复未完成任务并重新入队。
 
@@ -71,12 +82,16 @@ async def _recover_pending_tasks(
 
         await adopt_legacy(research_run_id, responsible_fids)
         recovered = 0
+        extra_scope_kwargs: dict[str, Any] = (
+            {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
+        )
         for scope_type in ("thread_replies", "post_comments"):
             async for scope_batch in pending_scopes(
                 research_run_id,
                 responsible_fids,
                 batch_size=500,
                 scope_type=scope_type,
+                **extra_scope_kwargs,
             ):
                 recovered += await _enqueue_research_scope_batch(
                     router,
@@ -182,9 +197,13 @@ async def _dispatch_pending_comment_scopes(
     producers_done: asyncio.Event | None = None,
     selected_comment_scopes: set[tuple[str, int]] | None = None,
     selected_thread_scopes: set[tuple[str, int]] | None = None,
+    min_thread_create_time: datetime | None = None,
 ) -> bool:
     """Feed durable pending comment scopes into the bounded comments queue."""
     dispatched: set[tuple[str, int]] = set()
+    extra_scope_kwargs: dict[str, Any] = (
+        {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
+    )
 
     async def read_pending() -> list[Any]:
         scopes: list[Any] = []
@@ -194,6 +213,7 @@ async def _dispatch_pending_comment_scopes(
             batch_size=500,
             scope_type="post_comments",
             status="pending",
+            **extra_scope_kwargs,
         ):
             for scope in batch:
                 key = (scope.logical_task_key, scope.generation)
@@ -1151,6 +1171,7 @@ async def main(
     resume: bool = False,
     run_id: str | None = None,
     revalidate_failed_comment_page_zero: bool = False,
+    min_thread_year: int | None = None,
 ):
     """统一入口，根据模式启动应用。
 
@@ -1163,8 +1184,15 @@ async def main(
         raise ValueError("--backfill-sort can only be used with --mode backfill.")
     if revalidate_failed_comment_page_zero and not resume:
         raise ValueError("--revalidate-failed-comment-page-zero requires --resume.")
+    min_thread_create_time = _min_thread_create_time(min_thread_year)
     container, router = await initialize_application(mode=mode)
     container.revalidate_failed_comment_page_zero = revalidate_failed_comment_page_zero
+    container.min_thread_create_time = min_thread_create_time
+    if min_thread_create_time is not None:
+        logger.info(
+            "Priority min-thread-year filter enabled: only threads created on/after {} are scanned in detail.",
+            min_thread_create_time.isoformat(),
+        )
 
     shutdown_event = asyncio.Event()
     restore_signal_handlers = _install_shutdown_signal_handlers(shutdown_event)
@@ -1353,12 +1381,16 @@ async def main(
         ]
         tasks.extend(worker_tasks)
         responsible_fids = {forum.fid for forum in (container.forums or [])}
+        extra_filter_kwargs: dict[str, Any] = (
+            {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
+        )
         recovery_task = asyncio.create_task(
             _recover_pending_tasks(
                 datastore,
                 router,
                 responsible_fids=responsible_fids,
                 research_run_id=research_run_id,
+                **extra_filter_kwargs,
             ),
             name="api-pending-recovery",
         )
@@ -1373,6 +1405,7 @@ async def main(
                     responsible_fids,
                     research_run_id,
                     producers_done=producers_done,
+                    **extra_filter_kwargs,
                 ),
                 name="api-comment-scope-dispatcher",
             )
@@ -1396,6 +1429,7 @@ async def main(
                     api_done_event=api_done_event,
                     browser_profile=web_config.browser_profile,
                     browser_config=web_config,
+                    **extra_filter_kwargs,
                 ),
                 name="web-fallback-worker",
             )
@@ -1599,6 +1633,14 @@ if __name__ == "__main__":
         action="store_true",
         help="on resume, recheck one stored parent page after a page-one comment identity failure",
     )
+    parser.add_argument(
+        "--min-thread-year",
+        type=positive_int,
+        help=(
+            "prioritize full/web scans only for threads created on/after YYYY-01-01 (Asia/Shanghai); "
+            "older threads remain deferred"
+        ),
+    )
     parser.add_argument("--tid", type=positive_int, help="limit drain-pending to this thread ID")
     parser.add_argument(
         "--limit",
@@ -1622,6 +1664,8 @@ if __name__ == "__main__":
             parser.error("--backfill-sort cannot be combined with drain-pending")
         if args.revalidate_failed_comment_page_zero:
             parser.error("--revalidate-failed-comment-page-zero cannot be combined with drain-pending")
+        if args.min_thread_year is not None:
+            parser.error("--min-thread-year cannot be combined with drain-pending")
     else:
         if args.run_id and not args.resume:
             parser.error("--run-id requires --resume")
@@ -1629,6 +1673,8 @@ if __name__ == "__main__":
             parser.error("--backfill-sort can only be used with --mode backfill")
         if args.revalidate_failed_comment_page_zero and not args.resume:
             parser.error("--revalidate-failed-comment-page-zero requires --resume")
+        if args.min_thread_year is not None and not 1990 <= args.min_thread_year <= 2100:
+            parser.error("--min-thread-year must be between 1990 and 2100")
         if args.tid is not None or args.limit is not None or args.max_seconds is not None:
             parser.error("--tid, --limit, and --max-seconds are only valid with drain-pending")
 
@@ -1649,6 +1695,7 @@ if __name__ == "__main__":
                 resume=args.resume,
                 run_id=args.run_id,
                 revalidate_failed_comment_page_zero=args.revalidate_failed_comment_page_zero,
+                min_thread_year=args.min_thread_year,
             )
         if loop_factory is not None:
             with asyncio.Runner(loop_factory=loop_factory) as runner:

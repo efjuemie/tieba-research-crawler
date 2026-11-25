@@ -1,9 +1,13 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from conftest import make_thread
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from tiebameow.models.orm import Base
+from tiebameow.models.orm import Forum as BaseForum
+from tiebameow.models.orm import Thread as BaseThread
+from tiebameow.utils.time_utils import SHANGHAI_TZ
 
 from src.core.models import ResearchRun, ResearchTaskScope
 from src.research.models import (
@@ -1372,3 +1376,106 @@ async def test_preflight_completed_task_at_attempt_limit_does_not_block_new_snap
         assert new_task.status == "pending_web"
         assert new_task.attempts == 0
         assert failures == []
+
+
+@pytest.mark.asyncio
+async def test_lease_web_enrichment_tasks_filters_by_min_thread_create_time():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            BaseForum.__table__,
+            BaseThread.__table__,
+            ResearchRun.__table__,
+            ResearchTaskScope.__table__,
+            *RESEARCH_TABLES,
+        ],
+    )
+    maker = _AsyncSessionMaker(engine)
+    cutoff = datetime(2021, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+    with Session(engine) as session, session.begin():
+        session.add(BaseForum(fid=7654321, fname="synthetic"))
+        session.add(
+            ResearchRun(
+                run_id="run-web-filter",
+                mode="reply_backfill",
+                scope_key="7654321",
+                forums_json=[{"fid": 7654321, "fname": "synthetic"}],
+                status="running",
+            )
+        )
+        session.add_all(
+            [
+                BaseThread.from_dto(
+                    make_thread(
+                        tid=1001,
+                        fid=7654321,
+                        fname="synthetic",
+                        create_time=datetime(2020, 12, 31, 23, 59, 59, tzinfo=SHANGHAI_TZ),
+                    )
+                ),
+                BaseThread.from_dto(
+                    make_thread(
+                        tid=1002,
+                        fid=7654321,
+                        fname="synthetic",
+                        create_time=cutoff,
+                    )
+                ),
+            ]
+        )
+        for tid, first_pid in ((1001, 2001), (1002, 2002)):
+            session.add(
+                ResearchThread(
+                    tid=tid,
+                    first_pid=first_pid,
+                    fid=7654321,
+                    title="synthetic",
+                    author_user_id=501,
+                    author_portrait="synthetic-portrait",
+                    source_api="aiotieba.get_posts",
+                    observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    source_payload_json={},
+                    missing_reasons_json={},
+                )
+            )
+            session.add(
+                ResearchTaskScope(
+                    run_id="run-web-filter",
+                    logical_task_key=f"thread_replies:{tid}",
+                    generation=0,
+                    task_type="posts",
+                    scope_type="thread_replies",
+                    fid=7654321,
+                    tid=tid,
+                    status="completed",
+                )
+            )
+
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-filter",
+        ["ip_location_text"],
+        target_type="thread",
+        target_ids=[1001, 1002],
+        only_missing_fields=True,
+    )
+    assert summary.created_count == 2
+
+    filtered = await lease_web_enrichment_tasks(
+        maker,
+        "run-web-filter",
+        "web-worker-cutoff",
+        limit=10,
+        min_thread_create_time=cutoff,
+    )
+    assert [lease.tid for lease in filtered] == [1002]
+
+    # Without the cutoff, the deferred pre-2021 task remains pending_web and leases cleanly.
+    unfiltered = await lease_web_enrichment_tasks(
+        maker,
+        "run-web-filter",
+        "web-worker-full",
+        limit=10,
+    )
+    assert [lease.tid for lease in unfiltered] == [1001]

@@ -13,11 +13,20 @@ from sqlalchemy.exc import InterfaceError
 from sqlalchemy.orm import Session
 from tiebameow.models.dto import BaseThreadDTO, ThreadDTO, ThreadUserDTO
 from tiebameow.models.orm import Base
+from tiebameow.models.orm import Forum as BaseForum
 from tiebameow.models.orm import Post as BasePost
+from tiebameow.models.orm import Thread as BaseThread
+from tiebameow.utils.time_utils import SHANGHAI_TZ
 
 from src.core.config import ConsumerConfig
 from src.core.datastore import DataStore
-from src.core.models import PendingCommentScan, PendingThreadScan, ResearchCheckpoint, ResearchTaskScope
+from src.core.models import (
+    PendingCommentScan,
+    PendingThreadScan,
+    ResearchCheckpoint,
+    ResearchRun,
+    ResearchTaskScope,
+)
 from src.research.models import ResearchPost
 
 # ==================== Mock 类 ====================
@@ -1436,3 +1445,172 @@ async def test_complete_failed_comment_scope_from_parent_zero_accepts_shifted_pa
     )
 
     assert completed is expected
+
+
+@pytest.mark.asyncio
+async def test_iter_pending_research_task_scopes_filters_by_min_thread_create_time():
+    engine, maker = _make_local_sqlite_sessions(
+        BaseForum.__table__,
+        BaseThread.__table__,
+        ResearchRun.__table__,
+        ResearchTaskScope.__table__,
+    )
+    cutoff = datetime(2021, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+    with Session(engine) as session, session.begin():
+        session.add(BaseForum(fid=10, fname="bar"))
+        session.add(
+            ResearchRun(
+                run_id="run-filter",
+                mode="reply_backfill",
+                scope_key="10",
+                forums_json=[{"fid": 10, "fname": "bar"}],
+                status="running",
+            )
+        )
+        session.add_all(
+            [
+                BaseThread.from_dto(
+                    make_thread(
+                        tid=101,
+                        fid=10,
+                        create_time=datetime(2020, 12, 31, 23, 59, 59, tzinfo=SHANGHAI_TZ),
+                    )
+                ),
+                BaseThread.from_dto(
+                    make_thread(
+                        tid=102,
+                        fid=10,
+                        create_time=cutoff,
+                    )
+                ),
+                BaseThread.from_dto(
+                    make_thread(
+                        tid=103,
+                        fid=10,
+                        create_time=datetime(2022, 3, 15, 8, 0, 0, tzinfo=SHANGHAI_TZ),
+                    )
+                ),
+            ]
+        )
+        session.add_all(
+            [
+                ResearchTaskScope(
+                    run_id="run-filter",
+                    logical_task_key="thread_replies:101",
+                    generation=0,
+                    task_type="full_scan_posts",
+                    scope_type="thread_replies",
+                    fid=10,
+                    fname="bar",
+                    tid=101,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                ),
+                ResearchTaskScope(
+                    run_id="run-filter",
+                    logical_task_key="thread_replies:102",
+                    generation=0,
+                    task_type="full_scan_posts",
+                    scope_type="thread_replies",
+                    fid=10,
+                    fname="bar",
+                    tid=102,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                ),
+                ResearchTaskScope(
+                    run_id="run-filter",
+                    logical_task_key="thread_replies:103",
+                    generation=0,
+                    task_type="full_scan_posts",
+                    scope_type="thread_replies",
+                    fid=10,
+                    fname="bar",
+                    tid=103,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                ),
+                ResearchTaskScope(
+                    run_id="run-filter",
+                    logical_task_key="post_comments:101:1001",
+                    generation=0,
+                    task_type="full_scan_comments",
+                    scope_type="post_comments",
+                    fid=10,
+                    fname="bar",
+                    tid=101,
+                    parent_pid=1001,
+                    parent_kind="reply_post",
+                    parent_generation=0,
+                    backfill=True,
+                    rn=30,
+                    status="incomplete",
+                ),
+                ResearchTaskScope(
+                    run_id="run-filter",
+                    logical_task_key="post_comments:102:2001",
+                    generation=0,
+                    task_type="full_scan_comments",
+                    scope_type="post_comments",
+                    fid=10,
+                    fname="bar",
+                    tid=102,
+                    parent_pid=2001,
+                    parent_kind="reply_post",
+                    parent_generation=0,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                ),
+                # Thread without a stored Thread row stays eligible (unknown create_time).
+                ResearchTaskScope(
+                    run_id="run-filter",
+                    logical_task_key="post_comments:104:4001",
+                    generation=0,
+                    task_type="full_scan_comments",
+                    scope_type="post_comments",
+                    fid=10,
+                    fname="bar",
+                    tid=104,
+                    parent_pid=4001,
+                    parent_kind="reply_post",
+                    parent_generation=0,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                ),
+            ]
+        )
+
+    datastore = DataStore.__new__(DataStore)
+    datastore.async_sessionmaker = cast("Any", maker)
+
+    filtered_keys: list[str] = []
+    async for batch in datastore.iter_pending_research_task_scopes(
+        "run-filter",
+        {10},
+        min_thread_create_time=cutoff,
+    ):
+        filtered_keys.extend(scope.logical_task_key for scope in batch)
+
+    assert sorted(filtered_keys) == [
+        "post_comments:102:2001",
+        "post_comments:104:4001",
+        "thread_replies:102",
+        "thread_replies:103",
+    ]
+
+    with Session(engine) as session:
+        assert session.get(ResearchTaskScope, ("run-filter", "thread_replies:101")).status == "pending"
+        assert session.get(ResearchTaskScope, ("run-filter", "post_comments:101:1001")).status == "incomplete"
+
+    unfiltered_keys: list[str] = []
+    async for batch in datastore.iter_pending_research_task_scopes("run-filter", {10}):
+        unfiltered_keys.extend(scope.logical_task_key for scope in batch)
+
+    assert len(unfiltered_keys) == 6
+    assert "thread_replies:101" in unfiltered_keys
+    assert "post_comments:101:1001" in unfiltered_keys

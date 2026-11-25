@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
+from tiebameow.models.orm import Thread
 
 from src.core.models import ResearchTaskScope
 from src.research.models import (
@@ -500,13 +501,23 @@ async def _process_durable_web_lease(
     return task_status, result
 
 
-async def _lease_one_web_task(sessions: Any, run_ids: Sequence[str], worker_id: str):
+async def _lease_one_web_task(
+    sessions: Any,
+    run_ids: Sequence[str],
+    worker_id: str,
+    *,
+    min_thread_create_time: datetime | None = None,
+):
+    extra_kwargs: dict[str, Any] = (
+        {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
+    )
     for run_id in run_ids:
         leases = await lease_web_enrichment_tasks(
             sessions,
             run_id,
             worker_id,
             limit=1,
+            **extra_kwargs,
         )
         if leases:
             return leases[0]
@@ -709,12 +720,24 @@ async def _next_retry_delay(
     run_ids: Sequence[str],
     *,
     task_keys: Sequence[str] | None = None,
+    min_thread_create_time: datetime | None = None,
 ) -> float | None:
     if not run_ids:
         return None
     now = datetime.now(UTC)
     task_filter = (
         ResearchWebEnrichmentTask.task_key.in_(tuple(task_keys)) if task_keys is not None else True
+    )
+    thread_time_filter = (
+        ~exists(
+            select(1).where(
+                Thread.tid == ResearchWebEnrichmentTask.tid,
+                Thread.create_time.is_not(None),
+                Thread.create_time < min_thread_create_time,
+            )
+        )
+        if min_thread_create_time is not None
+        else True
     )
     async with sessions() as session:
         retry_at = await session.scalar(
@@ -723,6 +746,7 @@ async def _next_retry_delay(
                 ResearchWebEnrichmentTask.status == "failed_retryable",
                 ResearchWebEnrichmentTask.next_retry_at.is_not(None),
                 task_filter,
+                thread_time_filter,
             )
         )
         lease_until = await session.scalar(
@@ -731,6 +755,7 @@ async def _next_retry_delay(
                 ResearchWebEnrichmentTask.status == "running",
                 ResearchWebEnrichmentTask.lease_until.is_not(None),
                 task_filter,
+                thread_time_filter,
             )
         )
     future = [
@@ -779,6 +804,7 @@ async def drain_pending_web_enrichment(
     stop_event: Any | None = None,
     wait_for_login: bool = True,
     login_confirmation: Any | None = None,
+    min_thread_create_time: datetime | None = None,
 ) -> WebWorkerSummary:
     """Drain durable web tasks across runs using one caller-owned provider."""
     normalized_run_ids = await _snapshot_run_ids(run_ids)
@@ -793,13 +819,25 @@ async def drain_pending_web_enrichment(
     stopped_run_id = None
     stopped_target_type = None
     last_queue_wait_log = 0.0
+    extra_filter_kwargs: dict[str, Any] = (
+        {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
+    )
 
     while normalized_run_ids and not (stop_event is not None and stop_event.is_set()):
-        lease = await _lease_one_web_task(sessions, normalized_run_ids, "live-web-fallback")
+        lease = await _lease_one_web_task(
+            sessions,
+            normalized_run_ids,
+            "live-web-fallback",
+            **extra_filter_kwargs,
+        )
         if lease is None:
             if stop_event is not None and stop_event.is_set():
                 break
-            retry_delay = await _next_retry_delay(sessions, normalized_run_ids)
+            retry_delay = await _next_retry_delay(
+                sessions,
+                normalized_run_ids,
+                **extra_filter_kwargs,
+            )
             now = asyncio.get_running_loop().time()
             if now - last_queue_wait_log >= _QUEUE_WAIT_LOG_INTERVAL_SECONDS:
                 counts = await _web_task_status_counts(sessions, normalized_run_ids)
@@ -930,6 +968,7 @@ async def run_live_web_fallback_worker(
     headed: bool = True,
     wait_for_login: bool = True,
     login_confirmation: Any | None = None,
+    min_thread_create_time: datetime | None = None,
 ) -> WebWorkerSummary:
     """Run WEB work independently, draining only after normal API completion."""
     if browser_profile is None:
@@ -966,17 +1005,29 @@ async def run_live_web_fallback_worker(
     stopped_target_type = None
     all_run_ids: set[str] = set()
     last_queue_wait_log = 0.0
+    extra_filter_kwargs: dict[str, Any] = (
+        {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
+    )
     try:
         while not stop_event.is_set() and not (
             api_done_event is not None and api_done_event.is_set()
         ):
             current_run_ids = await _snapshot_run_ids(run_ids)
             all_run_ids.update(current_run_ids)
-            lease = await _lease_one_web_task(sessions, current_run_ids, "live-web-fallback")
+            lease = await _lease_one_web_task(
+                sessions,
+                current_run_ids,
+                "live-web-fallback",
+                **extra_filter_kwargs,
+            )
             if lease is None:
                 if api_done_event is not None and api_done_event.is_set():
                     break
-                retry_delay = await _next_retry_delay(sessions, current_run_ids)
+                retry_delay = await _next_retry_delay(
+                    sessions,
+                    current_run_ids,
+                    **extra_filter_kwargs,
+                )
                 now = asyncio.get_running_loop().time()
                 if now - last_queue_wait_log >= _QUEUE_WAIT_LOG_INTERVAL_SECONDS:
                     counts = await _web_task_status_counts(sessions, current_run_ids)
@@ -1087,6 +1138,7 @@ async def run_live_web_fallback_worker(
                 stop_event=stop_event,
                 wait_for_login=wait_for_login,
                 login_confirmation=login_confirmation,
+                **extra_filter_kwargs,
             )
             collected += drained.collected_count
             completed += drained.completed_count
