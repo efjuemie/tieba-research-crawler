@@ -1833,3 +1833,84 @@ async def test_lease_web_enrichment_tasks_default_lease_and_worker_lease_sizing(
         assert task.lease_until.replace(tzinfo=UTC) == now + timedelta(seconds=240)
     assert web_service_mod._web_lease_seconds(SimpleNamespace(timeout_seconds=90.0)) == 240
     assert web_service_mod._web_lease_seconds(SimpleNamespace(timeout_seconds=180.0)) == 300
+
+
+@pytest.mark.asyncio
+async def test_lease_web_enrichment_tasks_newest_first_groups_by_tid_desc_and_target_type_order(
+    research_db,
+):
+    engine, maker = research_db
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                ResearchPost(
+                    pid=2201,
+                    tid=1002,
+                    fid=7654321,
+                    text="newer post",
+                    author_user_id=778,
+                    author_portrait="synthetic-post-portrait-2",
+                    source_api="aiotieba.get_posts",
+                    observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchComment(
+                    cid=3201,
+                    tid=1002,
+                    parent_post_pid=2201,
+                    fid=7654321,
+                    text="newer comment",
+                    author_user_id=889,
+                    source_api="aiotieba.get_comments",
+                    observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchTaskScope(
+                    run_id="run-web-001",
+                    logical_task_key="post_comments:1002:2201",
+                    generation=0,
+                    task_type="comments",
+                    scope_type="post_comments",
+                    fid=7654321,
+                    tid=1002,
+                    parent_pid=2201,
+                    parent_generation=0,
+                    status="completed",
+                ),
+            ]
+        )
+    for target_type, target_ids in (
+        ("thread", [1001, 1002]),
+        ("post", None),
+        ("comment", None),
+    ):
+        summary = await enqueue_web_enrichment_tasks(
+            maker,
+            "run-web-001",
+            ["ip_location_text"],
+            target_type=target_type,
+            target_ids=target_ids,
+            only_missing_fields=True,
+        )
+        assert summary.created_count > 0
+
+    leases = await lease_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        "newest-first-worker",
+        limit=20,
+        newest_first=True,
+    )
+    observed = [(lease.tid, lease.target_type) for lease in leases]
+    assert observed == [
+        (1002, "thread"),
+        (1002, "post"),
+        (1002, "comment"),
+        (1001, "thread"),
+        (1001, "post"),
+        (1001, "post"),
+        (1001, "comment"),
+        (1001, "comment"),
+    ]

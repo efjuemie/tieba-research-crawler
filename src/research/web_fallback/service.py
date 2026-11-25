@@ -513,12 +513,15 @@ async def _lease_one_web_task(
     *,
     min_thread_create_time: datetime | None = None,
     lease_seconds: int | None = None,
+    newest_first: bool = False,
 ):
     extra_kwargs: dict[str, Any] = {}
     if min_thread_create_time is not None:
         extra_kwargs["min_thread_create_time"] = min_thread_create_time
     if lease_seconds is not None:
         extra_kwargs["lease_seconds"] = lease_seconds
+    if newest_first:
+        extra_kwargs["newest_first"] = True
     for run_id in run_ids:
         leases = await lease_web_enrichment_tasks(
             sessions,
@@ -813,6 +816,7 @@ async def drain_pending_web_enrichment(
     wait_for_login: bool = True,
     login_confirmation: Any | None = None,
     min_thread_create_time: datetime | None = None,
+    newest_first: bool = False,
 ) -> WebWorkerSummary:
     """Drain durable web tasks across runs using one caller-owned provider."""
     normalized_run_ids = await _snapshot_run_ids(run_ids)
@@ -830,13 +834,16 @@ async def drain_pending_web_enrichment(
     extra_filter_kwargs: dict[str, Any] = (
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
+    lease_kwargs = dict(extra_filter_kwargs)
+    if newest_first:
+        lease_kwargs["newest_first"] = True
 
     while normalized_run_ids and not (stop_event is not None and stop_event.is_set()):
         lease = await _lease_one_web_task(
             sessions,
             normalized_run_ids,
             "live-web-fallback",
-            **extra_filter_kwargs,
+            **lease_kwargs,
         )
         if lease is None:
             if stop_event is not None and stop_event.is_set():
@@ -977,6 +984,7 @@ async def run_live_web_fallback_worker(
     wait_for_login: bool = True,
     login_confirmation: Any | None = None,
     min_thread_create_time: datetime | None = None,
+    newest_first: bool = False,
 ) -> WebWorkerSummary:
     """Run WEB work independently, draining only after normal API completion."""
     if browser_profile is None:
@@ -1016,8 +1024,11 @@ async def run_live_web_fallback_worker(
     extra_filter_kwargs: dict[str, Any] = (
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
+    drain_kwargs = dict(extra_filter_kwargs)
+    if newest_first:
+        drain_kwargs["newest_first"] = True
     lease_seconds = _web_lease_seconds(browser_config)
-    lease_kwargs = dict(extra_filter_kwargs)
+    lease_kwargs = dict(drain_kwargs)
     if lease_seconds > 240:
         lease_kwargs["lease_seconds"] = lease_seconds
     try:
@@ -1150,7 +1161,7 @@ async def run_live_web_fallback_worker(
                 stop_event=stop_event,
                 wait_for_login=wait_for_login,
                 login_confirmation=login_confirmation,
-                **extra_filter_kwargs,
+                **drain_kwargs,
             )
             collected += drained.collected_count
             completed += drained.completed_count

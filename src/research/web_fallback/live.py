@@ -156,6 +156,7 @@ async def run_live_web_worker(
     request_budget: Any | None = None,
     browser_config: Any | None = None,
     min_thread_create_time: datetime | None = None,
+    newest_first: bool = False,
 ) -> Any:
     """Run WEB work alongside API producers, then drain only on normal API completion."""
     from .service import run_live_web_fallback_worker
@@ -164,6 +165,8 @@ async def run_live_web_worker(
     extra_kwargs: dict[str, Any] = (
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
+    if newest_first:
+        extra_kwargs["newest_first"] = True
     return await run_live_web_fallback_worker(
         sessions,
         lambda: stable_run_ids,

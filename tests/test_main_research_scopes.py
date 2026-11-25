@@ -495,3 +495,29 @@ async def test_recover_and_dispatch_forward_min_thread_create_time_only_when_set
     assert seen_dispatch_kwargs
     assert all(kw["min_thread_create_time"] == cutoff for kw in seen_recover_kwargs)
     assert all(kw["min_thread_create_time"] == cutoff for kw in seen_dispatch_kwargs)
+    assert all("newest_first" not in kw for kw in seen_recover_kwargs)
+    assert all("newest_first" not in kw for kw in seen_dispatch_kwargs)
+
+    seen_recover_kwargs.clear()
+    seen_dispatch_kwargs.clear()
+    await _recover_pending_tasks(
+        store,
+        router,
+        {7},
+        research_run_id="run-synthetic",
+        min_thread_create_time=cutoff,
+        newest_first=True,
+    )
+    await _dispatch_pending_comment_scopes(
+        store,
+        router,
+        {7},
+        "run-synthetic",
+        producers_done=producers_done,
+        min_thread_create_time=cutoff,
+        newest_first=True,
+    )
+    assert seen_recover_kwargs
+    assert seen_dispatch_kwargs
+    assert all(kw["newest_first"] is True for kw in seen_recover_kwargs)
+    assert all(kw["newest_first"] is True for kw in seen_dispatch_kwargs)

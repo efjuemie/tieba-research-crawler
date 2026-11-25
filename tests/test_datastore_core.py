@@ -1614,3 +1614,131 @@ async def test_iter_pending_research_task_scopes_filters_by_min_thread_create_ti
     assert len(unfiltered_keys) == 6
     assert "thread_replies:101" in unfiltered_keys
     assert "post_comments:101:1001" in unfiltered_keys
+
+
+@pytest.mark.asyncio
+async def test_iter_pending_research_task_scopes_newest_first_keyset_pagination():
+    engine, maker = _make_local_sqlite_sessions(
+        ResearchRun.__table__,
+        ResearchTaskScope.__table__,
+    )
+    with Session(engine) as session, session.begin():
+        session.add(
+            ResearchRun(
+                run_id="run-newest",
+                mode="reply_backfill",
+                scope_key="10",
+                forums_json=[{"fid": 10, "fname": "bar"}],
+                status="running",
+            )
+        )
+        # Deliberately mix varying digit lengths (99, 100, 1000) to confirm numeric tid DESC
+        # differs from lexicographic logical_task_key ordering, plus multiple scopes sharing a tid.
+        session.add_all(
+            [
+                ResearchTaskScope(
+                    run_id="run-newest",
+                    logical_task_key="post_comments:99:10",
+                    generation=0,
+                    task_type="full_scan_comments",
+                    scope_type="post_comments",
+                    fid=10,
+                    fname="bar",
+                    tid=99,
+                    parent_pid=10,
+                    parent_kind="reply_post",
+                    parent_generation=0,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                ),
+                ResearchTaskScope(
+                    run_id="run-newest",
+                    logical_task_key="post_comments:100:20",
+                    generation=0,
+                    task_type="full_scan_comments",
+                    scope_type="post_comments",
+                    fid=10,
+                    fname="bar",
+                    tid=100,
+                    parent_pid=20,
+                    parent_kind="reply_post",
+                    parent_generation=0,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                ),
+                ResearchTaskScope(
+                    run_id="run-newest",
+                    logical_task_key="post_comments:100:21",
+                    generation=0,
+                    task_type="full_scan_comments",
+                    scope_type="post_comments",
+                    fid=10,
+                    fname="bar",
+                    tid=100,
+                    parent_pid=21,
+                    parent_kind="reply_post",
+                    parent_generation=0,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                ),
+                ResearchTaskScope(
+                    run_id="run-newest",
+                    logical_task_key="post_comments:1000:30",
+                    generation=0,
+                    task_type="full_scan_comments",
+                    scope_type="post_comments",
+                    fid=10,
+                    fname="bar",
+                    tid=1000,
+                    parent_pid=30,
+                    parent_kind="reply_post",
+                    parent_generation=0,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                ),
+                ResearchTaskScope(
+                    run_id="run-newest",
+                    logical_task_key="post_comments:1000:31",
+                    generation=0,
+                    task_type="full_scan_comments",
+                    scope_type="post_comments",
+                    fid=10,
+                    fname="bar",
+                    tid=1000,
+                    parent_pid=31,
+                    parent_kind="reply_post",
+                    parent_generation=0,
+                    backfill=True,
+                    rn=30,
+                    status="pending",
+                ),
+            ]
+        )
+
+    datastore = DataStore.__new__(DataStore)
+    datastore.async_sessionmaker = cast("Any", maker)
+
+    batches: list[list[tuple[int | None, str]]] = [
+        [(scope.tid, scope.logical_task_key) for scope in batch]
+        async for batch in datastore.iter_pending_research_task_scopes(
+            "run-newest",
+            {10},
+            batch_size=2,
+            scope_type="post_comments",
+            newest_first=True,
+        )
+    ]
+
+    flattened = [item for batch in batches for item in batch]
+    assert [len(batch) for batch in batches] == [2, 2, 1]
+    assert flattened == [
+        (1000, "post_comments:1000:31"),
+        (1000, "post_comments:1000:30"),
+        (100, "post_comments:100:21"),
+        (100, "post_comments:100:20"),
+        (99, "post_comments:99:10"),
+    ]

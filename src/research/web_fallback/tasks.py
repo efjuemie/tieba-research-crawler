@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from sqlalchemy import and_, any_, bindparam, exists, select, text
+from sqlalchemy import and_, any_, bindparam, case, exists, select, text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -1199,6 +1199,7 @@ async def lease_web_enrichment_tasks(
     task_keys: Sequence[str] | None = None,
     now: datetime | None = None,
     min_thread_create_time: datetime | None = None,
+    newest_first: bool = False,
 ) -> list[WebEnrichmentTaskLease]:
     """Lease due tasks in a short transaction; caller performs HTTP after return."""
     if not worker_id or len(worker_id) > 128:
@@ -1245,10 +1246,25 @@ async def lease_web_enrichment_tasks(
                     )
                 ),
             )
-        result = await session.execute(
-            select(ResearchWebEnrichmentTask)
-            .where(eligible)
-            .order_by(
+        if newest_first:
+            target_type_rank = case(
+                (ResearchWebEnrichmentTask.target_type == "thread", 0),
+                (ResearchWebEnrichmentTask.target_type == "post", 1),
+                (ResearchWebEnrichmentTask.target_type == "comment", 2),
+                else_=3,
+            )
+            order_clauses: tuple[Any, ...] = (
+                ResearchWebEnrichmentTask.attempts.asc(),
+                ResearchWebEnrichmentTask.priority.desc(),
+                ResearchWebEnrichmentTask.tid.desc(),
+                target_type_rank.asc(),
+                ResearchWebEnrichmentTask.parent_post_pid.asc(),
+                ResearchWebEnrichmentTask.target_id.asc(),
+                ResearchWebEnrichmentTask.created_at.asc(),
+                ResearchWebEnrichmentTask.task_key.asc(),
+            )
+        else:
+            order_clauses = (
                 ResearchWebEnrichmentTask.attempts.asc(),
                 ResearchWebEnrichmentTask.priority.desc(),
                 ResearchWebEnrichmentTask.target_type,
@@ -1258,6 +1274,10 @@ async def lease_web_enrichment_tasks(
                 ResearchWebEnrichmentTask.created_at,
                 ResearchWebEnrichmentTask.task_key,
             )
+        result = await session.execute(
+            select(ResearchWebEnrichmentTask)
+            .where(eligible)
+            .order_by(*order_clauses)
             .limit(limit)
             .with_for_update(skip_locked=True)
         )

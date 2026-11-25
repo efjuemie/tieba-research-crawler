@@ -1330,6 +1330,7 @@ class DataStore:
         scope_type: Literal["post_comments", "thread_replies"] | None = None,
         status: str | None = None,
         min_thread_create_time: datetime | None = None,
+        newest_first: bool = False,
     ) -> AsyncIterator[list[ResearchTaskScope]]:
         """Yield current detail scopes in bounded, comments-first batches.
 
@@ -1348,10 +1349,12 @@ class DataStore:
             return
         yielded = 0
         scope_types = (scope_type,) if scope_type is not None else ("post_comments", "thread_replies")
+        tid_order_expr = func.coalesce(ResearchTaskScope.tid, 0)
         for current_scope_type in scope_types:
             if limit is not None and yielded >= limit:
                 break
             last_key = ""
+            last_cursor: tuple[int, str] | None = None
             while True:
                 query_limit = batch_size if limit is None else min(batch_size, limit - yielded)
                 async with self.async_sessionmaker() as session:
@@ -1359,8 +1362,21 @@ class DataStore:
                         ResearchTaskScope.run_id == run_id,
                         ResearchTaskScope.scope_type == current_scope_type,
                         ResearchTaskScope.fid.in_(responsible_fids),
-                        ResearchTaskScope.logical_task_key > last_key,
                     ]
+                    if newest_first:
+                        if last_cursor is not None:
+                            last_tid, last_cursor_key = last_cursor
+                            filters.append(
+                                or_(
+                                    tid_order_expr < last_tid,
+                                    and_(
+                                        tid_order_expr == last_tid,
+                                        ResearchTaskScope.logical_task_key < last_cursor_key,
+                                    ),
+                                )
+                            )
+                    else:
+                        filters.append(ResearchTaskScope.logical_task_key > last_key)
                     filters.append(
                         ResearchTaskScope.status == status
                         if status is not None
@@ -1378,16 +1394,24 @@ class DataStore:
                                 )
                             )
                         )
+                    order_clauses = (
+                        (tid_order_expr.desc(), ResearchTaskScope.logical_task_key.desc())
+                        if newest_first
+                        else (ResearchTaskScope.logical_task_key,)
+                    )
                     result = await session.execute(
                         select(ResearchTaskScope)
                         .where(*filters)
-                        .order_by(ResearchTaskScope.logical_task_key)
+                        .order_by(*order_clauses)
                         .limit(query_limit)
                     )
                     rows = list(result.scalars().all())
                 if not rows:
                     break
-                last_key = rows[-1].logical_task_key
+                if newest_first:
+                    last_cursor = (int(rows[-1].tid or 0), rows[-1].logical_task_key)
+                else:
+                    last_key = rows[-1].logical_task_key
                 yielded += len(rows)
                 yield rows
 

@@ -66,6 +66,7 @@ async def _recover_pending_tasks(
     *,
     research_run_id: str | None = None,
     min_thread_create_time: datetime | None = None,
+    newest_first: bool = False,
 ) -> None:
     """启动时恢复未完成任务并重新入队。
 
@@ -85,6 +86,8 @@ async def _recover_pending_tasks(
         extra_scope_kwargs: dict[str, Any] = (
             {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
         )
+        if newest_first:
+            extra_scope_kwargs["newest_first"] = True
         for scope_type in ("thread_replies", "post_comments"):
             async for scope_batch in pending_scopes(
                 research_run_id,
@@ -198,12 +201,15 @@ async def _dispatch_pending_comment_scopes(
     selected_comment_scopes: set[tuple[str, int]] | None = None,
     selected_thread_scopes: set[tuple[str, int]] | None = None,
     min_thread_create_time: datetime | None = None,
+    newest_first: bool = False,
 ) -> bool:
     """Feed durable pending comment scopes into the bounded comments queue."""
     dispatched: set[tuple[str, int]] = set()
     extra_scope_kwargs: dict[str, Any] = (
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
+    if newest_first:
+        extra_scope_kwargs["newest_first"] = True
 
     async def read_pending() -> list[Any]:
         scopes: list[Any] = []
@@ -1172,6 +1178,7 @@ async def main(
     run_id: str | None = None,
     revalidate_failed_comment_page_zero: bool = False,
     min_thread_year: int | None = None,
+    newest_first: bool = False,
 ):
     """统一入口，根据模式启动应用。
 
@@ -1192,6 +1199,11 @@ async def main(
         logger.info(
             "Priority min-thread-year filter enabled: only threads created on/after {} are scanned in detail.",
             min_thread_create_time.isoformat(),
+        )
+    if newest_first:
+        logger.info(
+            "Newest-first ordering enabled: WEB tasks (thread->post->comment per tid DESC) "
+            "and pending scope recovery run newest-first."
         )
 
     shutdown_event = asyncio.Event()
@@ -1388,13 +1400,16 @@ async def main(
         extra_filter_kwargs: dict[str, Any] = (
             {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
         )
+        extra_order_kwargs = dict(extra_filter_kwargs)
+        if newest_first:
+            extra_order_kwargs["newest_first"] = True
         recovery_task = asyncio.create_task(
             _recover_pending_tasks(
                 datastore,
                 router,
                 responsible_fids=responsible_fids,
                 research_run_id=research_run_id,
-                **extra_filter_kwargs,
+                **extra_order_kwargs,
             ),
             name="api-pending-recovery",
         )
@@ -1409,7 +1424,7 @@ async def main(
                     responsible_fids,
                     research_run_id,
                     producers_done=producers_done,
-                    **extra_filter_kwargs,
+                    **extra_order_kwargs,
                 ),
                 name="api-comment-scope-dispatcher",
             )
@@ -1433,7 +1448,7 @@ async def main(
                     api_done_event=api_done_event,
                     browser_profile=web_config.browser_profile,
                     browser_config=web_config,
-                    **extra_filter_kwargs,
+                    **extra_order_kwargs,
                 ),
                 name="web-fallback-worker",
             )
@@ -1649,6 +1664,14 @@ if __name__ == "__main__":
             "older threads remain deferred"
         ),
     )
+    parser.add_argument(
+        "--newest-first",
+        action="store_true",
+        help=(
+            "lease WEB tasks newest-first per thread (thread -> post -> comment) "
+            "and recover pending scopes newest-first"
+        ),
+    )
     parser.add_argument("--tid", type=positive_int, help="limit drain-pending to this thread ID")
     parser.add_argument(
         "--limit",
@@ -1674,6 +1697,8 @@ if __name__ == "__main__":
             parser.error("--revalidate-failed-comment-page-zero cannot be combined with drain-pending")
         if args.min_thread_year is not None:
             parser.error("--min-thread-year cannot be combined with drain-pending")
+        if args.newest_first:
+            parser.error("--newest-first cannot be combined with drain-pending")
     else:
         if args.run_id and not args.resume:
             parser.error("--run-id requires --resume")
@@ -1704,6 +1729,7 @@ if __name__ == "__main__":
                 run_id=args.run_id,
                 revalidate_failed_comment_page_zero=args.revalidate_failed_comment_page_zero,
                 min_thread_year=args.min_thread_year,
+                newest_first=args.newest_first,
             )
         if loop_factory is not None:
             with asyncio.Runner(loop_factory=loop_factory) as runner:
