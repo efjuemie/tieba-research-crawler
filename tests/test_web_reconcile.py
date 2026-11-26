@@ -742,6 +742,56 @@ async def test_live_web_worker_drains_after_api_done_and_uses_its_own_budget(rec
 
 
 @pytest.mark.asyncio
+async def test_live_web_worker_accepts_min_ip_create_time_and_priority_kwargs(reconcile_db):
+    from tiebameow.models.orm import Thread
+
+    engine, maker = reconcile_db
+    Thread.__table__.create(engine, checkfirst=True)
+    await enqueue_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        ["author_nickname"],
+        target_type="post",
+        target_ids=[2101],
+        tid=1001,
+    )
+    stop_event = asyncio.Event()
+    api_done_event = asyncio.Event()
+    visited = []
+
+    class Provider:
+        async def collect(self, target):
+            visited.append(target.target_id)
+            api_done_event.set()
+            return SimpleNamespace(
+                status="ok",
+                candidates=(_candidate(target, "author_nickname", f"web-{target.target_id}"),),
+                field_outcomes={},
+                diagnostics={"pages": 1},
+            )
+
+    result = await service.run_live_web_fallback_worker(
+        maker,
+        lambda: ("run-reconcile-001",),
+        stop_event=stop_event,
+        api_done_event=api_done_event,
+        browser_profile="synthetic-profile",
+        browser_config=SimpleNamespace(rps=0.2),
+        provider_factory=lambda **_kwargs: Provider(),
+        headed=False,
+        wait_for_login=False,
+        min_ip_create_time=datetime(2022, 4, 28, tzinfo=UTC),
+        priority_min_thread_create_time=datetime(2021, 1, 1, tzinfo=UTC),
+        prioritize_comments=True,
+        newest_first=True,
+    )
+
+    assert result.completed_count == 1
+    assert result.unresolved_count == 0
+    assert visited == ["2101"]
+
+
+@pytest.mark.asyncio
 async def test_user_stop_interrupts_api_done_web_drain_after_current_visit(reconcile_db):
     _engine, maker = reconcile_db
     await enqueue_web_enrichment_tasks(

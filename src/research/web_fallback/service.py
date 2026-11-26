@@ -904,13 +904,18 @@ async def drain_pending_web_enrichment(
         if stop_event is not None and stop_event.is_set():
             break
 
+        process_kwargs: dict[str, Any] = {"stop_event": stop_event}
+        enqueue_kwargs: dict[str, Any] = {}
+        if min_ip_create_time is not None:
+            process_kwargs["min_ip_create_time"] = min_ip_create_time
+            enqueue_kwargs["min_ip_create_time"] = min_ip_create_time
+
         try:
             status, result = await _process_durable_web_lease(
                 sessions,
                 provider,
                 lease,
-                stop_event=stop_event,
-                min_ip_create_time=min_ip_create_time,
+                **process_kwargs,
             )
         except asyncio.CancelledError:
             raise
@@ -946,9 +951,7 @@ async def drain_pending_web_enrichment(
             completed += 1
         elif status == "partially_completed":
             partial += 1
-            await _enqueue_remaining_fields(
-                sessions, lease, min_ip_create_time=min_ip_create_time
-            )
+            await _enqueue_remaining_fields(sessions, lease, **enqueue_kwargs)
 
         reason = getattr(result, "reason", None)
         if status == "failed_retryable" and reason == "transport_reset":
@@ -1062,17 +1065,17 @@ async def run_live_web_fallback_worker(
     extra_filter_kwargs: dict[str, Any] = (
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
-    drain_kwargs = dict(extra_filter_kwargs)
+    lease_kwargs = dict(extra_filter_kwargs)
     if priority_min_thread_create_time is not None:
-        drain_kwargs["priority_min_thread_create_time"] = priority_min_thread_create_time
+        lease_kwargs["priority_min_thread_create_time"] = priority_min_thread_create_time
     if prioritize_comments:
-        drain_kwargs["prioritize_comments"] = True
+        lease_kwargs["prioritize_comments"] = True
     if newest_first:
-        drain_kwargs["newest_first"] = True
+        lease_kwargs["newest_first"] = True
+    drain_kwargs = dict(lease_kwargs)
     if min_ip_create_time is not None:
         drain_kwargs["min_ip_create_time"] = min_ip_create_time
     lease_seconds = _web_lease_seconds(browser_config)
-    lease_kwargs = dict(drain_kwargs)
     if lease_seconds > 240:
         lease_kwargs["lease_seconds"] = lease_seconds
     try:
@@ -1112,13 +1115,18 @@ async def run_live_web_fallback_worker(
             if stop_event.is_set():
                 break
 
+            process_kwargs: dict[str, Any] = {"stop_event": stop_event}
+            enqueue_kwargs: dict[str, Any] = {}
+            if min_ip_create_time is not None:
+                process_kwargs["min_ip_create_time"] = min_ip_create_time
+                enqueue_kwargs["min_ip_create_time"] = min_ip_create_time
+
             try:
                 status, result = await _process_durable_web_lease(
                     sessions,
                     provider,
                     lease,
-                    stop_event=stop_event,
-                    min_ip_create_time=min_ip_create_time,
+                    **process_kwargs,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1154,9 +1162,7 @@ async def run_live_web_fallback_worker(
                 completed += 1
             elif status == "partially_completed":
                 partial += 1
-                await _enqueue_remaining_fields(
-                    sessions, lease, min_ip_create_time=min_ip_create_time
-                )
+                await _enqueue_remaining_fields(sessions, lease, **enqueue_kwargs)
 
             reason = getattr(result, "reason", None)
             if status == "failed_retryable" and reason == "transport_reset":
