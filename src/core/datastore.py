@@ -1336,6 +1336,7 @@ class DataStore:
         scope_type: Literal["post_comments", "thread_replies"] | None = None,
         status: str | None = None,
         min_thread_create_time: datetime | None = None,
+        older_than_thread_create_time: datetime | None = None,
         newest_first: bool = False,
     ) -> AsyncIterator[list[ResearchTaskScope]]:
         """Yield current detail scopes in bounded, comments-first batches.
@@ -1351,6 +1352,8 @@ class DataStore:
             raise ValueError("tid must be positive")
         if limit is not None and limit < 1:
             raise ValueError("limit must be positive")
+        if min_thread_create_time is not None and older_than_thread_create_time is not None:
+            raise ValueError("min_thread_create_time and older_than_thread_create_time are mutually exclusive")
         if not responsible_fids:
             return
         yielded = 0
@@ -1400,6 +1403,16 @@ class DataStore:
                                 )
                             )
                         )
+                    if older_than_thread_create_time is not None:
+                        filters.append(
+                            exists(
+                                select(1).where(
+                                    Thread.tid == ResearchTaskScope.tid,
+                                    Thread.create_time.is_not(None),
+                                    Thread.create_time < older_than_thread_create_time,
+                                )
+                            )
+                        )
                     order_clauses = (
                         (tid_order_expr.desc(), ResearchTaskScope.logical_task_key.desc())
                         if newest_first
@@ -1420,6 +1433,38 @@ class DataStore:
                     last_key = rows[-1].logical_task_key
                 yielded += len(rows)
                 yield rows
+
+    async def count_pending_research_task_scopes(
+        self,
+        run_id: str,
+        responsible_fids: set[int],
+        *,
+        min_thread_create_time: datetime | None = None,
+        scope_types: tuple[str, ...] = ("thread_replies", "post_comments"),
+        statuses: tuple[str, ...] = ("pending", "running"),
+    ) -> int:
+        """Count active pending/running detail scopes optionally fenced by min_thread_create_time."""
+        if not responsible_fids or not scope_types or not statuses:
+            return 0
+        filters = [
+            ResearchTaskScope.run_id == run_id,
+            ResearchTaskScope.fid.in_(responsible_fids),
+            ResearchTaskScope.scope_type.in_(scope_types),
+            ResearchTaskScope.status.in_(statuses),
+        ]
+        if min_thread_create_time is not None:
+            filters.append(
+                ~exists(
+                    select(1).where(
+                        Thread.tid == ResearchTaskScope.tid,
+                        Thread.create_time.is_not(None),
+                        Thread.create_time < min_thread_create_time,
+                    )
+                )
+            )
+        async with self.async_sessionmaker() as session:
+            count = await session.scalar(select(func.count()).select_from(ResearchTaskScope).where(*filters))
+            return int(count or 0)
 
     async def adopt_legacy_research_scopes(self, run_id: str, responsible_fids: set[int]) -> None:
         """Adopt old pending full scans as generation-zero authoritative scopes."""

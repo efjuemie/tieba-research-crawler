@@ -34,6 +34,17 @@ def test_parse_ip_location_min_date_accepts_date_none_and_rejects_invalid():
 
 
 @pytest.mark.asyncio
+async def test_api_continue_older_requires_min_thread_year(monkeypatch):
+    initialize = AsyncMock()
+    monkeypatch.setattr(app_main, "initialize_application", initialize)
+
+    with pytest.raises(ValueError, match="--api-continue-older requires --min-thread-year"):
+        await app_main.main(api_continue_older=True)
+
+    initialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_main_propagates_incomplete_backfill_failure(monkeypatch):
     class FakeDataStore:
         def __init__(self, _container):

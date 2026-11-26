@@ -93,3 +93,32 @@ def test_web_fallback_ip_location_min_date_defaults_and_normalization():
         cfg = WebFallbackConfig(ip_location_min_date=disabled)
         assert cfg.ip_location_min_date is None
         assert cfg.ip_location_min_time is None
+
+
+def test_web_fallback_cache_blocking_and_priority_defaults_and_bounds():
+    default_cfg = WebFallbackConfig()
+    assert default_cfg.parent_snapshot_ttl_seconds == 30.0
+    assert default_cfg.parent_snapshot_max_targets == 8
+    assert default_cfg.block_nonessential_resources is False
+    assert default_cfg.prioritize_comments is False
+
+    custom = WebFallbackConfig(
+        rps=0.4,
+        parent_snapshot_ttl_seconds=300.0,
+        parent_snapshot_max_targets=200,
+        block_nonessential_resources=True,
+        prioritize_comments=True,
+    )
+    assert custom.rps == 0.4
+    assert custom.parent_snapshot_ttl_seconds == 300.0
+    assert custom.parent_snapshot_max_targets == 200
+    assert custom.block_nonessential_resources is True
+    assert custom.prioritize_comments is True
+
+    for invalid in (
+        {"parent_snapshot_ttl_seconds": 0},
+        {"parent_snapshot_max_targets": 0},
+        {"parent_snapshot_max_targets": 501},
+    ):
+        with pytest.raises(ValidationError):
+            WebFallbackConfig(**invalid)

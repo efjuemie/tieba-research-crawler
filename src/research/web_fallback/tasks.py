@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from sqlalchemy import and_, any_, bindparam, case, exists, select, text
+from sqlalchemy import String, and_, any_, bindparam, case, cast, exists, func, select, text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -1253,6 +1253,8 @@ async def lease_web_enrichment_tasks(
     task_keys: Sequence[str] | None = None,
     now: datetime | None = None,
     min_thread_create_time: datetime | None = None,
+    priority_min_thread_create_time: datetime | None = None,
+    prioritize_comments: bool = False,
     newest_first: bool = False,
 ) -> list[WebEnrichmentTaskLease]:
     """Lease due tasks in a short transaction; caller performs HTTP after return."""
@@ -1300,6 +1302,39 @@ async def lease_web_enrichment_tasks(
                     )
                 ),
             )
+        leading_orders: list[Any] = []
+        if priority_min_thread_create_time is not None:
+            era_rank = case(
+                (
+                    exists(
+                        select(1).where(
+                            Thread.tid == ResearchWebEnrichmentTask.tid,
+                            Thread.create_time.is_not(None),
+                            Thread.create_time < priority_min_thread_create_time,
+                        )
+                    ),
+                    1,
+                ),
+                else_=0,
+            )
+            leading_orders.append(era_rank.asc())
+        if prioritize_comments:
+            ip_only_expr = (
+                func.replace(cast(ResearchWebEnrichmentTask.requested_fields_json, String), " ", "")
+                == '["ip_location_text"]'
+            )
+            comment_priority_rank = case(
+                (ResearchWebEnrichmentTask.target_type == "comment", 0),
+                (
+                    and_(
+                        ResearchWebEnrichmentTask.target_type.in_(("thread", "post")),
+                        ip_only_expr,
+                    ),
+                    2,
+                ),
+                else_=1,
+            )
+            leading_orders.append(comment_priority_rank.asc())
         if newest_first:
             target_type_rank = case(
                 (ResearchWebEnrichmentTask.target_type == "thread", 0),
@@ -1308,6 +1343,7 @@ async def lease_web_enrichment_tasks(
                 else_=3,
             )
             order_clauses: tuple[Any, ...] = (
+                *leading_orders,
                 ResearchWebEnrichmentTask.attempts.asc(),
                 ResearchWebEnrichmentTask.priority.desc(),
                 ResearchWebEnrichmentTask.tid.desc(),
@@ -1319,6 +1355,7 @@ async def lease_web_enrichment_tasks(
             )
         else:
             order_clauses = (
+                *leading_orders,
                 ResearchWebEnrichmentTask.attempts.asc(),
                 ResearchWebEnrichmentTask.priority.desc(),
                 ResearchWebEnrichmentTask.target_type,
@@ -1609,6 +1646,94 @@ async def prune_pre_launch_ip_web_tasks(
     return counts
 
 
+async def prune_stale_web_tasks(
+    async_sessionmaker_: async_sessionmaker,
+    run_ids: Sequence[str],
+    *,
+    min_thread_create_time: datetime | None = None,
+) -> int:
+    """Mark open WEB tasks whose target row has a newer API observed_at as failed_final."""
+    if not run_ids:
+        return 0
+    stable_run_ids = tuple(dict.fromkeys(run_ids))
+    now = datetime.now(UTC)
+    pruned = 0
+    models = (
+        ("thread", ResearchThread, ResearchThread.tid),
+        ("post", ResearchPost, ResearchPost.pid),
+        ("comment", ResearchComment, ResearchComment.cid),
+    )
+
+    for target_type, model, id_col in models:
+        async with async_sessionmaker_() as session:
+            dialect = session.get_bind().dialect.name
+            stmt = (
+                select(
+                    ResearchWebEnrichmentTask.task_key,
+                    ResearchWebEnrichmentTask.target_observed_at,
+                    model.observed_at,
+                )
+                .join(model, id_col == ResearchWebEnrichmentTask.target_id)
+                .where(
+                    ResearchWebEnrichmentTask.run_id.in_(stable_run_ids),
+                    ResearchWebEnrichmentTask.target_type == target_type,
+                    ResearchWebEnrichmentTask.status.in_(
+                        ("pending_web", "failed_retryable", "pending_api_detail")
+                    ),
+                    model.observed_at.is_not(None),
+                )
+            )
+            if dialect == "postgresql":
+                stmt = stmt.where(
+                    model.observed_at.is_distinct_from(ResearchWebEnrichmentTask.target_observed_at)
+                )
+            if min_thread_create_time is not None:
+                stmt = stmt.where(
+                    ~exists(
+                        select(1).where(
+                            Thread.tid == ResearchWebEnrichmentTask.tid,
+                            Thread.create_time.is_not(None),
+                            Thread.create_time < min_thread_create_time,
+                        )
+                    )
+                )
+            rows = (await session.execute(stmt)).all()
+
+        stale_keys = [
+            task_key
+            for task_key, task_obs, row_obs in rows
+            if row_obs is not None and _now(row_obs) != _now(task_obs)
+        ]
+        for chunk_start in range(0, len(stale_keys), 500):
+            chunk = stale_keys[chunk_start : chunk_start + 500]
+            async with async_sessionmaker_() as session, session.begin():
+                tasks = (
+                    await session.scalars(
+                        select(ResearchWebEnrichmentTask)
+                        .where(ResearchWebEnrichmentTask.task_key.in_(chunk))
+                        .with_for_update(skip_locked=True)
+                    )
+                ).all()
+                for task in tasks:
+                    if task.status not in ("pending_web", "failed_retryable", "pending_api_detail"):
+                        continue
+                    task.status = "failed_final"
+                    task.last_error_type = "failed_final"
+                    task.last_error = "target_observed_at_changed"
+                    task.lease_token = None
+                    task.lease_owner = None
+                    task.lease_until = None
+                    task.leased_at = None
+                    task.next_retry_at = None
+                    task.completed_at = now
+                    task.updated_at = now
+                    pruned += 1
+            if chunk_start + 500 < len(stale_keys):
+                await asyncio.sleep(0)
+
+    return pruned
+
+
 __all__ = [
     "EnqueueSummary",
     "IP_BEFORE_LAUNCH_REASON",
@@ -1623,5 +1748,6 @@ __all__ = [
     "lease_web_enrichment_tasks",
     "plan_web_enrichment_targets",
     "prune_pre_launch_ip_web_tasks",
+    "prune_stale_web_tasks",
     "resume_web_enrichment_tasks",
 ]

@@ -36,6 +36,18 @@ from .network import (
 _CALLBACK_CLEANUP_TIMEOUT_SECONDS = 0.05
 _PARENT_SNAPSHOT_TTL_SECONDS = 30.0
 _PARENT_SNAPSHOT_MAX_TARGETS = 8
+_BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
+_BLOCKED_ANALYTICS_HOSTS = frozenset(
+    {
+        "hm.baidu.com",
+        "pos.baidu.com",
+        "eclick.baidu.com",
+        "cpro.baidustatic.com",
+        "als.baidu.com",
+        "sp0.baidu.com",
+        "nsclick.baidu.com",
+    }
+)
 _TRANSPORT_ERRORS = (ConnectionResetError, BrokenPipeError, EOFError, asyncio.IncompleteReadError)
 _COMMENT_GROWTH_HYDRATION_WAIT_SECONDS = 2.0
 _COMMENT_GROWTH_HYDRATION_POLL_SECONDS = 0.05
@@ -232,6 +244,9 @@ class PlaywrightWebFallbackProvider:
         on_blocked: Any | None = None,
         playwright_factory: Any | None = None,
         reuse_parent_snapshots: bool = False,
+        parent_snapshot_ttl_seconds: float = _PARENT_SNAPSHOT_TTL_SECONDS,
+        parent_snapshot_max_targets: int = _PARENT_SNAPSHOT_MAX_TARGETS,
+        block_nonessential_resources: bool = False,
     ) -> None:
         if budget is None or not hasattr(budget, "__aenter__"):
             raise BrowserProviderConfigurationError("an async request budget is required")
@@ -249,6 +264,20 @@ class PlaywrightWebFallbackProvider:
             raise ValueError("headless and keep_login_page must be booleans")
         if not isinstance(reuse_parent_snapshots, bool):
             raise ValueError("reuse_parent_snapshots must be a boolean")
+        if (
+            isinstance(parent_snapshot_ttl_seconds, bool)
+            or not isinstance(parent_snapshot_ttl_seconds, (int, float))
+            or parent_snapshot_ttl_seconds <= 0
+        ):
+            raise ValueError("parent_snapshot_ttl_seconds must be positive")
+        if (
+            isinstance(parent_snapshot_max_targets, bool)
+            or not isinstance(parent_snapshot_max_targets, int)
+            or parent_snapshot_max_targets < 1
+        ):
+            raise ValueError("parent_snapshot_max_targets must be a positive integer")
+        if not isinstance(block_nonessential_resources, bool):
+            raise ValueError("block_nonessential_resources must be a boolean")
         if keep_login_page and headless:
             raise BrowserProviderConfigurationError("keep_login_page requires headless=False")
         if profile_dir is not None:
@@ -258,6 +287,7 @@ class PlaywrightWebFallbackProvider:
         self._external_context = context
         self._context = context
         self._owned_context = False
+        self._route_installed = False
         self._playwright_factory = playwright_factory
         self._manager = None
         self._playwright = None
@@ -267,6 +297,9 @@ class PlaywrightWebFallbackProvider:
         self._headless = headless
         self._keep_login_page = keep_login_page
         self._reuse_parent_snapshots = reuse_parent_snapshots
+        self._parent_snapshot_ttl_seconds = float(parent_snapshot_ttl_seconds)
+        self._parent_snapshot_max_targets = parent_snapshot_max_targets
+        self._block_nonessential_resources = block_nonessential_resources
         self._on_blocked = on_blocked
         self._target_semaphore = asyncio.Semaphore(1)
         self._closed = False
@@ -391,7 +424,7 @@ class PlaywrightWebFallbackProvider:
             return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
         cached_page = self._cached_post_page
         reuse_page = (
-            target.target_type == "post"
+            target.target_type in {"thread", "post"}
             and cached_page is not None
             and cached_page.tid == target.tid
         )
@@ -491,9 +524,9 @@ class PlaywrightWebFallbackProvider:
                     parent_snapshot_pending.append(snapshot)
             if (
                 path == PAGE_PC_PATH
-                and target.target_type == "post"
+                and target.target_type in {"thread", "post"}
                 and result.identity_verified
-                and context_snapshot.target.target_type == "post"
+                and context_snapshot.target.target_type in {"thread", "post"}
             ):
                 post_page_snapshot = _CachedPostPage(
                     page=page,
@@ -628,7 +661,12 @@ class PlaywrightWebFallbackProvider:
                     target=target,
                     context_id=f"{cached_page.request_context.context_id}:cached:{uuid.uuid4().hex}",
                 )
-                cached_result = extract_page_pc_post(
+                cached_parser = (
+                    extract_page_pc_thread_counts
+                    if target.target_type == "thread"
+                    else extract_page_pc_post
+                )
+                cached_result = cached_parser(
                     target,
                     cached_page.response_text,
                     cached_context,
@@ -645,8 +683,10 @@ class PlaywrightWebFallbackProvider:
                         response_status=cached_page.response_status,
                     )
                     state["page_cache_hits"] = 1
-                    dom_result = await _extract_post_dom_with_scroll(
-                        page, target, deadline, state
+                    dom_result = (
+                        _extract_dom_or_empty(target, page.url, await page.content())
+                        if target.target_type == "thread"
+                        else await _extract_post_dom_with_scroll(page, target, deadline, state)
                     )
                     if dom_result.identity_verified:
                         dom_result = await _hover_growth_and_extract_dom(
@@ -670,7 +710,7 @@ class PlaywrightWebFallbackProvider:
                         and cached_parent is not None
                         and cached_parent.run_id == self._run_scope_id
                         and cached_parent.group_key == _parent_snapshot_group_key(target)
-                        and time.monotonic() - cached_parent.cached_at <= _PARENT_SNAPSHOT_TTL_SECONDS
+                        and time.monotonic() - cached_parent.cached_at <= self._parent_snapshot_ttl_seconds
                         and target_key in cached_parent.missed_target_ids
                     )
                     if not preserve_growth_miss:
@@ -871,7 +911,7 @@ class PlaywrightWebFallbackProvider:
                 dom_result is not None and dom_result.identity_verified
             )
             identity_methods = _identity_methods(target, network_results, dom_result)
-            if target.target_type == "post" and identity_verified and post_page_snapshot is not None:
+            if target.target_type in {"thread", "post"} and identity_verified and post_page_snapshot is not None:
                 self._cached_post_page = post_page_snapshot
             if candidates:
                 self._cache_parent_snapshots(target, parent_snapshot_pending)
@@ -1010,7 +1050,7 @@ class PlaywrightWebFallbackProvider:
             cached is not None
             and cached.run_id == self._run_scope_id
             and cached.group_key == group_key
-            and time.monotonic() - cached.cached_at <= _PARENT_SNAPSHOT_TTL_SECONDS
+            and time.monotonic() - cached.cached_at <= self._parent_snapshot_ttl_seconds
         ):
             added_snapshot = False
             for snapshot in snapshots:
@@ -1045,8 +1085,8 @@ class PlaywrightWebFallbackProvider:
         if (
             cached.run_id != self._run_scope_id
             or cached.group_key != group_key
-            or time.monotonic() - cached.cached_at > _PARENT_SNAPSHOT_TTL_SECONDS
-            or cached.target_count >= _PARENT_SNAPSHOT_MAX_TARGETS
+            or time.monotonic() - cached.cached_at > self._parent_snapshot_ttl_seconds
+            or cached.target_count >= self._parent_snapshot_max_targets
         ):
             self._cached_parent_snapshot = None
             state["parent_snapshot_misses"] = 1
@@ -1092,7 +1132,7 @@ class PlaywrightWebFallbackProvider:
         ):
             cached.missed_target_ids.add(target_key)
             state["parent_snapshot_misses"] = 1
-            if cached.target_count >= _PARENT_SNAPSHOT_MAX_TARGETS:
+            if cached.target_count >= self._parent_snapshot_max_targets:
                 self._cached_parent_snapshot = None
             return None
 
@@ -1123,7 +1163,7 @@ class PlaywrightWebFallbackProvider:
                 candidates_by_field.setdefault(candidate.field_name, candidate)
         for field_name in candidates_by_field:
             outcomes.pop(field_name, None)
-        if cached.target_count >= _PARENT_SNAPSHOT_MAX_TARGETS:
+        if cached.target_count >= self._parent_snapshot_max_targets:
             self._cached_parent_snapshot = None
         state["parent_snapshot_hits"] = 1
         return BrowserRunResult(
@@ -1348,8 +1388,32 @@ class PlaywrightWebFallbackProvider:
             if state["blocked_reason"]:
                 return
 
+    async def _install_resource_route(self, context: Any) -> None:
+        route_fn = getattr(context, "route", None)
+        if not callable(route_fn) or self._route_installed:
+            return
+
+        async def _route_handler(route) -> None:
+            request = getattr(route, "request", None)
+            resource_type = (getattr(request, "resource_type", None) or "").lower()
+            host = (urlparse(getattr(request, "url", "") or "").hostname or "").lower()
+            try:
+                if resource_type in _BLOCKED_RESOURCE_TYPES or host in _BLOCKED_ANALYTICS_HOSTS:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:
+                pass
+
+        result = route_fn("**/*", _route_handler)
+        if asyncio.iscoroutine(result):
+            await result
+        self._route_installed = True
+
     async def _ensure_context(self):
         if self._context is not None:
+            if self._block_nonessential_resources and not self._route_installed:
+                await self._install_resource_route(self._context)
             return self._context
         if self.profile_dir is None:
             raise BrowserProviderConfigurationError("no browser context available")
@@ -1371,6 +1435,8 @@ class PlaywrightWebFallbackProvider:
             headless=self._headless,
         )
         self._owned_context = True
+        if self._block_nonessential_resources:
+            await self._install_resource_route(self._context)
         return self._context
 
     @asynccontextmanager

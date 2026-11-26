@@ -26,6 +26,7 @@ from src.research.web_fallback.live import (
     discover_missing_web_targets,
     pending_web_run_ids,
     prune_pre_launch_ip_web_tasks,
+    prune_stale_web_tasks,
     run_live_web_worker,
 )
 from src.scraper import Scheduler, Worker
@@ -85,6 +86,8 @@ async def _recover_pending_tasks(
     research_run_id: str | None = None,
     min_thread_create_time: datetime | None = None,
     newest_first: bool = False,
+    api_continue_older: bool = False,
+    older_api_enabled: asyncio.Event | None = None,
 ) -> None:
     """启动时恢复未完成任务并重新入队。
 
@@ -123,6 +126,49 @@ async def _recover_pending_tasks(
 
         if recovered:
             logger.info("Recovered current research task scopes: {}", recovered)
+
+        if api_continue_older and min_thread_create_time is not None:
+            count_pending = getattr(datastore, "count_pending_research_task_scopes", None)
+            if count_pending is not None:
+                while True:
+                    remaining_priority = await count_pending(
+                        research_run_id,
+                        responsible_fids,
+                        min_thread_create_time=min_thread_create_time,
+                    )
+                    posts_empty = router.get_queue("posts").empty()
+                    comments_empty = router.get_queue("comments").empty()
+                    if remaining_priority == 0 and posts_empty and comments_empty:
+                        break
+                    await asyncio.sleep(2.0)
+
+            logger.info(
+                "All >= {} API detail scopes completed; continuing to older (< {}) pending scopes.",
+                min_thread_create_time.isoformat(),
+                min_thread_create_time.isoformat(),
+            )
+            if older_api_enabled is not None:
+                older_api_enabled.set()
+            older_scope_kwargs: dict[str, Any] = {"older_than_thread_create_time": min_thread_create_time}
+            if newest_first:
+                older_scope_kwargs["newest_first"] = True
+            older_recovered = 0
+            for scope_type in ("thread_replies", "post_comments"):
+                async for scope_batch in pending_scopes(
+                    research_run_id,
+                    responsible_fids,
+                    batch_size=500,
+                    scope_type=scope_type,
+                    **older_scope_kwargs,
+                ):
+                    older_recovered += await _enqueue_research_scope_batch(
+                        router,
+                        scope_batch,
+                        responsible_fids,
+                        research_run_id,
+                    )
+            if older_recovered:
+                logger.info("Enqueued older (< {}) research task scopes: {}", min_thread_create_time.isoformat(), older_recovered)
         return
 
     recovered_threads = 0
@@ -220,6 +266,7 @@ async def _dispatch_pending_comment_scopes(
     selected_thread_scopes: set[tuple[str, int]] | None = None,
     min_thread_create_time: datetime | None = None,
     newest_first: bool = False,
+    older_api_enabled: asyncio.Event | None = None,
 ) -> bool:
     """Feed durable pending comment scopes into the bounded comments queue."""
     dispatched: set[tuple[str, int]] = set()
@@ -231,23 +278,35 @@ async def _dispatch_pending_comment_scopes(
 
     async def read_pending() -> list[Any]:
         scopes: list[Any] = []
-        async for batch in datastore.iter_pending_research_task_scopes(
-            research_run_id,
-            responsible_fids,
-            batch_size=500,
-            scope_type="post_comments",
-            status="pending",
-            **extra_scope_kwargs,
+        passes: list[dict[str, Any]] = [extra_scope_kwargs]
+        if (
+            min_thread_create_time is not None
+            and older_api_enabled is not None
+            and older_api_enabled.is_set()
         ):
-            for scope in batch:
-                key = (scope.logical_task_key, scope.generation)
-                parent_key = (scope.parent_logical_task_key, scope.parent_generation)
-                if selected_comment_scopes is not None or selected_thread_scopes is not None:
-                    if key not in (selected_comment_scopes or set()) and parent_key not in (
-                        selected_thread_scopes or set()
-                    ):
-                        continue
-                scopes.append(scope)
+            older_kwargs = {"older_than_thread_create_time": min_thread_create_time}
+            if newest_first:
+                older_kwargs["newest_first"] = True
+            passes.append(older_kwargs)
+
+        for pass_kwargs in passes:
+            async for batch in datastore.iter_pending_research_task_scopes(
+                research_run_id,
+                responsible_fids,
+                batch_size=500,
+                scope_type="post_comments",
+                status="pending",
+                **pass_kwargs,
+            ):
+                for scope in batch:
+                    key = (scope.logical_task_key, scope.generation)
+                    parent_key = (scope.parent_logical_task_key, scope.parent_generation)
+                    if selected_comment_scopes is not None or selected_thread_scopes is not None:
+                        if key not in (selected_comment_scopes or set()) and parent_key not in (
+                            selected_thread_scopes or set()
+                        ):
+                            continue
+                    scopes.append(scope)
         return scopes
 
     while True:
@@ -1198,6 +1257,8 @@ async def main(
     min_thread_year: int | None = None,
     newest_first: bool = False,
     ip_location_min_date: str | None = None,
+    api_continue_older: bool = False,
+    prioritize_web_comments: bool | None = None,
 ):
     """统一入口，根据模式启动应用。
 
@@ -1210,6 +1271,8 @@ async def main(
         raise ValueError("--backfill-sort can only be used with --mode backfill.")
     if revalidate_failed_comment_page_zero and not resume:
         raise ValueError("--revalidate-failed-comment-page-zero requires --resume.")
+    if api_continue_older and min_thread_year is None:
+        raise ValueError("--api-continue-older requires --min-thread-year.")
     min_thread_create_time = _min_thread_create_time(min_thread_year)
     explicit_min_ip_create_time = (
         _parse_ip_location_min_date(ip_location_min_date)
@@ -1219,23 +1282,31 @@ async def main(
     container, router = await initialize_application(mode=mode)
     container.revalidate_failed_comment_page_zero = revalidate_failed_comment_page_zero
     container.min_thread_create_time = min_thread_create_time
+    pydantic_cfg = getattr(container.config, "pydantic_config", None)
+    web_cfg = getattr(pydantic_cfg, "web_fallback", None)
     if ip_location_min_date is not None:
         min_ip_create_time = explicit_min_ip_create_time
     else:
-        pydantic_cfg = getattr(container.config, "pydantic_config", None)
-        web_cfg = getattr(pydantic_cfg, "web_fallback", None)
         min_ip_create_time = getattr(web_cfg, "ip_location_min_time", None)
+    web_prioritize_comments = (
+        prioritize_web_comments
+        if prioritize_web_comments is not None
+        else bool(getattr(web_cfg, "prioritize_comments", False))
+    )
     container.min_ip_create_time = min_ip_create_time
     if min_thread_create_time is not None:
         logger.info(
-            "Priority min-thread-year filter enabled: only threads created on/after {} are scanned in detail.",
+            "Priority min-thread-year filter enabled: only threads created on/after {} are scanned in detail{}.",
             min_thread_create_time.isoformat(),
+            " first (API continues older afterwards)" if api_continue_older else "",
         )
     if min_ip_create_time is not None:
         logger.info(
             "WEB ip_location_text cutoff enabled: skipping WEB enrichment for content created before {}.",
             min_ip_create_time.isoformat(),
         )
+    if web_prioritize_comments:
+        logger.info("WEB comment prioritization enabled: comment tasks run before thread/post IP tasks.")
     if newest_first:
         logger.info(
             "Newest-first ordering enabled: WEB tasks (thread->post->comment per tid DESC) "
@@ -1439,10 +1510,28 @@ async def main(
         extra_order_kwargs = dict(extra_filter_kwargs)
         if newest_first:
             extra_order_kwargs["newest_first"] = True
-        extra_web_filter_kwargs = dict(extra_filter_kwargs)
+        older_api_enabled = (
+            asyncio.Event()
+            if (research_run_id is not None and api_continue_older and min_thread_create_time is not None)
+            else None
+        )
+        recovery_kwargs = dict(extra_order_kwargs)
+        if older_api_enabled is not None:
+            recovery_kwargs["api_continue_older"] = True
+            recovery_kwargs["older_api_enabled"] = older_api_enabled
+        dispatch_kwargs = dict(extra_order_kwargs)
+        if older_api_enabled is not None:
+            dispatch_kwargs["older_api_enabled"] = older_api_enabled
+        extra_web_filter_kwargs: dict[str, Any] = (
+            {} if (api_continue_older and min_thread_create_time is not None) else dict(extra_filter_kwargs)
+        )
         if min_ip_create_time is not None:
             extra_web_filter_kwargs["min_ip_create_time"] = min_ip_create_time
         extra_web_worker_kwargs = dict(extra_web_filter_kwargs)
+        if api_continue_older and min_thread_create_time is not None:
+            extra_web_worker_kwargs["priority_min_thread_create_time"] = min_thread_create_time
+        if web_prioritize_comments:
+            extra_web_worker_kwargs["prioritize_comments"] = True
         if newest_first:
             extra_web_worker_kwargs["newest_first"] = True
         recovery_task = asyncio.create_task(
@@ -1451,7 +1540,7 @@ async def main(
                 router,
                 responsible_fids=responsible_fids,
                 research_run_id=research_run_id,
-                **extra_order_kwargs,
+                **recovery_kwargs,
             ),
             name="api-pending-recovery",
         )
@@ -1466,7 +1555,7 @@ async def main(
                     responsible_fids,
                     research_run_id,
                     producers_done=producers_done,
-                    **extra_order_kwargs,
+                    **dispatch_kwargs,
                 ),
                 name="api-comment-scope-dispatcher",
             )
@@ -1479,20 +1568,36 @@ async def main(
                 research_run_id,
                 responsible_forums=responsible_forums,
             )
-            if min_ip_create_time is not None and web_run_ids:
-                pruned = await prune_pre_launch_ip_web_tasks(
+            if web_run_ids:
+                prune_scope_kwargs = (
+                    {"min_thread_create_time": min_thread_create_time}
+                    if (min_thread_create_time is not None and not api_continue_older)
+                    else {}
+                )
+                if min_ip_create_time is not None:
+                    pruned = await prune_pre_launch_ip_web_tasks(
+                        datastore.async_sessionmaker,
+                        web_run_ids,
+                        min_ip_create_time=min_ip_create_time,
+                        **prune_scope_kwargs,
+                    )
+                    if pruned["marked_not_applicable"] or pruned["annotated_mixed"]:
+                        logger.info(
+                            "Pruned pre-launch IP WEB tasks before worker start (cutoff={}): "
+                            "marked_not_applicable={}, annotated_mixed={}",
+                            min_ip_create_time.isoformat(),
+                            pruned["marked_not_applicable"],
+                            pruned["annotated_mixed"],
+                        )
+                stale_pruned = await prune_stale_web_tasks(
                     datastore.async_sessionmaker,
                     web_run_ids,
-                    min_ip_create_time=min_ip_create_time,
-                    **extra_filter_kwargs,
+                    **prune_scope_kwargs,
                 )
-                if pruned["marked_not_applicable"] or pruned["annotated_mixed"]:
+                if stale_pruned:
                     logger.info(
-                        "Pruned pre-launch IP WEB tasks before worker start (cutoff={}): "
-                        "marked_not_applicable={}, annotated_mixed={}",
-                        min_ip_create_time.isoformat(),
-                        pruned["marked_not_applicable"],
-                        pruned["annotated_mixed"],
+                        "Pruned stale WEB tasks (target_observed_at_changed) before worker start: {}",
+                        stale_pruned,
                     )
             web_stop_event = asyncio.Event()
             api_done_event = asyncio.Event()
@@ -1736,6 +1841,20 @@ if __name__ == "__main__":
             "(Asia/Shanghai); defaults to config (2022-04-28); pass 'none' to disable"
         ),
     )
+    parser.add_argument(
+        "--api-continue-older",
+        action="store_true",
+        help=(
+            "after finishing >= --min-thread-year API scopes, continue draining older pending scopes "
+            "while WEB still prioritizes >= --min-thread-year first"
+        ),
+    )
+    parser.add_argument(
+        "--prioritize-web-comments",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="prioritize WEB comment tasks ahead of thread/post IP-only tasks (defaults to config)",
+    )
     parser.add_argument("--tid", type=positive_int, help="limit drain-pending to this thread ID")
     parser.add_argument(
         "--limit",
@@ -1765,6 +1884,10 @@ if __name__ == "__main__":
             parser.error("--newest-first cannot be combined with drain-pending")
         if args.ip_location_min_date is not None:
             parser.error("--ip-location-min-date cannot be combined with drain-pending")
+        if args.api_continue_older:
+            parser.error("--api-continue-older cannot be combined with drain-pending")
+        if args.prioritize_web_comments is not None:
+            parser.error("--prioritize-web-comments cannot be combined with drain-pending")
     else:
         if args.run_id and not args.resume:
             parser.error("--run-id requires --resume")
@@ -1774,6 +1897,8 @@ if __name__ == "__main__":
             parser.error("--revalidate-failed-comment-page-zero requires --resume")
         if args.min_thread_year is not None and not 1990 <= args.min_thread_year <= 2100:
             parser.error("--min-thread-year must be between 1990 and 2100")
+        if args.api_continue_older and args.min_thread_year is None:
+            parser.error("--api-continue-older requires --min-thread-year")
         if args.ip_location_min_date is not None:
             try:
                 _parse_ip_location_min_date(args.ip_location_min_date)
@@ -1802,6 +1927,8 @@ if __name__ == "__main__":
                 min_thread_year=args.min_thread_year,
                 newest_first=args.newest_first,
                 ip_location_min_date=args.ip_location_min_date,
+                api_continue_older=args.api_continue_older,
+                prioritize_web_comments=args.prioritize_web_comments,
             )
         if loop_factory is not None:
             with asyncio.Runner(loop_factory=loop_factory) as runner:

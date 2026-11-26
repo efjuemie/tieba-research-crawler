@@ -2734,3 +2734,142 @@ async def test_thread_with_unverified_page_pc_exits_fast_as_identity_unverified(
     assert result.candidates == ()
     assert result.diagnostics["pages"] == 1
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_configurable_parent_snapshot_max_targets_avoids_reopen():
+    siblings = [
+        (str(9007199254742000 + index), str(78100 + index), f"地区{index}")
+        for index in range(12)
+    ]
+    comments = [(CID, AUTHOR_ID, "黑龙江"), *siblings]
+    shared_response = _page_pc_parent_response(comments)
+    pages = [
+        FakePage(page_pc_response_text=shared_response, nested_response_text=_nested_response())
+        for _ in range(2)
+    ]
+    context = FakeContext(lambda: pages.pop(0))
+    provider = _provider(
+        context,
+        reuse_parent_snapshots=True,
+        parent_snapshot_ttl_seconds=300.0,
+        parent_snapshot_max_targets=50,
+    )
+    provider.set_run_scope("synthetic-run")
+
+    anchor = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+    assert anchor.status == "ok"
+    for cid, author_id, _region in siblings:
+        res = await provider.collect(
+            _comment_target(
+                target_id=cid,
+                cid=cid,
+                author_user_id=author_id,
+                requested_fields=("ip_location_text",),
+            )
+        )
+        assert res.status == "ok"
+        assert res.diagnostics["parent_snapshot_hits"] == 1
+    assert len(context.pages) == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_block_nonessential_resources_aborts_images_fonts_and_analytics():
+    class _RoutingFakeContext(FakeContext):
+        def __init__(self, page_factory):
+            super().__init__(page_factory)
+            self.route_patterns = []
+            self.route_handler = None
+
+        async def route(self, pattern, handler):
+            self.route_patterns.append(pattern)
+            self.route_handler = handler
+
+    class _FakeRoute:
+        def __init__(self, url, resource_type):
+            self.request = FakeRequest(url, resource_type=resource_type)
+            self.aborted = False
+            self.continued = False
+
+        async def abort(self):
+            self.aborted = True
+
+        async def continue_(self):
+            self.continued = True
+
+    page = FakePage(
+        html_text=_thread_html(),
+        page_pc_response_text=_page_pc_response(),
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 0},
+    )
+    context = _RoutingFakeContext(lambda: page)
+    provider = _provider(context, block_nonessential_resources=True)
+    res = await provider.collect(_thread_target(requested_fields=("ip_location_text",)))
+    assert res.status == "ok"
+    assert context.route_patterns == ["**/*"]
+    assert context.route_handler is not None
+
+    img_route = _FakeRoute("https://tiebapic.baidu.com/pic.jpg", "image")
+    hm_route = _FakeRoute("https://hm.baidu.com/hm.js", "script")
+    doc_route = _FakeRoute("https://tieba.baidu.com/p/81001", "document")
+    xhr_route = _FakeRoute("https://tieba.baidu.com/p/page_pc", "xhr")
+    await context.route_handler(img_route)
+    await context.route_handler(hm_route)
+    await context.route_handler(doc_route)
+    await context.route_handler(xhr_route)
+    assert img_route.aborted is True
+    assert hm_route.aborted is True
+    assert doc_route.continued is True
+    assert xhr_route.continued is True
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_same_thread_reuses_page_snapshot_from_thread_to_post():
+    payload = json.loads(_page_pc_response())
+    payload["thread"]["author"] = {
+        "id": int(AUTHOR_ID),
+        "ip_address": "合成地区",
+        "user_growth": {"level_id": 5},
+    }
+    payload["post_list"] = [
+        {
+            "id": 45003,
+            "author_id": int(AUTHOR_ID),
+            "floor": 2,
+            "author": {
+                "id": int(AUTHOR_ID),
+                "portrait": PORTRAIT,
+                "ip_address": "广东",
+                "user_growth": {"level_id": 6},
+            },
+        }
+    ]
+    shared_html = (
+        f'<html><body><div class="image-text">'
+        f'<div class="pc-pb-first-floor-interactive"></div></div>'
+        f'<div class="pb-comment-item" data-id="45003">'
+        f'<div class="pb-content-wrap"><div class="richtext-item"><span tid="{TID}" fid="{FID}" index="1"></span></div></div>'
+        f'<div class="head-line user-info"><div class="name-info"><a class="head-name" href="https://tieba.baidu.com/home/main?id={PORTRAIT}">synthetic</a></div></div>'
+        f'<div class="desc-info"><span class="ip-address">广东</span></div>'
+        f"</div></body></html>"
+    )
+    page = FakePage(
+        html_text=shared_html,
+        page_pc_response_text=json.dumps(payload, ensure_ascii=False),
+        selector_readiness_result={"readyState": "complete", "visibleOwnerCount": 0},
+    )
+    context = FakeContext(lambda: page)
+    provider = _provider(context)
+
+    t_res = await provider.collect(_thread_target(requested_fields=("ip_location_text",)))
+    assert t_res.status == "ok"
+    assert t_res.diagnostics["pages"] == 1
+
+    p_res = await provider.collect(_post_target(requested_fields=("ip_location_text",)))
+    assert p_res.status == "ok"
+    assert p_res.diagnostics["pages"] == 0
+    assert p_res.diagnostics["page_cache_hits"] == 1
+    assert len(context.pages) == 1
+    await provider.close()

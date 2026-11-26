@@ -528,12 +528,18 @@ async def _lease_one_web_task(
     worker_id: str,
     *,
     min_thread_create_time: datetime | None = None,
+    priority_min_thread_create_time: datetime | None = None,
+    prioritize_comments: bool = False,
     lease_seconds: int | None = None,
     newest_first: bool = False,
 ):
     extra_kwargs: dict[str, Any] = {}
     if min_thread_create_time is not None:
         extra_kwargs["min_thread_create_time"] = min_thread_create_time
+    if priority_min_thread_create_time is not None:
+        extra_kwargs["priority_min_thread_create_time"] = priority_min_thread_create_time
+    if prioritize_comments:
+        extra_kwargs["prioritize_comments"] = True
     if lease_seconds is not None:
         extra_kwargs["lease_seconds"] = lease_seconds
     if newest_first:
@@ -832,6 +838,8 @@ async def drain_pending_web_enrichment(
     wait_for_login: bool = True,
     login_confirmation: Any | None = None,
     min_thread_create_time: datetime | None = None,
+    priority_min_thread_create_time: datetime | None = None,
+    prioritize_comments: bool = False,
     newest_first: bool = False,
     min_ip_create_time: datetime | None = None,
 ) -> WebWorkerSummary:
@@ -852,6 +860,10 @@ async def drain_pending_web_enrichment(
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
     lease_kwargs = dict(extra_filter_kwargs)
+    if priority_min_thread_create_time is not None:
+        lease_kwargs["priority_min_thread_create_time"] = priority_min_thread_create_time
+    if prioritize_comments:
+        lease_kwargs["prioritize_comments"] = True
     if newest_first:
         lease_kwargs["newest_first"] = True
 
@@ -1007,6 +1019,8 @@ async def run_live_web_fallback_worker(
     wait_for_login: bool = True,
     login_confirmation: Any | None = None,
     min_thread_create_time: datetime | None = None,
+    priority_min_thread_create_time: datetime | None = None,
+    prioritize_comments: bool = False,
     newest_first: bool = False,
     min_ip_create_time: datetime | None = None,
 ) -> WebWorkerSummary:
@@ -1049,6 +1063,10 @@ async def run_live_web_fallback_worker(
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
     drain_kwargs = dict(extra_filter_kwargs)
+    if priority_min_thread_create_time is not None:
+        drain_kwargs["priority_min_thread_create_time"] = priority_min_thread_create_time
+    if prioritize_comments:
+        drain_kwargs["prioritize_comments"] = True
     if newest_first:
         drain_kwargs["newest_first"] = True
     if min_ip_create_time is not None:
@@ -1453,6 +1471,9 @@ def _make_browser_provider(*, budget: Any, profile_dir: str | Path, settings: An
         headless=not headed,
         keep_login_page=keep_login_page,
         reuse_parent_snapshots=getattr(settings, "web_parent_batch_enabled", False),
+        parent_snapshot_ttl_seconds=float(getattr(settings, "parent_snapshot_ttl_seconds", 30.0)),
+        parent_snapshot_max_targets=int(getattr(settings, "parent_snapshot_max_targets", 8)),
+        block_nonessential_resources=bool(getattr(settings, "block_nonessential_resources", False)),
     )
 
 

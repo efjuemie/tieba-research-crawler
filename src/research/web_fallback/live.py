@@ -15,6 +15,7 @@ from .tasks import (
     EnqueueSummary,
     enqueue_web_enrichment_tasks,
     prune_pre_launch_ip_web_tasks,
+    prune_stale_web_tasks,
 )
 
 if TYPE_CHECKING:
@@ -169,6 +170,8 @@ async def run_live_web_worker(
     request_budget: Any | None = None,
     browser_config: Any | None = None,
     min_thread_create_time: datetime | None = None,
+    priority_min_thread_create_time: datetime | None = None,
+    prioritize_comments: bool = False,
     newest_first: bool = False,
     min_ip_create_time: datetime | None = None,
 ) -> Any:
@@ -179,6 +182,10 @@ async def run_live_web_worker(
     extra_kwargs: dict[str, Any] = (
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
+    if priority_min_thread_create_time is not None:
+        extra_kwargs["priority_min_thread_create_time"] = priority_min_thread_create_time
+    if prioritize_comments:
+        extra_kwargs["prioritize_comments"] = True
     if newest_first:
         extra_kwargs["newest_first"] = True
     if min_ip_create_time is not None:
@@ -204,5 +211,6 @@ __all__ = [
     "enqueue_missing_web_targets",
     "pending_web_run_ids",
     "prune_pre_launch_ip_web_tasks",
+    "prune_stale_web_tasks",
     "run_live_web_worker",
 ]

@@ -219,6 +219,10 @@ class WebFallbackConfig(BaseModel):
     timeout_seconds: float = Field(default=90.0, gt=0, le=120)
     rps: float = Field(default=0.2, gt=0)
     ip_location_min_date: str | None = "2022-04-28"
+    parent_snapshot_ttl_seconds: float = Field(default=30.0, gt=0, le=3600.0)
+    parent_snapshot_max_targets: int = Field(default=8, ge=1, le=500)
+    block_nonessential_resources: bool = False
+    prioritize_comments: bool = False
 
     @field_validator("ip_location_min_date", mode="before")
     @classmethod

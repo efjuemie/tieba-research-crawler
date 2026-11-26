@@ -2117,3 +2117,229 @@ async def test_ip_location_cutoff_skips_pre_launch_enqueue_and_prunes_existing_t
         }
         assert p_row is not None and p_row.status == "not_applicable"
         assert new_p_row is not None and new_p_row.status == "pending_web"
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_web_tasks_and_priority_ordering_comments_and_era(research_db):
+    from src.research.web_fallback.tasks import prune_stale_web_tasks
+
+    engine, maker = research_db
+    BaseThread.__table__.create(engine, checkfirst=True)
+    t_old_obs = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    t_new_obs = datetime(2026, 1, 2, 0, 0, tzinfo=UTC)
+    era_cutoff = datetime(2021, 1, 1, 0, 0, tzinfo=SHANGHAI_TZ)
+    pre_2021 = datetime(2020, 12, 31, 12, 0, tzinfo=SHANGHAI_TZ)
+    in_2022 = datetime(2022, 6, 1, 12, 0, tzinfo=SHANGHAI_TZ)
+
+    with Session(engine) as session, session.begin():
+        # Update base fixture thread 1001 to have 2022 create_time, add 2020 thread 999 & stale 1003.
+        t1001 = session.get(ResearchThread, 1001)
+        assert t1001 is not None
+        t1001.create_time = in_2022
+        session.add_all(
+            [
+                BaseThread(
+                    tid=999,
+                    fid=7654321,
+                    title="pre-2021",
+                    text="old",
+                    author_id=900,
+                    author_level=1,
+                    create_time=pre_2021,
+                    last_time=pre_2021,
+                    reply_num=1,
+                ),
+                BaseThread(
+                    tid=1001,
+                    fid=7654321,
+                    title="synthetic-2022",
+                    text="body",
+                    author_id=900,
+                    author_level=1,
+                    create_time=in_2022,
+                    last_time=in_2022,
+                    reply_num=1,
+                ),
+                BaseThread(
+                    tid=1003,
+                    fid=7654321,
+                    title="stale-2022",
+                    text="stale",
+                    author_id=901,
+                    author_level=1,
+                    create_time=in_2022,
+                    last_time=in_2022,
+                    reply_num=1,
+                ),
+                ResearchThread(
+                    tid=999,
+                    fid=7654321,
+                    fname="synthetic",
+                    title="pre-2021",
+                    create_time=pre_2021,
+                    scraped_at=t_old_obs,
+                    author_user_id=900,
+                    author_portrait="p999",
+                    source_api="aiotieba.get_posts",
+                    observed_at=t_old_obs,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchThread(
+                    tid=1003,
+                    fid=7654321,
+                    fname="synthetic",
+                    title="stale-2022",
+                    create_time=in_2022,
+                    scraped_at=t_old_obs,
+                    author_user_id=901,
+                    author_portrait="p1003",
+                    source_api="aiotieba.get_posts",
+                    observed_at=t_old_obs,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchPost(
+                    pid=2999,
+                    tid=999,
+                    fid=7654321,
+                    floor=2,
+                    text="pre-2021-post",
+                    create_time=pre_2021,
+                    scraped_at=t_old_obs,
+                    author_user_id=902,
+                    author_portrait="p2999",
+                    source_api="aiotieba.get_posts",
+                    observed_at=t_old_obs,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchComment(
+                    cid=3999,
+                    tid=999,
+                    parent_post_pid=2999,
+                    fid=7654321,
+                    text="pre-2021-comment",
+                    create_time=pre_2021,
+                    scraped_at=t_old_obs,
+                    author_user_id=903,
+                    source_api="aiotieba.get_comments",
+                    observed_at=t_old_obs,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchTaskScope(
+                    run_id="run-web-001",
+                    logical_task_key="thread_replies:999",
+                    generation=0,
+                    task_type="posts",
+                    scope_type="thread_replies",
+                    fid=7654321,
+                    tid=999,
+                    status="completed",
+                ),
+                ResearchTaskScope(
+                    run_id="run-web-001",
+                    logical_task_key="post_comments:999:2999",
+                    generation=0,
+                    task_type="comments",
+                    scope_type="post_comments",
+                    fid=7654321,
+                    tid=999,
+                    parent_pid=2999,
+                    parent_generation=0,
+                    status="completed",
+                ),
+                ResearchTaskScope(
+                    run_id="run-web-001",
+                    logical_task_key="thread_replies:1003",
+                    generation=0,
+                    task_type="posts",
+                    scope_type="thread_replies",
+                    fid=7654321,
+                    tid=1003,
+                    status="completed",
+                ),
+            ]
+        )
+
+    # Enqueue thread 1003 (then refresh its observed_at so task becomes stale)
+    stale_summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="thread",
+        target_ids=[1003],
+        only_missing_fields=True,
+    )
+    assert stale_summary.created_count == 1
+    with Session(engine) as session, session.begin():
+        t1003 = session.get(ResearchThread, 1003)
+        assert t1003 is not None
+        t1003.observed_at = t_new_obs
+
+    # Enqueue mixed >=2021 (thread/post IP-only + post growth + comments) and <2021 comment.
+    await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="thread",
+        target_ids=[1001],
+        only_missing_fields=True,
+    )
+    await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2101],
+        only_missing_fields=True,
+    )
+    growth_post = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_level", "global_growth_icon_url"],
+        target_type="post",
+        target_ids=[2102],
+        only_missing_fields=True,
+        pair_growth_fields=True,
+    )
+    assert growth_post.created_count == 1
+    await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="comment",
+        target_ids=[3101, 3999],
+        only_missing_fields=True,
+    )
+
+    pruned_stale = await prune_stale_web_tasks(maker, ["run-web-001"])
+    assert pruned_stale == 1
+    with Session(engine) as session:
+        stale_task = session.get(ResearchWebEnrichmentTask, stale_summary.task_keys[0])
+        assert stale_task is not None
+        assert stale_task.status == "failed_final"
+        assert stale_task.last_error == "target_observed_at_changed"
+
+    # Lease with era + comment priority + newest_first:
+    # 1) >=2021 comment (tid=1001, cid=3101)
+    # 2) >=2021 growth post (tid=1001, pid=2102)
+    # 3) >=2021 IP-only thread & post (tid=1001, thread then post — NOT dropped!)
+    # 4) <2021 comment (tid=999, cid=3999) last!
+    leases = await lease_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        "prio-worker",
+        limit=20,
+        priority_min_thread_create_time=era_cutoff,
+        prioritize_comments=True,
+        newest_first=True,
+    )
+    assert [(lease.tid, lease.target_type, lease.target_id, lease.requested_fields) for lease in leases] == [
+        (1001, "comment", 3101, ("ip_location_text",)),
+        (1001, "post", 2102, ("global_growth_icon_url", "global_growth_level")),
+        (1001, "thread", 1001, ("ip_location_text",)),
+        (1001, "post", 2101, ("ip_location_text",)),
+        (999, "comment", 3999, ("ip_location_text",)),
+    ]

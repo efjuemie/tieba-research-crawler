@@ -73,3 +73,82 @@ async def test_recover_pending_tasks_only_for_responsible_forums() -> None:
     assert len(comment_tasks) == 1
     assert comment_tasks[0].content.tid == 1001
     assert isinstance(comment_tasks[0].content, IncrementalScanCommentsTask)
+
+
+@pytest.mark.asyncio
+async def test_recover_pending_tasks_api_continue_older_phases_and_waits() -> None:
+    import asyncio
+    from datetime import datetime
+    from tiebameow.utils.time_utils import SHANGHAI_TZ
+
+    cutoff = datetime(2021, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+    calls: list[dict[str, Any]] = []
+    older_enabled = asyncio.Event()
+
+    new_scope = SimpleNamespace(
+        scope_type="thread_replies",
+        task_type="full_scan_posts",
+        status="pending",
+        tid=2001,
+        fid=1,
+        fname="bar",
+        rn=100,
+        backfill=True,
+        generation=0,
+        logical_task_key="thread_replies:2001",
+    )
+    old_scope = SimpleNamespace(
+        scope_type="thread_replies",
+        task_type="full_scan_posts",
+        status="pending",
+        tid=1001,
+        fid=1,
+        fname="bar",
+        rn=100,
+        backfill=True,
+        generation=0,
+        logical_task_key="thread_replies:1001",
+    )
+
+    class _PhasedDataStore:
+        def __init__(self) -> None:
+            self.pending_count_calls = 0
+
+        async def adopt_legacy_research_scopes(self, _run_id: str, _fids: set[int]) -> None:
+            return None
+
+        async def iter_pending_research_task_scopes(self, _run_id, _fids, **kwargs):
+            calls.append(dict(kwargs))
+            if kwargs.get("scope_type") != "thread_replies":
+                return
+            if kwargs.get("min_thread_create_time") == cutoff:
+                yield [new_scope]
+            elif kwargs.get("older_than_thread_create_time") == cutoff:
+                yield [old_scope]
+
+        async def count_pending_research_task_scopes(self, _run_id, _fids, **_kwargs):
+            self.pending_count_calls += 1
+            return 0
+
+    class _QueueRouter(DummyRouter):
+        def get_queue(self, _name: str):
+            return SimpleNamespace(empty=lambda: True)
+
+    router = _QueueRouter()
+    ds = _PhasedDataStore()
+    await _recover_pending_tasks(
+        cast("Any", ds),
+        cast("Any", router),
+        responsible_fids={1},
+        research_run_id="run-phased",
+        min_thread_create_time=cutoff,
+        newest_first=True,
+        api_continue_older=True,
+        older_api_enabled=older_enabled,
+    )
+
+    assert older_enabled.is_set()
+    assert ds.pending_count_calls >= 1
+    assert [t.content.tid for t in router.tasks] == [2001, 1001]
+    assert any(c.get("min_thread_create_time") == cutoff and c.get("newest_first") is True for c in calls)
+    assert any(c.get("older_than_thread_create_time") == cutoff and c.get("newest_first") is True for c in calls)
