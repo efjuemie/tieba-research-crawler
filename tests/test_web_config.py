@@ -72,8 +72,24 @@ def test_web_fallback_config_accepts_bounded_pagination(max_pages, max_expansion
         {"max_expansions": 11},
         {"timeout_seconds": 0},
         {"timeout_seconds": 121},
+        {"ip_location_min_date": "2022/04/28"},
+        {"ip_location_min_date": "invalid-date"},
     ],
 )
 def test_web_fallback_config_rejects_out_of_bounds_settings(values):
     with pytest.raises(ValidationError):
         WebFallbackConfig(**values)
+
+
+def test_web_fallback_ip_location_min_date_defaults_and_normalization():
+    default_cfg = WebFallbackConfig()
+    assert default_cfg.ip_location_min_date == "2022-04-28"
+    assert default_cfg.ip_location_min_time is not None
+    assert default_cfg.ip_location_min_time.year == 2022
+    assert default_cfg.ip_location_min_time.month == 4
+    assert default_cfg.ip_location_min_time.day == 28
+
+    for disabled in ("none", "OFF", "  ", None):
+        cfg = WebFallbackConfig(ip_location_min_date=disabled)
+        assert cfg.ip_location_min_date is None
+        assert cfg.ip_location_min_time is None

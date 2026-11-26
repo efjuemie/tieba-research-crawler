@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from tiebameow.models.orm import Thread
+from tiebameow.utils.time_utils import SHANGHAI_TZ
 
 from src.core.models import (
     ResearchRun,
@@ -75,6 +76,9 @@ _ZERO_UNKNOWN_REASONS = frozenset(
     }
 )
 _GROWTH_FIELDS = frozenset({"global_growth_level", "global_growth_icon_url"})
+TIEBA_IP_LOCATION_LAUNCH_DATE = "2022-04-28"
+TIEBA_IP_LOCATION_LAUNCH_TIME = datetime(2022, 4, 28, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+IP_BEFORE_LAUNCH_REASON = "before_ip_location_launch"
 _RESOLVED_FIELD_STATUSES = frozenset(
     {"applied", "confirmed", "absent_on_page", "unsupported_by_source", "not_applicable"}
 )
@@ -321,7 +325,33 @@ def _unknown_canonical_value(current: Any, field_name: str, missing_reasons: dic
     return isinstance(current, int) and current == 0
 
 
-def _unknown_requested_fields(row: Any, fields: Sequence[str], *, pair_growth_fields: bool) -> tuple[str, ...]:
+def is_entity_before_ip_location_cutoff(
+    row: Any, min_ip_create_time: datetime | None
+) -> bool:
+    """Return True when row.create_time is strictly earlier than ``min_ip_create_time``."""
+    if min_ip_create_time is None:
+        return False
+    create_time = getattr(row, "create_time", None)
+    if create_time is None:
+        return False
+    norm_create = (
+        create_time.replace(tzinfo=SHANGHAI_TZ) if create_time.tzinfo is None else create_time
+    )
+    norm_cutoff = (
+        min_ip_create_time.replace(tzinfo=SHANGHAI_TZ)
+        if min_ip_create_time.tzinfo is None
+        else min_ip_create_time
+    )
+    return norm_create.astimezone(UTC) < norm_cutoff.astimezone(UTC)
+
+
+def _unknown_requested_fields(
+    row: Any,
+    fields: Sequence[str],
+    *,
+    pair_growth_fields: bool,
+    min_ip_create_time: datetime | None = None,
+) -> tuple[str, ...]:
     missing_reasons = dict(getattr(row, "missing_reasons_json", None) or {})
     output = [
         name
@@ -329,6 +359,12 @@ def _unknown_requested_fields(row: Any, fields: Sequence[str], *, pair_growth_fi
         if name not in _GROWTH_FIELDS
         and _unknown_canonical_value(getattr(row, name, None), name, missing_reasons)
     ]
+    if (
+        min_ip_create_time is not None
+        and "ip_location_text" in output
+        and is_entity_before_ip_location_cutoff(row, min_ip_create_time)
+    ):
+        output = [name for name in output if name != "ip_location_text"]
     requested_growth = set(fields) & _GROWTH_FIELDS
     if requested_growth:
         growth_unknown = {
@@ -702,6 +738,7 @@ async def enqueue_web_enrichment_tasks(
     only_missing_fields: bool = False,
     pair_growth_fields: bool = False,
     min_thread_create_time: datetime | None = None,
+    min_ip_create_time: datetime | None = None,
 ) -> EnqueueSummary:
     """Create deduplicated field tasks only for content represented in this run.
 
@@ -978,14 +1015,31 @@ async def enqueue_web_enrichment_tasks(
                         row,
                         applicable_fields,
                         pair_growth_fields=pair_growth_fields,
+                        min_ip_create_time=min_ip_create_time,
                     )
                     if only_missing_fields
                     else tuple(applicable_fields)
                 )
                 if not field_names:
-                    skipped["requested_fields_already_known"] = skipped.get(
-                        "requested_fields_already_known", 0
-                    ) + 1
+                    if (
+                        only_missing_fields
+                        and min_ip_create_time is not None
+                        and "ip_location_text" in applicable_fields
+                        and is_entity_before_ip_location_cutoff(row, min_ip_create_time)
+                        and _unknown_requested_fields(
+                            row,
+                            applicable_fields,
+                            pair_growth_fields=pair_growth_fields,
+                        )
+                        == ("ip_location_text",)
+                    ):
+                        skipped["ip_location_before_mechanism_launch"] = (
+                            skipped.get("ip_location_before_mechanism_launch", 0) + 1
+                        )
+                    else:
+                        skipped["requested_fields_already_known"] = skipped.get(
+                            "requested_fields_already_known", 0
+                        ) + 1
                     continue
                 marker = content_markers.get(target_id)
                 marker_proves_target = _content_marker_matches(row, current_type, target_id, marker)
@@ -1452,14 +1506,122 @@ def _safe_reason(value: str) -> str:
     return safe or "unspecified"
 
 
+async def prune_pre_launch_ip_web_tasks(
+    async_sessionmaker_: async_sessionmaker,
+    run_ids: Sequence[str],
+    *,
+    min_ip_create_time: datetime | None,
+    min_thread_create_time: datetime | None = None,
+) -> dict[str, int]:
+    """Close pre-launch IP-only WEB tasks as ``not_applicable`` and annotate mixed ones."""
+    counts = {"marked_not_applicable": 0, "annotated_mixed": 0}
+    if min_ip_create_time is None or not run_ids:
+        return counts
+    stable_run_ids = tuple(dict.fromkeys(run_ids))
+    cutoff_utc = _now(min_ip_create_time)
+    now = datetime.now(UTC)
+    models = (
+        ("thread", ResearchThread, ResearchThread.tid),
+        ("post", ResearchPost, ResearchPost.pid),
+        ("comment", ResearchComment, ResearchComment.cid),
+    )
+
+    for target_type, model, id_col in models:
+        async with async_sessionmaker_() as session:
+            dialect = session.get_bind().dialect.name
+            stmt = (
+                select(ResearchWebEnrichmentTask.task_key, model.create_time)
+                .join(model, id_col == ResearchWebEnrichmentTask.target_id)
+                .where(
+                    ResearchWebEnrichmentTask.run_id.in_(stable_run_ids),
+                    ResearchWebEnrichmentTask.target_type == target_type,
+                    ResearchWebEnrichmentTask.status.in_(
+                        ("pending_web", "failed_retryable", "pending_api_detail")
+                    ),
+                    model.create_time.is_not(None),
+                )
+            )
+            if dialect == "postgresql":
+                stmt = stmt.where(model.create_time < cutoff_utc)
+            if min_thread_create_time is not None:
+                stmt = stmt.where(
+                    ~exists(
+                        select(1).where(
+                            Thread.tid == ResearchWebEnrichmentTask.tid,
+                            Thread.create_time.is_not(None),
+                            Thread.create_time < min_thread_create_time,
+                        )
+                    )
+                )
+            rows = (await session.execute(stmt)).all()
+
+        matching_keys = [
+            task_key
+            for task_key, create_time in rows
+            if is_entity_before_ip_location_cutoff(
+                type("_Row", (), {"create_time": create_time})(), cutoff_utc
+            )
+        ]
+        for chunk_start in range(0, len(matching_keys), 500):
+            chunk = matching_keys[chunk_start : chunk_start + 500]
+            async with async_sessionmaker_() as session, session.begin():
+                tasks = (
+                    await session.scalars(
+                        select(ResearchWebEnrichmentTask)
+                        .where(ResearchWebEnrichmentTask.task_key.in_(chunk))
+                        .with_for_update(skip_locked=True)
+                    )
+                ).all()
+                for task in tasks:
+                    requested = list(task.requested_fields_json or ())
+                    if "ip_location_text" not in requested:
+                        continue
+                    if set(requested) == {"ip_location_text"}:
+                        task.field_statuses_json = {
+                            "ip_location_text": {
+                                "status": "not_applicable",
+                                "reason": IP_BEFORE_LAUNCH_REASON,
+                            }
+                        }
+                        task.status = "not_applicable"
+                        task.identity_verified = True
+                        task.identity_reason = None
+                        task.last_error = None
+                        task.last_error_type = None
+                        task.next_retry_at = None
+                        task.completed_at = now
+                        task.updated_at = now
+                        counts["marked_not_applicable"] += 1
+                    else:
+                        statuses = dict(task.field_statuses_json or {})
+                        current_ip = statuses.get("ip_location_text")
+                        if not isinstance(current_ip, dict) or current_ip.get("status") != "not_applicable":
+                            statuses["ip_location_text"] = {
+                                "status": "not_applicable",
+                                "reason": IP_BEFORE_LAUNCH_REASON,
+                            }
+                            task.field_statuses_json = statuses
+                            task.updated_at = now
+                            counts["annotated_mixed"] += 1
+            if chunk_start + 500 < len(matching_keys):
+                await asyncio.sleep(0)
+
+    return counts
+
+
 __all__ = [
     "EnqueueSummary",
+    "IP_BEFORE_LAUNCH_REASON",
     "LEGACY_WEB_FIELD_TYPES",
+    "TIEBA_IP_LOCATION_LAUNCH_DATE",
+    "TIEBA_IP_LOCATION_LAUNCH_TIME",
     "WEB_FIELD_TYPES",
     "WebEnrichmentTaskLease",
     "cancel_web_enrichment_task",
     "enqueue_web_enrichment_tasks",
+    "is_entity_before_ip_location_cutoff",
     "lease_web_enrichment_tasks",
     "plan_web_enrichment_targets",
+    "prune_pre_launch_ip_web_tasks",
     "resume_web_enrichment_tasks",
 ]

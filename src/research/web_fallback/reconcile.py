@@ -39,10 +39,12 @@ from .identity import (
 from .tasks import (
     _CONTENT_MARKERS,
     _THREAD_LIST_METADATA_FIELDS,
+    IP_BEFORE_LAUNCH_REASON,
     LEGACY_WEB_FIELD_TYPES,
     WEB_FIELD_TYPES,
     _field_outcome_resolved,
     _record_failure_audit,
+    is_entity_before_ip_location_cutoff,
     _resolved_web_task_status,
     _safe_reason,
     _thread_list_metadata_matches,
@@ -594,6 +596,7 @@ async def preflight_web_enrichment_task(
     lease_token: str,
     *,
     now: datetime | None = None,
+    min_ip_create_time: datetime | None = None,
 ) -> WebTaskPreflight:
     """Validate a leased target and skip fields already filled by a newer API pass."""
     current_time = _now(now)
@@ -651,6 +654,16 @@ async def preflight_web_enrichment_task(
                     )
                 )
             }
+            if (
+                min_ip_create_time is not None
+                and "ip_location_text" in requested_fields
+                and "ip_location_text" not in preserved_outcomes
+                and is_entity_before_ip_location_cutoff(row, min_ip_create_time)
+            ):
+                preserved_outcomes["ip_location_text"] = {
+                    "status": "not_applicable",
+                    "reason": IP_BEFORE_LAUNCH_REASON,
+                }
             missing_fields = tuple(name for name in missing_fields if name not in preserved_outcomes)
             satisfied_fields = tuple(name for name in requested_fields if name not in missing_fields)
             if missing_fields:

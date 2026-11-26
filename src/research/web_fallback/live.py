@@ -10,7 +10,12 @@ from src.core.datastore import RESEARCH_RUN_RESUMABLE_STATUSES
 from src.core.models import ResearchRun
 
 from ..models import ResearchWebEnrichmentTask
-from .tasks import EnqueueSummary, enqueue_web_enrichment_tasks
+from .tasks import (
+    TIEBA_IP_LOCATION_LAUNCH_TIME,
+    EnqueueSummary,
+    enqueue_web_enrichment_tasks,
+    prune_pre_launch_ip_web_tasks,
+)
 
 if TYPE_CHECKING:
     import asyncio
@@ -34,11 +39,15 @@ async def enqueue_missing_web_targets(
     thread_ids: Sequence[int] = (),
     post_ids: Sequence[int] = (),
     comment_ids: Sequence[int] = (),
+    min_ip_create_time: datetime | None = None,
 ) -> tuple[EnqueueSummary, ...]:
     """Durably enqueue just-persisted targets whose API fields are still missing."""
     if not run_id:
         return ()
 
+    extra_kwargs: dict[str, Any] = (
+        {"min_ip_create_time": min_ip_create_time} if min_ip_create_time is not None else {}
+    )
     summaries: list[EnqueueSummary] = []
     for target_type, target_ids in (
         ("thread", thread_ids),
@@ -56,6 +65,7 @@ async def enqueue_missing_web_targets(
             target_ids=ids,
             only_missing_fields=True,
             pair_growth_fields=True,
+            **extra_kwargs,
         )
         summaries.append(summary)
     return tuple(summaries)
@@ -66,12 +76,15 @@ async def discover_missing_web_targets(
     run_ids: Sequence[str],
     *,
     min_thread_create_time: datetime | None = None,
+    min_ip_create_time: datetime | None = None,
 ) -> int:
     """Rescan persisted canonical rows after API producers stop or at startup."""
     created = 0
     extra_kwargs: dict[str, Any] = (
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
+    if min_ip_create_time is not None:
+        extra_kwargs["min_ip_create_time"] = min_ip_create_time
     for run_id in tuple(dict.fromkeys(run_ids)):
         for target_type in ("thread", "post", "comment"):
             summary = await enqueue_web_enrichment_tasks(
@@ -157,6 +170,7 @@ async def run_live_web_worker(
     browser_config: Any | None = None,
     min_thread_create_time: datetime | None = None,
     newest_first: bool = False,
+    min_ip_create_time: datetime | None = None,
 ) -> Any:
     """Run WEB work alongside API producers, then drain only on normal API completion."""
     from .service import run_live_web_fallback_worker
@@ -167,6 +181,8 @@ async def run_live_web_worker(
     )
     if newest_first:
         extra_kwargs["newest_first"] = True
+    if min_ip_create_time is not None:
+        extra_kwargs["min_ip_create_time"] = min_ip_create_time
     return await run_live_web_fallback_worker(
         sessions,
         lambda: stable_run_ids,
@@ -183,8 +199,10 @@ async def run_live_web_worker(
 
 __all__ = [
     "MISSING_CONTENT_FIELDS",
+    "TIEBA_IP_LOCATION_LAUNCH_TIME",
     "discover_missing_web_targets",
     "enqueue_missing_web_targets",
     "pending_web_run_ids",
+    "prune_pre_launch_ip_web_tasks",
     "run_live_web_worker",
 ]

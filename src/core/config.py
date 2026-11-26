@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import tomllib
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote_plus, urlparse, urlunparse
@@ -21,10 +22,12 @@ from pydantic import (
     ValidationError,
     WebsocketUrl,
     computed_field,
+    field_validator,
     model_validator,
 )
 from pydantic.fields import FieldInfo  # noqa: TC002
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from tiebameow.utils.time_utils import SHANGHAI_TZ
 
 
 class TiebaConfig(BaseModel):
@@ -215,6 +218,29 @@ class WebFallbackConfig(BaseModel):
     max_expansions: int = Field(default=10, ge=0, le=10)
     timeout_seconds: float = Field(default=90.0, gt=0, le=120)
     rps: float = Field(default=0.2, gt=0)
+    ip_location_min_date: str | None = "2022-04-28"
+
+    @field_validator("ip_location_min_date", mode="before")
+    @classmethod
+    def _validate_ip_location_min_date(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("ip_location_min_date must be a YYYY-MM-DD string or null")
+        stripped = value.strip()
+        if not stripped or stripped.lower() in {"none", "off"}:
+            return None
+        try:
+            parsed = datetime.strptime(stripped, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("ip_location_min_date must use YYYY-MM-DD format") from exc
+        return parsed.strftime("%Y-%m-%d")
+
+    @property
+    def ip_location_min_time(self) -> datetime | None:
+        if not self.ip_location_min_date:
+            return None
+        return datetime.strptime(self.ip_location_min_date, "%Y-%m-%d").replace(tzinfo=SHANGHAI_TZ)
 
 
 class PydanticConfig(BaseSettings):

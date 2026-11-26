@@ -22,7 +22,12 @@ from tiebameow.utils.time_utils import SHANGHAI_TZ
 from src.core import DataStore, initialize_application
 from src.core.models import REPLY_BACKFILL_MODE
 from src.core.monitor import SystemMonitor
-from src.research.web_fallback.live import discover_missing_web_targets, pending_web_run_ids, run_live_web_worker
+from src.research.web_fallback.live import (
+    discover_missing_web_targets,
+    pending_web_run_ids,
+    prune_pre_launch_ip_web_tasks,
+    run_live_web_worker,
+)
 from src.scraper import Scheduler, Worker
 from src.scraper.router import QueueRouter
 from src.scraper.tasks import FullScanCommentsTask, FullScanPostsTask, IncrementalScanCommentsTask, Priority, Task
@@ -57,6 +62,19 @@ def _min_thread_create_time(min_thread_year: int | None) -> datetime | None:
     if min_thread_year < 1990 or min_thread_year > 2100:
         raise ValueError("--min-thread-year must be between 1990 and 2100.")
     return datetime(min_thread_year, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+
+
+def _parse_ip_location_min_date(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.lower() in {"none", "off"}:
+        return None
+    try:
+        parsed = datetime.strptime(stripped, "%Y-%m-%d")
+    except ValueError as error:
+        raise ValueError("--ip-location-min-date must use YYYY-MM-DD format or 'none'.") from error
+    return parsed.replace(tzinfo=SHANGHAI_TZ)
 
 
 async def _recover_pending_tasks(
@@ -1179,6 +1197,7 @@ async def main(
     revalidate_failed_comment_page_zero: bool = False,
     min_thread_year: int | None = None,
     newest_first: bool = False,
+    ip_location_min_date: str | None = None,
 ):
     """统一入口，根据模式启动应用。
 
@@ -1192,13 +1211,30 @@ async def main(
     if revalidate_failed_comment_page_zero and not resume:
         raise ValueError("--revalidate-failed-comment-page-zero requires --resume.")
     min_thread_create_time = _min_thread_create_time(min_thread_year)
+    explicit_min_ip_create_time = (
+        _parse_ip_location_min_date(ip_location_min_date)
+        if ip_location_min_date is not None
+        else None
+    )
     container, router = await initialize_application(mode=mode)
     container.revalidate_failed_comment_page_zero = revalidate_failed_comment_page_zero
     container.min_thread_create_time = min_thread_create_time
+    if ip_location_min_date is not None:
+        min_ip_create_time = explicit_min_ip_create_time
+    else:
+        pydantic_cfg = getattr(container.config, "pydantic_config", None)
+        web_cfg = getattr(pydantic_cfg, "web_fallback", None)
+        min_ip_create_time = getattr(web_cfg, "ip_location_min_time", None)
+    container.min_ip_create_time = min_ip_create_time
     if min_thread_create_time is not None:
         logger.info(
             "Priority min-thread-year filter enabled: only threads created on/after {} are scanned in detail.",
             min_thread_create_time.isoformat(),
+        )
+    if min_ip_create_time is not None:
+        logger.info(
+            "WEB ip_location_text cutoff enabled: skipping WEB enrichment for content created before {}.",
+            min_ip_create_time.isoformat(),
         )
     if newest_first:
         logger.info(
@@ -1287,7 +1323,7 @@ async def main(
             created = await discover_missing_web_targets(
                 datastore.async_sessionmaker,
                 web_run_ids,
-                **extra_filter_kwargs,
+                **extra_web_filter_kwargs,
             )
             if created:
                 logger.info("Queued {} missing metadata targets after API producers stopped.", created)
@@ -1403,6 +1439,12 @@ async def main(
         extra_order_kwargs = dict(extra_filter_kwargs)
         if newest_first:
             extra_order_kwargs["newest_first"] = True
+        extra_web_filter_kwargs = dict(extra_filter_kwargs)
+        if min_ip_create_time is not None:
+            extra_web_filter_kwargs["min_ip_create_time"] = min_ip_create_time
+        extra_web_worker_kwargs = dict(extra_web_filter_kwargs)
+        if newest_first:
+            extra_web_worker_kwargs["newest_first"] = True
         recovery_task = asyncio.create_task(
             _recover_pending_tasks(
                 datastore,
@@ -1437,6 +1479,21 @@ async def main(
                 research_run_id,
                 responsible_forums=responsible_forums,
             )
+            if min_ip_create_time is not None and web_run_ids:
+                pruned = await prune_pre_launch_ip_web_tasks(
+                    datastore.async_sessionmaker,
+                    web_run_ids,
+                    min_ip_create_time=min_ip_create_time,
+                    **extra_filter_kwargs,
+                )
+                if pruned["marked_not_applicable"] or pruned["annotated_mixed"]:
+                    logger.info(
+                        "Pruned pre-launch IP WEB tasks before worker start (cutoff={}): "
+                        "marked_not_applicable={}, annotated_mixed={}",
+                        min_ip_create_time.isoformat(),
+                        pruned["marked_not_applicable"],
+                        pruned["annotated_mixed"],
+                    )
             web_stop_event = asyncio.Event()
             api_done_event = asyncio.Event()
             web_config = container.config.pydantic_config.web_fallback
@@ -1448,7 +1505,7 @@ async def main(
                     api_done_event=api_done_event,
                     browser_profile=web_config.browser_profile,
                     browser_config=web_config,
-                    **extra_order_kwargs,
+                    **extra_web_worker_kwargs,
                 ),
                 name="web-fallback-worker",
             )
@@ -1458,7 +1515,7 @@ async def main(
                 discover_missing_web_targets(
                     datastore.async_sessionmaker,
                     web_run_ids,
-                    **extra_filter_kwargs,
+                    **extra_web_filter_kwargs,
                 ),
                 name="web-startup-discovery",
             )
@@ -1672,6 +1729,13 @@ if __name__ == "__main__":
             "and recover pending scopes newest-first"
         ),
     )
+    parser.add_argument(
+        "--ip-location-min-date",
+        help=(
+            "skip WEB ip_location_text enrichment for content created before YYYY-MM-DD "
+            "(Asia/Shanghai); defaults to config (2022-04-28); pass 'none' to disable"
+        ),
+    )
     parser.add_argument("--tid", type=positive_int, help="limit drain-pending to this thread ID")
     parser.add_argument(
         "--limit",
@@ -1699,6 +1763,8 @@ if __name__ == "__main__":
             parser.error("--min-thread-year cannot be combined with drain-pending")
         if args.newest_first:
             parser.error("--newest-first cannot be combined with drain-pending")
+        if args.ip_location_min_date is not None:
+            parser.error("--ip-location-min-date cannot be combined with drain-pending")
     else:
         if args.run_id and not args.resume:
             parser.error("--run-id requires --resume")
@@ -1708,6 +1774,11 @@ if __name__ == "__main__":
             parser.error("--revalidate-failed-comment-page-zero requires --resume")
         if args.min_thread_year is not None and not 1990 <= args.min_thread_year <= 2100:
             parser.error("--min-thread-year must be between 1990 and 2100")
+        if args.ip_location_min_date is not None:
+            try:
+                _parse_ip_location_min_date(args.ip_location_min_date)
+            except ValueError as error:
+                parser.error(str(error))
         if args.tid is not None or args.limit is not None or args.max_seconds is not None:
             parser.error("--tid, --limit, and --max-seconds are only valid with drain-pending")
 
@@ -1730,6 +1801,7 @@ if __name__ == "__main__":
                 revalidate_failed_comment_page_zero=args.revalidate_failed_comment_page_zero,
                 min_thread_year=args.min_thread_year,
                 newest_first=args.newest_first,
+                ip_location_min_date=args.ip_location_min_date,
             )
         if loop_factory is not None:
             with asyncio.Runner(loop_factory=loop_factory) as runner:

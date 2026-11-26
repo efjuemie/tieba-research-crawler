@@ -930,12 +930,17 @@ class TaskHandler(ABC):
             return
         from ..research.web_fallback.live import enqueue_missing_web_targets
 
+        min_ip_create_time = getattr(self.container, "min_ip_create_time", None)
+        extra_kwargs = (
+            {"min_ip_create_time": min_ip_create_time} if min_ip_create_time is not None else {}
+        )
         await enqueue_missing_web_targets(
             self.datastore.async_sessionmaker,
             run_id,
             thread_ids=thread_ids,
             post_ids=post_ids,
             comment_ids=comment_ids,
+            **extra_kwargs,
         )
 
     async def _enqueue_missing_web_targets_after_commit(
@@ -1326,6 +1331,11 @@ class ThreadsTaskHandler(TaskHandler):
         all_tids = [thread.tid for thread in threads_data.objs]
         non_top_threads = [thread for thread in threads_data.objs if not thread.is_top]
         non_top_create_times = tuple(thread.create_time for thread in non_top_threads)
+        non_top_last_times = tuple(
+            thread.last_time
+            for thread in non_top_threads
+            if getattr(thread, "last_time", None) is not None
+        )
         non_top_tids = tuple(thread.tid for thread in non_top_threads)
         cursor = task_content.continuation_json or {}
         if task_content.backfill and sort_mode == "create" and any(
@@ -1483,6 +1493,7 @@ class ThreadsTaskHandler(TaskHandler):
             tids=tuple(all_tids),
             non_top_create_times=non_top_create_times,
             non_top_tids=non_top_tids,
+            non_top_last_times=non_top_last_times,
             continuation_json=continuation_json,
         )
 

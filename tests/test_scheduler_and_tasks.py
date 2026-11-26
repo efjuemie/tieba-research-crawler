@@ -383,6 +383,7 @@ async def test_scheduler_reads_exception_code_once_for_classification_and_checkp
         config=DummyConfig(mode="backfill", max_backfill_pages=0),
         forums=[DummyForum(1, "synthetic")],
     )
+    container.config.research_enabled = True
     container.research_run_id = "synthetic-run"
     checkpoints = []
     datastore = SimpleNamespace(
@@ -733,3 +734,244 @@ def test_deep_scan_task_unique_key():
     assert t1.unique_key == 100
     assert t2.unique_key == 100
     assert t3.unique_key == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sort_mode", ["create", "reply"])
+async def test_backfill_min_thread_create_time_stops_list_after_three_old_pages(sort_mode):
+    from tiebameow.utils.time_utils import SHANGHAI_TZ
+
+    router = QueueRouter(maxsize=1)
+    container = DummyContainer(
+        config=DummyConfig(mode="backfill", max_backfill_pages=0),
+        forums=[DummyForum(1, "synthetic")],
+    )
+    container.config.research_enabled = True
+    container.research_run_id = "synthetic-run"
+    container.min_thread_create_time = datetime(2021, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+    statuses: list[str] = []
+    marked_scopes: list[tuple[int, str]] = []
+    datastore = SimpleNamespace(
+        get_research_list_checkpoint_states=AsyncMock(return_value={}),
+        mark_research_checkpoint_scope_status=AsyncMock(
+            side_effect=lambda _r, _k, pn, st: marked_scopes.append((pn, st))
+        ),
+        set_research_run_status_if=AsyncMock(
+            side_effect=lambda _r, _e, st, _reason=None: statuses.append(st) or True
+        ),
+    )
+    scheduler = Scheduler(
+        router, container, cast("Any", datastore), backfill_sort=sort_mode
+    )  # type: ignore[arg-type]
+
+    scanned_pages: list[int] = []
+    old_dt = datetime(2020, 12, 31, 23, 0, 0, tzinfo=SHANGHAI_TZ)
+    new_dt = datetime(2021, 1, 2, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+
+    async def fake_scan(_forum, pn, _max_pages, _is_good, _continuation=None, **_kwargs):
+        scanned_pages.append(pn)
+        dt = new_dt if pn == 1 else old_dt
+        return ThreadPageResult(
+            has_more=True,
+            current_page=pn,
+            total_pages=100,
+            total_count=100,
+            tids=(1000 + pn,),
+            non_top_create_times=(dt,),
+            non_top_tids=(1000 + pn,),
+            non_top_last_times=(dt,),
+            continuation_json={},
+        )
+
+    scheduler._scan_backfill_page = fake_scan  # type: ignore[method-assign]
+    await scheduler._run_backfill()
+
+    assert scanned_pages == [1, 2, 3, 4]
+    assert marked_scopes == [(4, "paused_limit")]
+    assert statuses == ["paused_limit"]
+
+
+@pytest.mark.asyncio
+async def test_reply_resume_saved_repeat_boundary_respects_min_thread_create_time_cutoff():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from tiebameow.utils.time_utils import SHANGHAI_TZ
+
+    from src.core.datastore import DataStore
+    from src.core.models import (
+        REPLY_BACKFILL_RN,
+        ResearchCheckpoint,
+        ResearchRun,
+    )
+    from src.research.models import ResearchThread
+
+    engine = create_engine("sqlite:///:memory:")
+    ResearchRun.__table__.create(engine)
+    ResearchCheckpoint.__table__.create(engine)
+    ResearchThread.__table__.create(engine)
+
+    class _SyncSessionWrapper:
+        def __init__(self, session):
+            self.session = session
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            self.session.close()
+
+        async def get(self, *args, **kwargs):
+            return self.session.get(*args, **kwargs)
+
+        async def execute(self, stmt):
+            return self.session.execute(stmt)
+
+        async def scalars(self, stmt):
+            return self.session.scalars(stmt)
+
+        async def stream(self, stmt):
+            rows = list(self.session.scalars(stmt))
+
+            class _AsyncStream:
+                def scalars(self):
+                    async def _gen():
+                        for row in rows:
+                            yield row
+
+                    return _gen()
+
+            return _AsyncStream()
+
+        async def commit(self):
+            self.session.commit()
+
+    store = DataStore.__new__(DataStore)
+    store.async_sessionmaker = lambda: _SyncSessionWrapper(Session(engine))
+
+    try:
+        cutoff = datetime(2021, 1, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+        old_time = datetime(2020, 6, 1, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+        new_time = datetime(2026, 11, 26, 0, 0, 0, tzinfo=SHANGHAI_TZ)
+        task_key = research_thread_list_task_key(905, False, "reply", REPLY_BACKFILL_RN)
+        run_id = "run-cutoff-boundary"
+        now = datetime(2026, 11, 26, 12, 0, 0, tzinfo=SHANGHAI_TZ)
+
+        with Session(engine) as session, session.begin():
+            session.add(
+                ResearchRun(
+                    run_id=run_id,
+                    mode="reply_backfill",
+                    scope_key="k",
+                    forums_json=[{"fid": 905, "fname": "bar"}],
+                    status="running",
+                    started_at=now,
+                    last_checked=now,
+                )
+            )
+            for tid, dt in [(101, old_time), (102, old_time), (103, old_time), (104, new_time)]:
+                session.add(
+                    ResearchThread(
+                        tid=tid,
+                        fid=905,
+                        fname="bar",
+                        title=f"t{tid}",
+                        create_time=dt,
+                        last_time=dt,
+                        scraped_at=now,
+                        source_api="aiotieba.get_threads",
+                        observed_at=now,
+                        field_sources_json={},
+                        source_payload_json={},
+                        missing_reasons_json={},
+                    )
+                )
+            # Simulate live failure: 3 consecutive pre-cutoff pages (pn=1..3), 1 wraparound page (pn=4),
+            # then high-duplicate pause at pn=5.
+            pages = [
+                (1, [101], 0.0, False, "running"),
+                (2, [102], 0.0, False, "running"),
+                (3, [103], 0.0, False, "running"),
+                (4, [104], 0.64, False, "running"),
+                (5, [104], 1.0, True, "incomplete"),
+            ]
+            for pn, tids, ratio, paused, scope_status in pages:
+                cont = {
+                    "list_contract_version": 1,
+                    "list_sort_mode": "reply",
+                    "source_api": "aiotieba.get_threads",
+                    "rn": REPLY_BACKFILL_RN,
+                    "sort_type": 6,
+                    "is_good": False,
+                    "page_non_top_tids": tids,
+                    "page_duplicate_ratio": ratio,
+                    "flow_duplicate_streak": 3 if paused else 0,
+                }
+                if paused:
+                    cont["high_duplicate_pause_reason"] = "three_consecutive_pages_at_least_90_percent_seen"
+                session.add(
+                    ResearchCheckpoint(
+                        run_id=run_id,
+                        task_key=task_key,
+                        page_number=pn,
+                        task_type="thread_list",
+                        scope_type="thread_list",
+                        sort_mode="reply",
+                        fid=905,
+                        fname="bar",
+                        is_good=False,
+                        status="completed",
+                        scope_status=scope_status,
+                        has_more=True,
+                        next_page=pn + 1,
+                        continuation_json=cont,
+                        last_checked=now,
+                    )
+                )
+
+        assert (
+            await store.research_list_crossed_min_create_time(
+                run_id,
+                905,
+                False,
+                sort_mode="reply",
+                rn=REPLY_BACKFILL_RN,
+                min_thread_create_time=cutoff,
+            )
+            is True
+        )
+        assert (
+            await store.research_list_crossed_min_create_time(
+                run_id,
+                905,
+                False,
+                sort_mode="reply",
+                rn=REPLY_BACKFILL_RN,
+                min_thread_create_time=datetime(2019, 1, 1, tzinfo=SHANGHAI_TZ),
+            )
+            is False
+        )
+
+        # With min_thread_create_time set and crossed, resume pauses cleanly with paused_limit.
+        router = QueueRouter(maxsize=1)
+        container = DummyContainer(
+            config=DummyConfig(mode="backfill", max_backfill_pages=0),
+            forums=[DummyForum(905, "bar")],
+        )
+        container.config.research_enabled = True
+        container.research_run_id = run_id
+        container.min_thread_create_time = cutoff
+        scheduler = Scheduler(router, container, cast("Any", store), backfill_sort="reply")
+        await scheduler._run_backfill()
+        with Session(engine) as session:
+            run_row = session.get(ResearchRun, run_id)
+            cp5 = session.get(ResearchCheckpoint, (run_id, task_key, 5))
+            assert run_row is not None and run_row.status == "paused_limit"
+            assert cp5 is not None and cp5.scope_status == "paused_limit"
+
+        # Without min_thread_create_time, saved repeat boundary still fails closed.
+        container.min_thread_create_time = None
+        scheduler_unbounded = Scheduler(router, container, cast("Any", store), backfill_sort="reply")
+        with pytest.raises(BackfillIncompleteError, match="paused_at_saved_repeat_boundary"):
+            await scheduler_unbounded._run_backfill()
+    finally:
+        engine.dispose()

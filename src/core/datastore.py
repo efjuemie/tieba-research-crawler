@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 from tiebameow.models.orm import Comment, Forum, Post, Thread, User
 from tiebameow.utils.logger import logger
+from tiebameow.utils.time_utils import SHANGHAI_TZ
 
 from .error_codes import normalize_checkpoint_error_code
 from .metrics import CACHE_HITS, CACHE_MISSES, DB_OPERATIONS
@@ -117,6 +118,11 @@ def _research_forum_ids(forums_json: Any) -> tuple[set[int], bool]:
             continue
         forum_ids.add(fid)
     return forum_ids, invalid_entry
+
+
+def _normalize_shanghai_utc(value: datetime) -> datetime:
+    normalized = value.replace(tzinfo=SHANGHAI_TZ) if value.tzinfo is None else value
+    return normalized.astimezone(UTC)
 
 
 def _checkpoint_tid_set(values: Any) -> set[int]:
@@ -1730,6 +1736,118 @@ class DataStore:
             row.scope_status = scope_status
             row.last_checked = datetime.now(UTC)
             await session.commit()
+
+    async def research_list_crossed_min_create_time(
+        self,
+        run_id: str,
+        fid: int,
+        is_good: bool,
+        *,
+        sort_mode: Literal["create", "reply"],
+        rn: int,
+        min_thread_create_time: datetime,
+        consecutive_pages: int = 3,
+    ) -> bool:
+        """Return True if completed list pages show at least ``consecutive_pages`` consecutive old pages."""
+        if consecutive_pages <= 0:
+            return False
+        from ..research.models import ResearchThread
+
+        cutoff = _normalize_shanghai_utc(min_thread_create_time)
+        task_key = research_thread_list_task_key(fid, is_good, sort_mode, rn)
+        async with self.async_sessionmaker() as session:
+            rows = (
+                await session.scalars(
+                    select(ResearchCheckpoint)
+                    .where(
+                        ResearchCheckpoint.run_id == run_id,
+                        ResearchCheckpoint.task_key == task_key,
+                        ResearchCheckpoint.scope_type == "thread_list",
+                        ResearchCheckpoint.status == "completed",
+                    )
+                    .order_by(ResearchCheckpoint.page_number.asc())
+                )
+            ).all()
+
+            non_duplicate_rows: list[ResearchCheckpoint] = []
+            for row in rows:
+                cursor = row.continuation_json or {}
+                if cursor.get("high_duplicate_pause_reason"):
+                    continue
+                ratio = cursor.get("page_duplicate_ratio")
+                if isinstance(ratio, (int, float)) and ratio >= 0.9:
+                    continue
+                non_duplicate_rows.append(row)
+
+            if len(non_duplicate_rows) < consecutive_pages:
+                return False
+
+            recent_rows = non_duplicate_rows[-20:]
+            tids_needed: set[int] = set()
+            for row in recent_rows:
+                cursor = row.continuation_json or {}
+                has_create = bool(cursor.get("max_non_top_create_time"))
+                has_last = sort_mode != "reply" or bool(cursor.get("max_non_top_last_time"))
+                if not (has_create and has_last):
+                    tids_needed.update(
+                        _checkpoint_tid_set(
+                            cursor.get("page_non_top_tids") or cursor.get("page_fingerprint") or []
+                        )
+                    )
+
+            thread_times: dict[int, tuple[datetime | None, datetime | None]] = {}
+            if tids_needed:
+                sorted_tids = sorted(tids_needed)
+                for chunk_start in range(0, len(sorted_tids), 1000):
+                    chunk = sorted_tids[chunk_start : chunk_start + 1000]
+                    result = await session.execute(
+                        select(ResearchThread.tid, ResearchThread.create_time, ResearchThread.last_time).where(
+                            ResearchThread.tid.in_(chunk)
+                        )
+                    )
+                    for tid_val, create_val, last_val in result.all():
+                        thread_times[int(tid_val)] = (create_val, last_val)
+
+        streak = 0
+        for row in reversed(recent_rows):
+            cursor = row.continuation_json or {}
+            page_old = False
+            raw_max_create = cursor.get("max_non_top_create_time")
+            raw_max_last = cursor.get("max_non_top_last_time")
+            if raw_max_create and (sort_mode != "reply" or raw_max_last):
+                try:
+                    max_create = _normalize_shanghai_utc(datetime.fromisoformat(str(raw_max_create)))
+                    page_old = max_create < cutoff
+                    if page_old and sort_mode == "reply":
+                        max_last = _normalize_shanghai_utc(datetime.fromisoformat(str(raw_max_last)))
+                        page_old = max_last < cutoff
+                except (TypeError, ValueError):
+                    page_old = False
+            else:
+                page_tids = _checkpoint_tid_set(
+                    cursor.get("page_non_top_tids") or cursor.get("page_fingerprint") or []
+                )
+                if page_tids and all(tid in thread_times for tid in page_tids):
+                    page_old = True
+                    for tid in page_tids:
+                        create_val, last_val = thread_times[tid]
+                        if create_val is None or _normalize_shanghai_utc(create_val) >= cutoff:
+                            page_old = False
+                            break
+                        if sort_mode == "reply" and (
+                            last_val is None or _normalize_shanghai_utc(last_val) >= cutoff
+                        ):
+                            page_old = False
+                            break
+
+            if page_old:
+                streak += 1
+                if streak >= consecutive_pages:
+                    return True
+            else:
+                streak = 0
+
+        return False
 
     async def get_research_list_checkpoint_states(
         self,

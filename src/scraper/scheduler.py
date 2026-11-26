@@ -12,9 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import deque
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
 from tiebameow.utils.logger import logger
+from tiebameow.utils.time_utils import SHANGHAI_TZ
 
 from ..core.error_codes import normalize_checkpoint_error_code
 from ..core.metrics import BACKFILL_FORUMS_COUNT, PERIODIC_FORUMS_COUNT
@@ -42,6 +44,12 @@ class BackfillIncompleteError(RuntimeError):
     def __init__(self, failures: list[str]) -> None:
         self.failures = tuple(failures)
         super().__init__(f"Backfill stopped with {len(failures)} incomplete list stream(s): {'; '.join(failures)}")
+
+
+def _dt_before_cutoff(value: datetime, cutoff: datetime) -> bool:
+    norm_val = value.replace(tzinfo=SHANGHAI_TZ) if value.tzinfo is None else value
+    norm_cut = cutoff.replace(tzinfo=SHANGHAI_TZ) if cutoff.tzinfo is None else cutoff
+    return norm_val.astimezone(UTC) < norm_cut.astimezone(UTC)
 
 
 class Scheduler:
@@ -325,6 +333,9 @@ class Scheduler:
             else {}
         )
         cursors: dict[tuple[int, bool], dict[str, object]] = {key: dict(reply_contract) for key in pages}
+        saved_page_numbers: dict[tuple[int, bool], int] = {}
+        cutoff_streak = dict.fromkeys(pages, 0)
+        min_create_time = getattr(self.container, "min_thread_create_time", None)
         run_id = getattr(self.container, "research_run_id", None)
         if run_id and self.datastore is not None:
             if sort_mode == "reply":
@@ -338,6 +349,8 @@ class Scheduler:
                 saved_states = await self.datastore.get_research_list_checkpoint_states(run_id)
             for key, (next_page, _scope_status, cursor) in saved_states.items():
                 if key in pages:
+                    if next_page is not None:
+                        saved_page_numbers[key] = next_page
                     pages[key] = next_page if next_page is not None else 0
                     cursors[key] = cursor or dict(reply_contract)
         scanned = dict.fromkeys(pages, 0)
@@ -356,6 +369,40 @@ class Scheduler:
                     or repeat_streak >= 3
                 ):
                     forum = next(forum for forum, is_good in streams if (forum.fid, is_good) == key)
+                    crossed_cutoff = (
+                        min_create_time is not None
+                        and not cursor.get("untrusted_terminal_reason")
+                        and run_id is not None
+                        and self.datastore is not None
+                        and hasattr(self.datastore, "research_list_crossed_min_create_time")
+                        and await self.datastore.research_list_crossed_min_create_time(
+                            run_id,
+                            forum.fid,
+                            key[1],
+                            sort_mode=sort_mode,
+                            rn=rn,
+                            min_thread_create_time=min_create_time,
+                        )
+                    )
+                    if crossed_cutoff:
+                        logger.info(
+                            "Backfill list stream already crossed min_thread_create_time={} before saved repeat boundary for forum={} is_good={}; pausing list pagination.",
+                            min_create_time.isoformat(),
+                            forum.fname,
+                            key[1],
+                        )
+                        limited.append(
+                            f"forum={forum.fname} is_good={key[1]} status=paused_limit reason=min_thread_create_time_cutoff"
+                        )
+                        if saved_page_numbers.get(key):
+                            await self.datastore.mark_research_checkpoint_scope_status(
+                                run_id,
+                                research_thread_list_task_key(forum.fid, key[1], sort_mode, rn),
+                                saved_page_numbers[key],
+                                "paused_limit",
+                            )
+                        pages[key] = 0
+                        continue
                     failures.append(f"forum={forum.fname} is_good={key[1]} paused_at_saved_repeat_boundary")
                     pages[key] = 0
         active = [(forum, is_good) for forum, is_good in streams if pages[(forum.fid, is_good)] != 0]
@@ -534,6 +581,41 @@ class Scheduler:
                     else None
                 )
                 if duplicate_pause_reason or untrusted_terminal_reason:
+                    crossed_cutoff = (
+                        min_create_time is not None
+                        and bool(duplicate_pause_reason)
+                        and not untrusted_terminal_reason
+                        and run_id is not None
+                        and self.datastore is not None
+                        and hasattr(self.datastore, "research_list_crossed_min_create_time")
+                        and await self.datastore.research_list_crossed_min_create_time(
+                            run_id,
+                            forum.fid,
+                            is_good,
+                            sort_mode=sort_mode,
+                            rn=rn,
+                            min_thread_create_time=min_create_time,
+                        )
+                    )
+                    if crossed_cutoff:
+                        logger.info(
+                            "Backfill list stream already crossed min_thread_create_time={} before repeat boundary for forum={} is_good={} pn={}; pausing list pagination.",
+                            min_create_time.isoformat(),
+                            forum.fname,
+                            is_good,
+                            pn,
+                        )
+                        limited.append(
+                            f"forum={forum.fname} is_good={is_good} status=paused_limit reason=min_thread_create_time_cutoff"
+                        )
+                        await self.datastore.mark_research_checkpoint_scope_status(
+                            run_id,
+                            research_thread_list_task_key(forum.fid, is_good, sort_mode, rn),
+                            pn,
+                            "paused_limit",
+                        )
+                        active.remove((forum, is_good))
+                        continue
                     failure = (
                         f"forum={forum.fname} is_good={is_good} pn={pn} "
                         f"reason={duplicate_pause_reason or untrusted_terminal_reason}"
@@ -542,6 +624,41 @@ class Scheduler:
                     logger.warning("Backfill list flow paused after its committed boundary page: {}", failure)
                     active.remove((forum, is_good))
                     continue
+
+                if min_create_time is not None:
+                    page_strictly_older = (
+                        bool(result.non_top_tids)
+                        and len(result.non_top_create_times) == len(result.non_top_tids)
+                        and all(_dt_before_cutoff(t, min_create_time) for t in result.non_top_create_times)
+                        and (
+                            sort_mode != "reply"
+                            or (
+                                len(result.non_top_last_times) == len(result.non_top_tids)
+                                and all(_dt_before_cutoff(t, min_create_time) for t in result.non_top_last_times)
+                            )
+                        )
+                    )
+                    cutoff_streak[key] = cutoff_streak[key] + 1 if page_strictly_older else 0
+                    if cutoff_streak[key] >= 3:
+                        logger.info(
+                            "Backfill list stream crossed min_thread_create_time={} for 3 consecutive pages at forum={} is_good={} pn={}; stopping list pagination.",
+                            min_create_time.isoformat(),
+                            forum.fname,
+                            is_good,
+                            pn,
+                        )
+                        limited.append(
+                            f"forum={forum.fname} is_good={is_good} status=paused_limit reason=min_thread_create_time_cutoff"
+                        )
+                        if run_id and self.datastore is not None:
+                            await self.datastore.mark_research_checkpoint_scope_status(
+                                run_id,
+                                research_thread_list_task_key(forum.fid, is_good, sort_mode, rn),
+                                pn,
+                                "paused_limit",
+                            )
+                        active.remove((forum, is_good))
+                        continue
 
                 if result.has_more:
                     if max_pages > 0 and scanned[key] >= max_pages:

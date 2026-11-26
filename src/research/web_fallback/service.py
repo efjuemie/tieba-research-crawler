@@ -416,7 +416,12 @@ async def run_field_backfill(
     )
 
 
-async def _enqueue_remaining_fields(sessions: Any, lease: Any):
+async def _enqueue_remaining_fields(
+    sessions: Any,
+    lease: Any,
+    *,
+    min_ip_create_time: datetime | None = None,
+):
     options: dict[str, Any] = {
         "target_type": lease.target_type,
         "target_ids": (lease.target_id,),
@@ -427,6 +432,8 @@ async def _enqueue_remaining_fields(sessions: Any, lease: Any):
         "only_missing_fields": True,
         "pair_growth_fields": True,
     }
+    if min_ip_create_time is not None:
+        options["min_ip_create_time"] = min_ip_create_time
     if lease.target_type == "comment":
         options["parent_pid"] = lease.parent_post_pid
     return await enqueue_web_enrichment_tasks(
@@ -443,8 +450,17 @@ async def _process_durable_web_lease(
     lease: Any,
     *,
     stop_event: Any | None = None,
+    min_ip_create_time: datetime | None = None,
 ):
-    preflight = await _preflight_web_task(sessions, lease)
+    preflight = (
+        await _preflight_web_task(
+            sessions,
+            lease,
+            min_ip_create_time=min_ip_create_time,
+        )
+        if min_ip_create_time is not None
+        else await _preflight_web_task(sessions, lease)
+    )
     if preflight.status != "ready":
         return preflight.status, preflight
     if stop_event is not None and stop_event.is_set():
@@ -817,6 +833,7 @@ async def drain_pending_web_enrichment(
     login_confirmation: Any | None = None,
     min_thread_create_time: datetime | None = None,
     newest_first: bool = False,
+    min_ip_create_time: datetime | None = None,
 ) -> WebWorkerSummary:
     """Drain durable web tasks across runs using one caller-owned provider."""
     normalized_run_ids = await _snapshot_run_ids(run_ids)
@@ -877,7 +894,11 @@ async def drain_pending_web_enrichment(
 
         try:
             status, result = await _process_durable_web_lease(
-                sessions, provider, lease, stop_event=stop_event
+                sessions,
+                provider,
+                lease,
+                stop_event=stop_event,
+                min_ip_create_time=min_ip_create_time,
             )
         except asyncio.CancelledError:
             raise
@@ -913,7 +934,9 @@ async def drain_pending_web_enrichment(
             completed += 1
         elif status == "partially_completed":
             partial += 1
-            await _enqueue_remaining_fields(sessions, lease)
+            await _enqueue_remaining_fields(
+                sessions, lease, min_ip_create_time=min_ip_create_time
+            )
 
         reason = getattr(result, "reason", None)
         if status == "failed_retryable" and reason == "transport_reset":
@@ -985,6 +1008,7 @@ async def run_live_web_fallback_worker(
     login_confirmation: Any | None = None,
     min_thread_create_time: datetime | None = None,
     newest_first: bool = False,
+    min_ip_create_time: datetime | None = None,
 ) -> WebWorkerSummary:
     """Run WEB work independently, draining only after normal API completion."""
     if browser_profile is None:
@@ -1027,6 +1051,8 @@ async def run_live_web_fallback_worker(
     drain_kwargs = dict(extra_filter_kwargs)
     if newest_first:
         drain_kwargs["newest_first"] = True
+    if min_ip_create_time is not None:
+        drain_kwargs["min_ip_create_time"] = min_ip_create_time
     lease_seconds = _web_lease_seconds(browser_config)
     lease_kwargs = dict(drain_kwargs)
     if lease_seconds > 240:
@@ -1070,7 +1096,11 @@ async def run_live_web_fallback_worker(
 
             try:
                 status, result = await _process_durable_web_lease(
-                    sessions, provider, lease, stop_event=stop_event
+                    sessions,
+                    provider,
+                    lease,
+                    stop_event=stop_event,
+                    min_ip_create_time=min_ip_create_time,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1106,7 +1136,9 @@ async def run_live_web_fallback_worker(
                 completed += 1
             elif status == "partially_completed":
                 partial += 1
-                await _enqueue_remaining_fields(sessions, lease)
+                await _enqueue_remaining_fields(
+                    sessions, lease, min_ip_create_time=min_ip_create_time
+                )
 
             reason = getattr(result, "reason", None)
             if status == "failed_retryable" and reason == "transport_reset":
@@ -1640,10 +1672,20 @@ async def _complete_task(sessions, task_key, lease_token, candidates, **kwargs):
     return await complete_web_enrichment_task(sessions, task_key, lease_token, candidates, **kwargs)
 
 
-async def _preflight_web_task(sessions, lease):
+async def _preflight_web_task(
+    sessions,
+    lease,
+    *,
+    min_ip_create_time: datetime | None = None,
+):
     from .reconcile import preflight_web_enrichment_task
 
-    return await preflight_web_enrichment_task(sessions, lease.task_key, lease.lease_token)
+    return await preflight_web_enrichment_task(
+        sessions,
+        lease.task_key,
+        lease.lease_token,
+        min_ip_create_time=min_ip_create_time,
+    )
 
 
 def _already_satisfied_outcomes(fields):

@@ -1914,3 +1914,206 @@ async def test_lease_web_enrichment_tasks_newest_first_groups_by_tid_desc_and_ta
         (1001, "comment"),
         (1001, "comment"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_ip_location_cutoff_skips_pre_launch_enqueue_and_prunes_existing_tasks(research_db):
+    from src.research.web_fallback.tasks import (
+        IP_BEFORE_LAUNCH_REASON,
+        TIEBA_IP_LOCATION_LAUNCH_TIME,
+        prune_pre_launch_ip_web_tasks,
+    )
+
+    engine, maker = research_db
+    pre_launch = datetime(2022, 4, 27, 23, 59, 0, tzinfo=SHANGHAI_TZ)
+    post_launch = datetime(2022, 4, 28, 0, 1, 0, tzinfo=SHANGHAI_TZ)
+    observed_at = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                # Old 2021 thread, with one old post (only IP missing) and one post-launch post & comment.
+                ResearchThread(
+                    tid=5001,
+                    fid=7654321,
+                    fname="synthetic",
+                    title="old-thread",
+                    create_time=pre_launch,
+                    scraped_at=observed_at,
+                    author_user_id=9001,
+                    author_portrait="p-old",
+                    global_growth_level=5,
+                    global_growth_icon_url="https://example.com/g.png",
+                    source_api="aiotieba.get_posts",
+                    observed_at=observed_at,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchPost(
+                    pid=6001,
+                    tid=5001,
+                    fid=7654321,
+                    floor=2,
+                    text="old post missing only ip",
+                    create_time=pre_launch,
+                    scraped_at=observed_at,
+                    author_user_id=9002,
+                    author_portrait="p-old-post",
+                    global_growth_level=3,
+                    global_growth_icon_url="https://example.com/g.png",
+                    source_api="aiotieba.get_posts",
+                    observed_at=observed_at,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchPost(
+                    pid=6002,
+                    tid=5001,
+                    fid=7654321,
+                    floor=3,
+                    text="old post missing growth and ip",
+                    create_time=pre_launch,
+                    scraped_at=observed_at,
+                    author_user_id=9003,
+                    author_portrait="p-old-post2",
+                    source_api="aiotieba.get_posts",
+                    observed_at=observed_at,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchPost(
+                    pid=6003,
+                    tid=5001,
+                    fid=7654321,
+                    floor=4,
+                    text="new reply in old thread",
+                    create_time=post_launch,
+                    scraped_at=observed_at,
+                    author_user_id=9004,
+                    author_portrait="p-new-post",
+                    global_growth_level=4,
+                    global_growth_icon_url="https://example.com/g.png",
+                    source_api="aiotieba.get_posts",
+                    observed_at=observed_at,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchComment(
+                    cid=7001,
+                    tid=5001,
+                    parent_post_pid=6003,
+                    fid=7654321,
+                    text="new comment in old thread",
+                    create_time=post_launch,
+                    scraped_at=observed_at,
+                    author_user_id=9005,
+                    author_portrait="p-new-cmt",
+                    global_growth_level=2,
+                    global_growth_icon_url="https://example.com/g.png",
+                    source_api="aiotieba.get_comments",
+                    observed_at=observed_at,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchTaskScope(
+                    run_id="run-web-001",
+                    logical_task_key="thread_replies:5001",
+                    generation=0,
+                    task_type="posts",
+                    scope_type="thread_replies",
+                    fid=7654321,
+                    tid=5001,
+                    status="completed",
+                ),
+                ResearchTaskScope(
+                    run_id="run-web-001",
+                    logical_task_key="post_comments:5001:6003",
+                    generation=0,
+                    task_type="comments",
+                    scope_type="post_comments",
+                    fid=7654321,
+                    tid=5001,
+                    parent_pid=6003,
+                    parent_generation=0,
+                    status="completed",
+                ),
+            ]
+        )
+
+    # New enqueue with min_ip_create_time skips 5001 & 6001, strips IP from 6002, keeps 6003 & 7001.
+    thread_summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_level", "global_growth_icon_url", "ip_location_text"],
+        target_type="thread",
+        target_ids=[5001],
+        only_missing_fields=True,
+        pair_growth_fields=True,
+        min_ip_create_time=TIEBA_IP_LOCATION_LAUNCH_TIME,
+    )
+    assert thread_summary.created_count == 0
+    assert thread_summary.skipped.get("ip_location_before_mechanism_launch") == 1
+
+    post_summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["global_growth_level", "global_growth_icon_url", "ip_location_text"],
+        target_type="post",
+        target_ids=[6001, 6002, 6003],
+        only_missing_fields=True,
+        pair_growth_fields=True,
+        min_ip_create_time=TIEBA_IP_LOCATION_LAUNCH_TIME,
+    )
+    assert post_summary.skipped.get("ip_location_before_mechanism_launch") == 1
+    assert {p.target_id: p.requested_fields for p in post_summary.planned_targets} == {
+        6002: ("global_growth_icon_url", "global_growth_level"),
+        6003: ("ip_location_text",),
+    }
+
+    cmt_summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="comment",
+        target_ids=[7001],
+        only_missing_fields=True,
+        min_ip_create_time=TIEBA_IP_LOCATION_LAUNCH_TIME,
+    )
+    assert cmt_summary.created_count == 1
+
+    # Also test pruning pre-existing un-filtered tasks (e.g. 5001 & 6001 enqueued before upgrade).
+    legacy_thread = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="thread",
+        target_ids=[5001],
+        only_missing_fields=True,
+    )
+    legacy_post_ip = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[6001],
+        only_missing_fields=True,
+    )
+    assert legacy_thread.created_count == 1
+    assert legacy_post_ip.created_count == 1
+
+    pruned = await prune_pre_launch_ip_web_tasks(
+        maker,
+        ["run-web-001"],
+        min_ip_create_time=TIEBA_IP_LOCATION_LAUNCH_TIME,
+    )
+    assert pruned["marked_not_applicable"] == 2
+    with Session(engine) as session:
+        t_row = session.get(ResearchWebEnrichmentTask, legacy_thread.task_keys[0])
+        p_row = session.get(ResearchWebEnrichmentTask, legacy_post_ip.task_keys[0])
+        new_p_row = session.get(ResearchWebEnrichmentTask, post_summary.task_keys[1])
+        assert t_row is not None and t_row.status == "not_applicable"
+        assert t_row.field_statuses_json == {
+            "ip_location_text": {"status": "not_applicable", "reason": IP_BEFORE_LAUNCH_REASON}
+        }
+        assert p_row is not None and p_row.status == "not_applicable"
+        assert new_p_row is not None and new_p_row.status == "pending_web"

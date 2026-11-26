@@ -93,6 +93,7 @@ class ThreadPageResult:
     tids: tuple[int, ...]
     non_top_create_times: tuple[datetime, ...]
     non_top_tids: tuple[int, ...] = ()
+    non_top_last_times: tuple[datetime, ...] = dataclasses.field(default=(), compare=False)
     continuation_json: dict[str, object] | None = None
 
 

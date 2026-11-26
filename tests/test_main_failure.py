@@ -22,6 +22,17 @@ async def test_parent_zero_revalidation_flag_requires_resume_before_initializati
     initialize.assert_not_awaited()
 
 
+def test_parse_ip_location_min_date_accepts_date_none_and_rejects_invalid():
+    parsed = app_main._parse_ip_location_min_date("2022-04-28")
+    assert parsed is not None
+    assert (parsed.year, parsed.month, parsed.day) == (2022, 4, 28)
+    assert app_main._parse_ip_location_min_date("none") is None
+    assert app_main._parse_ip_location_min_date("OFF") is None
+    assert app_main._parse_ip_location_min_date(None) is None
+    with pytest.raises(ValueError, match="--ip-location-min-date"):
+        app_main._parse_ip_location_min_date("2022/04/28")
+
+
 @pytest.mark.asyncio
 async def test_main_propagates_incomplete_backfill_failure(monkeypatch):
     class FakeDataStore:

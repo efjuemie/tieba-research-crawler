@@ -2369,3 +2369,106 @@ def test_service_failure_mapping_preserves_terminal_not_applicable_and_unsupport
             "reason": "field_unsupported",
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_preflight_resolves_pre_launch_ip_task_and_strips_mixed_ip_field(reconcile_db):
+    from tiebameow.utils.time_utils import SHANGHAI_TZ
+    from src.research.web_fallback.tasks import (
+        IP_BEFORE_LAUNCH_REASON,
+        TIEBA_IP_LOCATION_LAUNCH_TIME,
+    )
+
+    engine, maker = reconcile_db
+    observed = datetime(2026, 1, 1, tzinfo=UTC)
+    pre_launch = datetime(2021, 5, 1, 12, 0, 0, tzinfo=SHANGHAI_TZ)
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                ResearchPost(
+                    pid=2901,
+                    tid=1001,
+                    fid=7654321,
+                    floor=2,
+                    text="old post ip only",
+                    create_time=pre_launch,
+                    scraped_at=observed,
+                    author_user_id=501,
+                    author_portrait="p2901",
+                    global_growth_level=2,
+                    global_growth_icon_url="https://example.com/g.png",
+                    source_api="aiotieba.get_posts",
+                    observed_at=observed,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+                ResearchPost(
+                    pid=2902,
+                    tid=1001,
+                    fid=7654321,
+                    floor=3,
+                    text="old post mixed",
+                    create_time=pre_launch,
+                    scraped_at=observed,
+                    author_user_id=502,
+                    author_portrait="p2902",
+                    source_api="aiotieba.get_posts",
+                    observed_at=observed,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                ),
+            ]
+        )
+
+    ip_only_summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=[2901],
+        only_missing_fields=True,
+    )
+    mixed_summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        ["global_growth_level", "global_growth_icon_url", "ip_location_text"],
+        target_type="post",
+        target_ids=[2902],
+        only_missing_fields=True,
+        pair_growth_fields=True,
+    )
+    leases = await lease_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        "preflight-cutoff-worker",
+        limit=10,
+        task_keys=[ip_only_summary.task_keys[0], mixed_summary.task_keys[0]],
+    )
+    leases_by_id = {lease.target_id: lease for lease in leases}
+
+    ip_preflight = await preflight_web_enrichment_task(
+        maker,
+        leases_by_id[2901].task_key,
+        leases_by_id[2901].lease_token,
+        min_ip_create_time=TIEBA_IP_LOCATION_LAUNCH_TIME,
+    )
+    assert ip_preflight.status == "not_applicable"
+    assert ip_preflight.preflight_skipped is True
+    with Session(engine) as session:
+        task_row = session.get(ResearchWebEnrichmentTask, leases_by_id[2901].task_key)
+        assert task_row is not None and task_row.status == "not_applicable"
+        assert task_row.field_statuses_json == {
+            "ip_location_text": {"status": "not_applicable", "reason": IP_BEFORE_LAUNCH_REASON}
+        }
+
+    mixed_preflight = await preflight_web_enrichment_task(
+        maker,
+        leases_by_id[2902].task_key,
+        leases_by_id[2902].lease_token,
+        min_ip_create_time=TIEBA_IP_LOCATION_LAUNCH_TIME,
+    )
+    assert mixed_preflight.status == "ready"
+    assert mixed_preflight.missing_fields == ("global_growth_icon_url", "global_growth_level")
+    assert mixed_preflight.preserved_outcomes == {
+        "ip_location_text": {"status": "not_applicable", "reason": IP_BEFORE_LAUNCH_REASON}
+    }
