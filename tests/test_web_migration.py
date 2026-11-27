@@ -116,3 +116,50 @@ def test_postgresql_web_enrichment_lease_indexes_migration_is_idempotent():
     )
     _ensure_web_enrichment_lease_indexes(sqlite_connection)
     assert sqlite_statements == []
+
+
+@pytest.mark.asyncio
+async def test_core_create_tables_calls_web_enrichment_lease_indexes(tmp_path):
+    from src.core.initialize import create_tables
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'core-init.db'}")
+    try:
+        called = []
+
+        class _ConnWrapper:
+            def __init__(self, sync_conn):
+                self._sync_conn = sync_conn
+
+            async def run_sync(self, fn, *args, **kwargs):
+                if fn is _ensure_web_enrichment_lease_indexes:
+                    called.append(True)
+                return fn(self._sync_conn, *args, **kwargs)
+
+        class _BeginWrapper:
+            def __init__(self, eng):
+                self._eng = eng
+
+            async def __aenter__(self):
+                self._ctx = self._eng.begin()
+                return _ConnWrapper(self._ctx.__enter__())
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return self._ctx.__exit__(exc_type, exc, tb)
+
+        class _EngineWrapper:
+            def __init__(self, eng):
+                self._eng = eng
+
+            def begin(self):
+                return _BeginWrapper(self._eng)
+
+        container = SimpleNamespace(
+            tb_client=object(),
+            async_sessionmaker=object(),
+            db_engine=_EngineWrapper(engine),
+            config=SimpleNamespace(partition_enabled=False),
+        )
+        await create_tables(container)
+        assert called == [True]
+    finally:
+        engine.dispose()

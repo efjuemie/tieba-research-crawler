@@ -213,6 +213,8 @@ class _CachedParentSnapshot:
     growth_missed_target_ids: set[str] = field(default_factory=set)
     exhausted: bool = False
     exhausted_reason: str | None = None
+    page_url: str | None = None
+    dom_html: str | None = None
 
 
 def _snapshot_dedup_key(snapshot: Any) -> tuple[str, str, str | None, str]:
@@ -683,6 +685,8 @@ class PlaywrightWebFallbackProvider:
         terminal_readiness: str | None = None
         cache_ready = False
         comment_owner_exhausted = False
+        comment_page_url: str | None = None
+        comment_dom_html: str | None = None
         try:
             if reuse_page and cached_page is not None:
                 cached_context = replace(
@@ -843,7 +847,9 @@ class PlaywrightWebFallbackProvider:
                     comment_owner_exhausted = await self._expand_comment_owner(
                         page, target, state, capture_response, deadline
                     )
-                    dom_result = _extract_dom_or_empty(target, page.url, await page.content())
+                    comment_page_url = page.url
+                    comment_dom_html = await page.content()
+                    dom_result = _extract_dom_or_empty(target, comment_page_url, comment_dom_html)
                     if dom_result.identity_verified:
                         dom_result = await _hover_growth_and_extract_dom(
                             page, target, dom_result, network_results, deadline, state
@@ -949,6 +955,8 @@ class PlaywrightWebFallbackProvider:
                     target,
                     parent_snapshot_pending,
                     exhausted=comment_owner_exhausted and self._max_pages == 1,
+                    page_url=comment_page_url,
+                    dom_html=comment_dom_html,
                 )
                 return BrowserRunResult(
                     "ok",
@@ -964,6 +972,8 @@ class PlaywrightWebFallbackProvider:
                     target,
                     parent_snapshot_pending,
                     exhausted=comment_owner_exhausted and self._max_pages == 1,
+                    page_url=comment_page_url,
+                    dom_html=comment_dom_html,
                 )
                 return BrowserRunResult(
                     "ok",
@@ -1083,12 +1093,15 @@ class PlaywrightWebFallbackProvider:
         snapshots: list[Any],
         *,
         exhausted: bool = False,
+        page_url: str | None = None,
+        dom_html: str | None = None,
     ) -> None:
         if target.scope_generation is None or target.parent_scope_generation is None:
             self._cached_parent_snapshot = None
             return
         if not snapshots:
             return
+        normalized_html = dom_html if (dom_html and dom_html.strip()) else None
         group_key = _parent_snapshot_group_key(target)
         cached = self._cached_parent_snapshot
         if (
@@ -1109,6 +1122,9 @@ class PlaywrightWebFallbackProvider:
                 cached.missed_target_ids.intersection_update(cached.growth_missed_target_ids)
             if exhausted:
                 cached.exhausted = True
+            if normalized_html is not None and page_url:
+                cached.page_url = page_url
+                cached.dom_html = normalized_html
         else:
             deduped_snapshots = []
             seen_keys = set()
@@ -1124,6 +1140,8 @@ class PlaywrightWebFallbackProvider:
                 time.monotonic(),
                 exhausted=exhausted,
                 exhausted_reason="cid_missing_from_response",
+                page_url=page_url if (normalized_html is not None and page_url) else None,
+                dom_html=normalized_html if (normalized_html is not None and page_url) else None,
             )
 
     def _collect_from_parent_snapshot(
@@ -1204,25 +1222,74 @@ class PlaywrightWebFallbackProvider:
             return None
 
         growth_fields = {"global_growth_level", "global_growth_icon_url"}
+        dom_growth_result: DOMExtractionResult | None = None
         if set(target.requested_fields) & growth_fields and not any(
             candidate.field_name in growth_fields for result in results for candidate in result.candidates
         ):
-            cached.missed_target_ids.add(target_key)
-            cached.growth_missed_target_ids.add(target_key)
-            state["parent_snapshot_misses"] = 1
-            if cached.target_count >= self._parent_snapshot_max_targets:
-                self._cached_parent_snapshot = None
-            return None
+            if cached.dom_html and cached.page_url:
+                cached_dom = _extract_dom_or_empty(target, cached.page_url, cached.dom_html)
+                if cached_dom.identity_verified:
+                    requested_growth = set(target.requested_fields) & growth_fields
+                    has_growth = any(c.field_name in growth_fields for c in cached_dom.candidates)
+                    all_absent = all(
+                        cached_dom.field_outcomes.get(f, {}).get("status") == "absent_on_page"
+                        for f in requested_growth
+                    )
+                    if has_growth or (all_absent and not _comment_growth_needs_hover(cached_dom)):
+                        dom_growth_result = cached_dom
+                else:
+                    network_identities = [
+                        result.identity_evidence
+                        for result in results
+                        if result.status == "ok"
+                        and result.identity_verified
+                        and result.identity_evidence is not None
+                    ]
+                    if network_identities:
+                        dom_growth = extract_comment_author_growth(
+                            target, cached.page_url, cached.dom_html, network_identities[-1]
+                        )
+                        if _comment_growth_identity_conflict(dom_growth):
+                            self._cached_parent_snapshot = None
+                            state["parent_snapshot_misses"] = 1
+                            return BrowserRunResult(
+                                "identity_unverified",
+                                dom_growth.reason,
+                                (),
+                                {**state, "identity_failure": dom_growth.reason},
+                                {
+                                    name: {"status": "identity_unverified", "reason": dom_growth.reason}
+                                    for name in target.requested_fields
+                                },
+                                False,
+                            )
+                        if dom_growth.identity_verified and dom_growth.reason != "author_profile_header_not_observed":
+                            if any(
+                                c.field_name in growth_fields for c in dom_growth.candidates
+                            ) or not _comment_growth_needs_hover(dom_growth):
+                                dom_growth_result = dom_growth
+            if dom_growth_result is None:
+                cached.missed_target_ids.add(target_key)
+                cached.growth_missed_target_ids.add(target_key)
+                state["parent_snapshot_misses"] = 1
+                if cached.target_count >= self._parent_snapshot_max_targets:
+                    self._cached_parent_snapshot = None
+                return None
 
         candidates_by_field = {}
         outcomes = {}
         identity_methods = []
-        for result in results:
+        all_results = [*results, dom_growth_result] if dom_growth_result is not None else results
+        for result in all_results:
             outcomes.update(result.field_outcomes)
-            evidence = result.identity_evidence
+            evidence = getattr(result, "identity_evidence", None)
             if evidence is not None:
                 identity_methods.extend(method for method in evidence.match_methods if method not in identity_methods)
             for candidate in result.candidates:
+                if candidate.identity is not None:
+                    identity_methods.extend(
+                        method for method in candidate.identity.match_methods if method not in identity_methods
+                    )
                 existing = candidates_by_field.get(candidate.field_name)
                 if existing is not None and existing.normalized_value != candidate.normalized_value:
                     self._cached_parent_snapshot = None

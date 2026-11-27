@@ -12,6 +12,7 @@ from sqlalchemy import select, text
 from tiebameow.models.orm import Base, Forum
 from tiebameow.utils.logger import logger
 
+from ..research.migration import _ensure_web_enrichment_lease_indexes
 from .config import Config
 from .container import Container
 from .models import (  # noqa: F401  确保本地表被 create_all 发现
@@ -84,6 +85,7 @@ async def create_tables(container: Container) -> None:
     try:
         async with container.db_engine.begin() as conn:  # type: ignore
             await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_ensure_web_enrichment_lease_indexes)
             if container.config.partition_enabled:
                 await conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb;"))
                 for table in ("thread", "post", "comment"):

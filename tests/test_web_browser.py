@@ -3059,3 +3059,184 @@ async def test_unexhausted_parent_snapshot_missing_cid_preserves_cache_for_next_
     assert sibling.diagnostics["pages"] == 0
     assert len(context.pages) == 2
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_snapshot_reuses_expanded_dom_for_sibling_growth_and_absent_growth():
+    anchor_cid = CID
+    anchor_author = AUTHOR_ID
+    anchor_portrait = PORTRAIT
+    icon_cid = str(int(CID) + 1)
+    icon_author = str(int(AUTHOR_ID) + 1)
+    icon_portrait = "tb.1.sibling_icon"
+    no_icon_cid = str(int(CID) + 2)
+    no_icon_author = str(int(AUTHOR_ID) + 2)
+    no_icon_portrait = "tb.1.sibling_none"
+
+    expanded_html = f"""
+    <html><body>
+      <div class="pb-comment-item" data-id="{POST_ID}">
+        <div class="pb-content-wrap"><div class="richtext-item">
+          <span tid="{TID}" fid="{FID}" index="1"></span>
+        </div></div>
+        <div class="comment-content"><div class="lzl-wrapper">
+          <div class="pb-lzl-item">
+            <div class="head-line user-info"><div class="name-info">
+              <a class="head-name" href="https://tieba.baidu.com/home/main?id={anchor_portrait}">anchor</a>
+            </div></div>
+          </div>
+          <div class="pb-lzl-item">
+            <div class="head-line user-info"><div class="name-info">
+              <a class="head-name" href="https://tieba.baidu.com/home/main?id={icon_portrait}">with_icon</a>
+            </div><span class="icon_tshows tooltip__reference" aria-describedby="sibling-tip"><img
+              class="icon_tshows_img"
+              src="https://tieba-ares.cdn.bcebos.com/synthetic/sibling-growth.webp"></span></div>
+          </div>
+          <div class="pb-lzl-item">
+            <div class="head-line user-info"><div class="name-info">
+              <a class="head-name" href="https://tieba.baidu.com/home/main?id={no_icon_portrait}">no_icon</a>
+            </div></div>
+          </div>
+        </div></div>
+      </div>
+      <div id="sibling-tip">贴吧成长等级：Lv. 7</div>
+    </body></html>"""
+
+    shared_response = _page_pc_parent_response(
+        (
+            (anchor_cid, anchor_author, "北京"),
+            (icon_cid, icon_author, "上海"),
+            (no_icon_cid, no_icon_author, "广东"),
+        )
+    )
+    page = FakePage(
+        html_text=expanded_html,
+        page_pc_response_text=shared_response,
+        nested_response_text=_nested_response(cid=anchor_cid, author_id=anchor_author),
+        expansion_remaining=0,
+    )
+    context = FakeContext(lambda: page)
+    provider = _provider(context, reuse_parent_snapshots=True)
+    provider.set_run_scope("growth-dom-reuse-run")
+
+    anchor = await provider.collect(
+        _comment_target(
+            target_id=anchor_cid,
+            cid=anchor_cid,
+            author_user_id=anchor_author,
+            author_portrait=anchor_portrait,
+            requested_fields=("ip_location_text",),
+        )
+    )
+    assert anchor.status == "ok"
+
+    # Sibling with growth icon in expanded DOM hits snapshot with 0 page loads.
+    with_icon = await provider.collect(
+        _comment_target(
+            target_id=icon_cid,
+            cid=icon_cid,
+            author_user_id=icon_author,
+            author_portrait=icon_portrait,
+            requested_fields=("global_growth_icon_url", "global_growth_level", "ip_location_text"),
+        )
+    )
+    assert with_icon.status == "ok"
+    assert with_icon.diagnostics["parent_snapshot_hits"] == 1
+    assert with_icon.diagnostics["pages"] == 0
+    with_icon_map = {c.field_name: c.normalized_value for c in with_icon.candidates}
+    assert with_icon_map["ip_location_text"] == "上海"
+    assert with_icon_map["global_growth_level"] == 7
+    assert with_icon_map["global_growth_icon_url"] == (
+        "https://tieba-ares.cdn.bcebos.com/synthetic/sibling-growth.webp"
+    )
+
+    # Sibling with no growth icon in expanded DOM also hits snapshot and marks absent cleanly.
+    without_icon = await provider.collect(
+        _comment_target(
+            target_id=no_icon_cid,
+            cid=no_icon_cid,
+            author_user_id=no_icon_author,
+            author_portrait=no_icon_portrait,
+            requested_fields=("global_growth_icon_url", "global_growth_level", "ip_location_text"),
+        )
+    )
+    assert without_icon.status == "ok"
+    assert without_icon.diagnostics["parent_snapshot_hits"] == 1
+    assert without_icon.diagnostics["pages"] == 0
+    without_icon_map = {c.field_name: c.normalized_value for c in without_icon.candidates}
+    assert without_icon_map == {"ip_location_text": "广东"}
+    assert without_icon.field_outcomes["global_growth_icon_url"]["status"] == "absent_on_page"
+    assert without_icon.field_outcomes["global_growth_level"]["status"] == "absent_on_page"
+    assert len(context.pages) == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_snapshot_falls_back_when_cached_dom_growth_needs_hover():
+    anchor_cid = CID
+    anchor_author = AUTHOR_ID
+    sibling_cid = str(int(CID) + 1)
+    sibling_author = str(int(AUTHOR_ID) + 1)
+    sibling_portrait = "tb.1.needs_hover"
+
+    # Unmapped/empty-image icon_tshows triggers growth_icon_image_not_found -> needs hover on live page.
+    initial_html = f"""
+    <html><body>
+      <div class="pb-comment-item" data-id="{POST_ID}">
+        <div class="pb-content-wrap"><div class="richtext-item">
+          <span tid="{TID}" fid="{FID}" index="1"></span>
+        </div></div>
+        <div class="comment-content"><div class="lzl-wrapper">
+          <div class="pb-lzl-item">
+            <div class="head-line user-info"><div class="name-info">
+              <a class="head-name" href="https://tieba.baidu.com/home/main?id={PORTRAIT}">anchor</a>
+            </div></div>
+          </div>
+          <div class="pb-lzl-item">
+            <div class="head-line user-info"><div class="name-info">
+              <a class="head-name" href="https://tieba.baidu.com/home/main?id={sibling_portrait}">hover_needed</a>
+            </div><span class="icon_tshows tooltip__reference"></span></div>
+          </div>
+        </div></div>
+      </div>
+    </body></html>"""
+    hovered_html = initial_html.replace(
+        '<span class="icon_tshows tooltip__reference"></span>',
+        '<span class="icon_tshows tooltip__reference" aria-describedby="hover-tip"></span>',
+    ).replace("</body>", '<div id="hover-tip">贴吧成长等级：Lv. 9</div></body>')
+
+    shared_response = _page_pc_parent_response(
+        ((anchor_cid, anchor_author, "北京"), (sibling_cid, sibling_author, "浙江"))
+    )
+    pages = [
+        FakePage(html_text=initial_html, page_pc_response_text=shared_response, expansion_remaining=0),
+        FakePage(
+            html_text=initial_html,
+            hovered_html_text=hovered_html,
+            comment_growth_hover_points=[{"x": 10, "y": 10}],
+            page_pc_response_text=shared_response,
+            expansion_remaining=0,
+        ),
+    ]
+    context = FakeContext(lambda: pages.pop(0))
+    provider = _provider(context, reuse_parent_snapshots=True)
+    provider.set_run_scope("hover-fallback-run")
+
+    anchor = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+    assert anchor.status == "ok"
+
+    sibling = await provider.collect(
+        _comment_target(
+            target_id=sibling_cid,
+            cid=sibling_cid,
+            author_user_id=sibling_author,
+            author_portrait=sibling_portrait,
+            requested_fields=("global_growth_level", "global_growth_icon_url"),
+        )
+    )
+    assert sibling.status == "ok"
+    assert sibling.diagnostics["parent_snapshot_misses"] == 1
+    assert sibling.diagnostics["pages"] == 1
+    assert next(c.normalized_value for c in sibling.candidates if c.field_name == "global_growth_level") == 9
+    assert len(context.pages) == 2
+    await provider.close()
