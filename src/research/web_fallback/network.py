@@ -1158,8 +1158,20 @@ def extract_nested_floor(
         field_outcomes["global_growth_icon_url"] = growth_outcome
 
     region = author.get("ip_address")
-    if isinstance(region, str) and region.strip() and not _is_literal_ip(region.strip()):
-        add("ip_location_text", region, f"{base}.author.ip_address")
+    if "ip_location_text" in field_outcomes and isinstance(region, str):
+        normalized_region = region.strip()
+        if not normalized_region:
+            field_outcomes["ip_location_text"] = {
+                "status": "absent_on_page",
+                "reason": "ip_location_empty_in_response",
+            }
+        elif _is_literal_ip(normalized_region):
+            field_outcomes["ip_location_text"] = {
+                "status": "needs_evidence",
+                "reason": "bare_ip_not_region_label",
+            }
+        else:
+            add("ip_location_text", region, f"{base}.author.ip_address")
 
     agree = item.get("agree")
     if isinstance(agree, dict):
@@ -1245,6 +1257,59 @@ def verify_parent_snapshot(
     else:
         return None
     if anchor_result.status != "ok" or not anchor_result.identity_verified:
+        return None
+    return VerifiedParentSnapshot(
+        anchor_target=anchor_target,
+        response_text=response_text,
+        request_context=request_context,
+        response_status=response_status,
+        observed_at=request_context.observed_at,
+        source_path=source_path,
+    )
+
+
+def verify_parent_nested_floor_page(
+    anchor_target: Target,
+    response_text: str,
+    request_context: ImmutableRequestContext,
+    *,
+    response_status: int = 200,
+) -> VerifiedParentSnapshot | None:
+    """Verify a nestedFloor page belongs to anchor_target's parent even if anchor CID is on another page."""
+    if anchor_target.target_type != "comment" or response_status != 200:
+        return None
+    source_path = urlparse(request_context.request_url).path
+    if source_path != NESTED_FLOOR_PATH:
+        return None
+    if not validate_request_context(anchor_target, request_context).identity_verified:
+        return None
+    try:
+        payload = parse_json_unique(response_text)
+    except (DuplicateJSONKeyError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error_code = payload.get("error_code")
+    if isinstance(error_code, bool) or error_code != 0:
+        return None
+    data = payload.get("data")
+    post_list = data.get("post_list") if isinstance(data, dict) else None
+    if not isinstance(post_list, list):
+        return None
+    response_fid, alias_reason = _nested_floor_response_identity(anchor_target, payload, data)
+    if alias_reason is not None:
+        return None
+    if (
+        request_context.request_fid is not None
+        and anchor_target.fid is not None
+        and request_context.request_fid != anchor_target.fid
+    ):
+        return None
+    if (
+        response_fid is not None
+        and request_context.request_fid is not None
+        and response_fid != request_context.request_fid
+    ):
         return None
     return VerifiedParentSnapshot(
         anchor_target=anchor_target,

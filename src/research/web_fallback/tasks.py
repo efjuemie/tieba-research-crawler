@@ -1302,77 +1302,110 @@ async def lease_web_enrichment_tasks(
                     )
                 ),
             )
-        leading_orders: list[Any] = []
-        if priority_min_thread_create_time is not None:
-            era_rank = case(
-                (
-                    exists(
-                        select(1).where(
-                            Thread.tid == ResearchWebEnrichmentTask.tid,
-                            Thread.create_time.is_not(None),
-                            Thread.create_time < priority_min_thread_create_time,
-                        )
-                    ),
-                    1,
-                ),
-                else_=0,
+        if priority_min_thread_create_time is not None and min_thread_create_time is None:
+            old_thread_exists = exists(
+                select(1).where(
+                    Thread.tid == ResearchWebEnrichmentTask.tid,
+                    Thread.create_time.is_not(None),
+                    Thread.create_time < priority_min_thread_create_time,
+                )
             )
-            leading_orders.append(era_rank.asc())
+            era_filters: tuple[Any, ...] = (~old_thread_exists, old_thread_exists)
+        else:
+            era_filters = (None,)
         if prioritize_comments:
             ip_only_expr = (
                 func.replace(cast(ResearchWebEnrichmentTask.requested_fields_json, String), " ", "")
                 == '["ip_location_text"]'
             )
-            comment_priority_rank = case(
-                (ResearchWebEnrichmentTask.target_type == "comment", 0),
+            comment_tier_specs: tuple[tuple[Any | None, bool], ...] = (
+                (ResearchWebEnrichmentTask.target_type == "comment", True),
+                (
+                    and_(
+                        ResearchWebEnrichmentTask.target_type.in_(("thread", "post")),
+                        ~ip_only_expr,
+                    ),
+                    False,
+                ),
                 (
                     and_(
                         ResearchWebEnrichmentTask.target_type.in_(("thread", "post")),
                         ip_only_expr,
                     ),
-                    2,
+                    False,
                 ),
-                else_=1,
-            )
-            leading_orders.append(comment_priority_rank.asc())
-        if newest_first:
-            target_type_rank = case(
-                (ResearchWebEnrichmentTask.target_type == "thread", 0),
-                (ResearchWebEnrichmentTask.target_type == "post", 1),
-                (ResearchWebEnrichmentTask.target_type == "comment", 2),
-                else_=3,
-            )
-            order_clauses: tuple[Any, ...] = (
-                *leading_orders,
-                ResearchWebEnrichmentTask.attempts.asc(),
-                ResearchWebEnrichmentTask.priority.desc(),
-                ResearchWebEnrichmentTask.tid.desc(),
-                target_type_rank.asc(),
-                ResearchWebEnrichmentTask.parent_post_pid.asc(),
-                ResearchWebEnrichmentTask.target_id.asc(),
-                ResearchWebEnrichmentTask.created_at.asc(),
-                ResearchWebEnrichmentTask.task_key.asc(),
             )
         else:
-            order_clauses = (
-                *leading_orders,
-                ResearchWebEnrichmentTask.attempts.asc(),
-                ResearchWebEnrichmentTask.priority.desc(),
-                ResearchWebEnrichmentTask.target_type,
-                ResearchWebEnrichmentTask.tid,
-                ResearchWebEnrichmentTask.parent_post_pid,
-                ResearchWebEnrichmentTask.target_id,
-                ResearchWebEnrichmentTask.created_at,
-                ResearchWebEnrichmentTask.task_key,
-            )
-        result = await session.execute(
-            select(ResearchWebEnrichmentTask)
-            .where(eligible)
-            .order_by(*order_clauses)
-            .limit(limit)
-            .with_for_update(skip_locked=True)
+            comment_tier_specs = ((None, False),)
+
+        target_type_rank = case(
+            (ResearchWebEnrichmentTask.target_type == "thread", 0),
+            (ResearchWebEnrichmentTask.target_type == "post", 1),
+            (ResearchWebEnrichmentTask.target_type == "comment", 2),
+            else_=3,
         )
-        rows = result.scalars().all()
+        rows: list[ResearchWebEnrichmentTask] = []
+        seen_task_keys: set[str] = set()
+        for era_filter in era_filters:
+            for comment_filter, single_target_type in comment_tier_specs:
+                remaining = limit - len(rows)
+                if remaining <= 0:
+                    break
+                tier_where = eligible
+                if era_filter is not None:
+                    tier_where = and_(tier_where, era_filter)
+                if comment_filter is not None:
+                    tier_where = and_(tier_where, comment_filter)
+                if newest_first:
+                    if single_target_type:
+                        order_clauses: tuple[Any, ...] = (
+                            ResearchWebEnrichmentTask.attempts.asc(),
+                            ResearchWebEnrichmentTask.priority.desc(),
+                            ResearchWebEnrichmentTask.tid.desc(),
+                            ResearchWebEnrichmentTask.parent_post_pid.asc(),
+                            ResearchWebEnrichmentTask.target_id.asc(),
+                            ResearchWebEnrichmentTask.created_at.asc(),
+                            ResearchWebEnrichmentTask.task_key.asc(),
+                        )
+                    else:
+                        order_clauses = (
+                            ResearchWebEnrichmentTask.attempts.asc(),
+                            ResearchWebEnrichmentTask.priority.desc(),
+                            ResearchWebEnrichmentTask.tid.desc(),
+                            target_type_rank.asc(),
+                            ResearchWebEnrichmentTask.parent_post_pid.asc(),
+                            ResearchWebEnrichmentTask.target_id.asc(),
+                            ResearchWebEnrichmentTask.created_at.asc(),
+                            ResearchWebEnrichmentTask.task_key.asc(),
+                        )
+                else:
+                    order_clauses = (
+                        ResearchWebEnrichmentTask.attempts.asc(),
+                        ResearchWebEnrichmentTask.priority.desc(),
+                        ResearchWebEnrichmentTask.target_type,
+                        ResearchWebEnrichmentTask.tid,
+                        ResearchWebEnrichmentTask.parent_post_pid,
+                        ResearchWebEnrichmentTask.target_id,
+                        ResearchWebEnrichmentTask.created_at,
+                        ResearchWebEnrichmentTask.task_key,
+                    )
+                result = await session.execute(
+                    select(ResearchWebEnrichmentTask)
+                    .where(tier_where)
+                    .order_by(*order_clauses)
+                    .limit(remaining)
+                    .with_for_update(skip_locked=True)
+                )
+                for task in result.scalars().all():
+                    if task.task_key in seen_task_keys:
+                        continue
+                    seen_task_keys.add(task.task_key)
+                    rows.append(task)
+            if len(rows) >= limit:
+                break
+
+        lease_timestamp = _now(now)
+        lease_until = lease_timestamp + timedelta(seconds=lease_seconds)
         for task in rows:
             token = str(uuid4())
             task.status = "running"
@@ -1381,14 +1414,14 @@ async def lease_web_enrichment_tasks(
             task.lease_token = token
             task.lease_owner = worker_id
             task.lease_until = lease_until
-            task.leased_at = current_time
+            task.leased_at = lease_timestamp
             task.next_retry_at = None
-            task.updated_at = current_time
+            task.updated_at = lease_timestamp
             session.add(
                 ResearchWebEnrichmentAttempt(
                     task_key=task.task_key,
                     lease_generation=task.lease_generation,
-                    started_at=current_time,
+                    started_at=lease_timestamp,
                     status="running",
                 )
             )

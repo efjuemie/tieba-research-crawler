@@ -2873,3 +2873,189 @@ async def test_same_thread_reuses_page_snapshot_from_thread_to_post():
     assert p_res.diagnostics["page_cache_hits"] == 1
     assert len(context.pages) == 1
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_multi_page_nested_floor_caches_all_pages_and_exhausted_snapshot():
+    page1_cid = CID
+    page1_author = AUTHOR_ID
+    page2_cid = str(int(CID) + 1)
+    page2_author = str(int(AUTHOR_ID) + 1)
+    missing_cid = str(int(CID) + 2)
+    missing_author = str(int(AUTHOR_ID) + 2)
+
+    class _MultiPageNestedExpansion(FakeExpansion):
+        async def click(self, **_kwargs):
+            idx = 2 - self.page.expansion_remaining
+            self.page.expansion_remaining -= 1
+            offset, text = self.page.step_responses[idx]
+            request = FakeRequest(
+                f"https://tieba.baidu.com{NESTED_FLOOR_PATH}",
+                method="POST",
+                post_data=f"thread_id={TID}&post_id={POST_ID}&fid={FID}&offset={offset}",
+            )
+            self.page.emit("request", request)
+            response = FakeResponse(request, text=text)
+            self.page.emit("response", response)
+            self.page.match_expected_response(response)
+
+    class _MultiPageFakePage(FakePage):
+        def __init__(self, step_responses, **kwargs):
+            super().__init__(**kwargs)
+            self.step_responses = step_responses
+
+        def locator(self, selector):
+            if selector.startswith(".pb-comment-item[data-id="):
+                parent_locator = FakePostLocator(self)
+                wrapper = FakeWrapper(self)
+                wrapper.locator = (
+                    lambda sel: _MultiPageNestedExpansion(self)
+                    if sel == ":scope > .show-more-lzl"
+                    else FakeNestedItems(self)
+                )
+                parent_locator.locator = lambda _sel: wrapper
+                return parent_locator
+            return super().locator(selector)
+
+    def _nested_with_ip(cid, author_id, ip_address):
+        return json.dumps(
+            {
+                "error_code": 0,
+                "data": {
+                    "post_list": [
+                        {
+                            "id": cid,
+                            "author_id": author_id,
+                            "author": {
+                                "id": author_id,
+                                "name_show": "合成昵称",
+                                "ip_address": ip_address,
+                            },
+                        }
+                    ]
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    page = _MultiPageFakePage(
+        step_responses=[
+            ("0", _nested_with_ip(page1_cid, page1_author, "北京")),
+            ("10", _nested_with_ip(page2_cid, page2_author, "上海")),
+        ],
+        page_pc_response_text=_page_pc_parent_response(((page1_cid, page1_author, "北京"),)),
+        expansion_remaining=2,
+    )
+    context = FakeContext(lambda: page)
+    provider = _provider(
+        context,
+        max_expansions=10,
+        reuse_parent_snapshots=True,
+        parent_snapshot_ttl_seconds=300.0,
+        parent_snapshot_max_targets=50,
+    )
+    provider.set_run_scope("multi-page-run")
+
+    anchor = await provider.collect(
+        _comment_target(
+            target_id=page1_cid,
+            cid=page1_cid,
+            author_user_id=page1_author,
+            requested_fields=("ip_location_text",),
+        )
+    )
+    assert anchor.status == "ok"
+    assert anchor.diagnostics["expansions"] == 2
+
+    # Missing sibling on an exhausted parent resolves from snapshot without re-opening or wiping cache.
+    missing = await provider.collect(
+        _comment_target(
+            target_id=missing_cid,
+            cid=missing_cid,
+            author_user_id=missing_author,
+            requested_fields=("ip_location_text",),
+        )
+    )
+    assert missing.status == "identity_unverified"
+    assert missing.reason == "cid_missing_from_response"
+    assert missing.diagnostics["pages"] == 0
+    assert missing.diagnostics["parent_snapshot_hits"] == 1
+
+    # Sibling on page 2 of nestedFloor hits cached snapshot without opening a new page.
+    second = await provider.collect(
+        _comment_target(
+            target_id=page2_cid,
+            cid=page2_cid,
+            author_user_id=page2_author,
+            requested_fields=("ip_location_text",),
+        )
+    )
+    assert second.status == "ok"
+    assert second.diagnostics["pages"] == 0
+    assert second.diagnostics["parent_snapshot_hits"] == 1
+    assert next(c.normalized_value for c in second.candidates if c.field_name == "ip_location_text") == "上海"
+    assert len(context.pages) == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_unexhausted_parent_snapshot_missing_cid_preserves_cache_for_next_sibling():
+    page1_cid = CID
+    page1_author = AUTHOR_ID
+    page2_cid = str(int(CID) + 1)
+    page2_author = str(int(AUTHOR_ID) + 1)
+    missing_cid = str(int(CID) + 2)
+    missing_author = str(int(AUTHOR_ID) + 2)
+
+    shared_response = _page_pc_parent_response(
+        ((page1_cid, page1_author, "黑龙江"), (page2_cid, page2_author, "浙江"))
+    )
+    pages = [
+        FakePage(
+            page_pc_response_text=shared_response,
+            nested_response_text=_nested_response(cid=page1_cid, author_id=page1_author),
+            expansion_remaining=2,  # hits max_expansions=1 -> NOT exhausted
+        ),
+        FakePage(
+            page_pc_response_text=shared_response,
+            nested_response_text=_nested_response(cid=page1_cid, author_id=page1_author),
+            expansion_remaining=1,
+        ),
+    ]
+    context = FakeContext(lambda: pages.pop(0))
+    provider = _provider(context, max_expansions=1, reuse_parent_snapshots=True)
+    provider.set_run_scope("unexhausted-run")
+
+    anchor = await provider.collect(_comment_target(requested_fields=("ip_location_text",)))
+    assert anchor.status == "ok"
+    cached = provider._cached_parent_snapshot
+    assert cached is not None
+    assert cached.exhausted is False
+
+    # Missing CID misses cache and falls back to fresh page, without destroying cached snapshot.
+    missing = await provider.collect(
+        _comment_target(
+            target_id=missing_cid,
+            cid=missing_cid,
+            author_user_id=missing_author,
+            requested_fields=("ip_location_text",),
+        )
+    )
+    assert missing.status == "identity_unverified"
+    assert missing.diagnostics["pages"] == 1
+    assert provider._cached_parent_snapshot is cached
+
+    # Next valid sibling still reuses the preserved snapshot!
+    sibling = await provider.collect(
+        _comment_target(
+            target_id=page2_cid,
+            cid=page2_cid,
+            author_user_id=page2_author,
+            requested_fields=("ip_location_text",),
+        )
+    )
+    assert sibling.status == "ok"
+    assert sibling.diagnostics["parent_snapshot_hits"] == 1
+    assert sibling.diagnostics["pages"] == 0
+    assert len(context.pages) == 2
+    await provider.close()

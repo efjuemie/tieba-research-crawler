@@ -31,6 +31,46 @@ async def create_research_tables(engine: AsyncEngine) -> None:
         await connection.run_sync(_ensure_content_field_sources)
         await connection.run_sync(_ensure_content_metadata_columns)
         await connection.run_sync(_ensure_api_field_observation_nullability)
+        await connection.run_sync(_ensure_web_enrichment_lease_indexes)
+
+
+def _ensure_web_enrichment_lease_indexes(connection) -> None:
+    """Ensure PostgreSQL partial indexes exist for tiered web task leasing."""
+    if connection.dialect.name != "postgresql":
+        return
+    connection.exec_driver_sql(
+        """
+        CREATE INDEX IF NOT EXISTS ix_rwt_active_lease_newest
+        ON research_web_enrichment_task (
+            run_id,
+            target_type,
+            attempts ASC,
+            priority DESC,
+            tid DESC,
+            parent_post_pid ASC,
+            target_id ASC,
+            created_at ASC,
+            task_key ASC
+        )
+        WHERE status IN ('pending_web', 'failed_retryable', 'running')
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE INDEX IF NOT EXISTS ix_rwt_active_lease_tid_desc
+        ON research_web_enrichment_task (
+            run_id,
+            attempts ASC,
+            priority DESC,
+            tid DESC,
+            parent_post_pid ASC,
+            target_id ASC,
+            created_at ASC,
+            task_key ASC
+        )
+        WHERE status IN ('pending_web', 'failed_retryable', 'running')
+        """
+    )
 
 
 def _ensure_research_user_global_growth_level(connection) -> None:

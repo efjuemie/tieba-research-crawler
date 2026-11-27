@@ -11,6 +11,7 @@ from src.research.web_fallback.identity import Target, make_request_context
 from src.research.web_fallback.network import (
     extract_from_parent_snapshot,
     extract_nested_floor,
+    verify_parent_nested_floor_page,
     verify_parent_snapshot,
 )
 
@@ -563,3 +564,57 @@ def test_nested_floor_keeps_zero_growth_unknown_and_explicit_zero_agree_count():
         "reason": "global_growth_level_zero_is_unknown",
     }
     assert candidates["agree_count"].normalized_value == 0
+
+
+def test_nested_floor_marks_empty_ip_absent_and_bare_ip_needs_evidence():
+    empty_result = _extract(_payload(ip_address=""))
+    assert empty_result.status == "ok"
+    assert empty_result.field_outcomes["ip_location_text"] == {
+        "status": "absent_on_page",
+        "reason": "ip_location_empty_in_response",
+    }
+
+    bare_ip_result = _extract(_payload(ip_address="192.0.2.8"))
+    assert bare_ip_result.status == "ok"
+    assert bare_ip_result.field_outcomes["ip_location_text"] == {
+        "status": "needs_evidence",
+        "reason": "bare_ip_not_region_label",
+    }
+
+
+def test_verify_parent_nested_floor_page_accepts_sibling_page_and_rejects_mismatched_identity():
+    anchor = _target(requested_fields=("ip_location_text",))
+    sibling_cid = "9007199254740994"
+    sibling_author = "77004"
+    sibling = _target(
+        target_id=sibling_cid,
+        cid=sibling_cid,
+        author_user_id=sibling_author,
+        requested_fields=("ip_location_text",),
+    )
+    sibling_page = json.dumps(
+        _payload(
+            cid=sibling_cid,
+            author_id=sibling_author,
+            nested_author_id=sibling_author,
+            ip_address="江苏",
+        ),
+        ensure_ascii=False,
+    )
+    context = _context(anchor)
+
+    assert verify_parent_snapshot(anchor, sibling_page, context) is None
+    verified = verify_parent_nested_floor_page(anchor, sibling_page, context)
+    assert verified is not None
+    extracted = extract_from_parent_snapshot(sibling, verified)
+    assert extracted.status == "ok"
+    assert extracted.identity_verified is True
+    assert next(c.normalized_value for c in extracted.candidates if c.field_name == "ip_location_text") == "江苏"
+
+    wrong_tid_payload = _payload(cid=sibling_cid, author_id=sibling_author)
+    wrong_tid_payload["data"]["tid"] = int(TID) + 1
+    assert verify_parent_nested_floor_page(anchor, json.dumps(wrong_tid_payload), context) is None
+
+    nonzero_err_payload = _payload(cid=sibling_cid, author_id=sibling_author)
+    nonzero_err_payload["error_code"] = 4
+    assert verify_parent_nested_floor_page(anchor, json.dumps(nonzero_err_payload), context) is None

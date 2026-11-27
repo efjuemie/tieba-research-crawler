@@ -30,6 +30,7 @@ from .network import (
     extract_page_pc_comment,
     extract_page_pc_post,
     extract_page_pc_thread_counts,
+    verify_parent_nested_floor_page,
     verify_parent_snapshot,
 )
 
@@ -209,6 +210,18 @@ class _CachedParentSnapshot:
     cached_at: float
     target_count: int = 1
     missed_target_ids: set[str] = field(default_factory=set)
+    growth_missed_target_ids: set[str] = field(default_factory=set)
+    exhausted: bool = False
+    exhausted_reason: str | None = None
+
+
+def _snapshot_dedup_key(snapshot: Any) -> tuple[str, str, str | None, str]:
+    return (
+        snapshot.source_path,
+        snapshot.request_context.request_url,
+        snapshot.request_context.request_offset,
+        snapshot.response_text,
+    )
 
 
 def _parent_snapshot_group_key(target: Target) -> tuple[str | None, str, str, int, int]:
@@ -522,6 +535,21 @@ class PlaywrightWebFallbackProvider:
                 )
                 if snapshot is not None:
                     parent_snapshot_pending.append(snapshot)
+            elif (
+                self._reuse_parent_snapshots
+                and path == NESTED_FLOOR_PATH
+                and target.target_type == "comment"
+                and result.status == "identity_unverified"
+                and result.reason == "cid_missing_from_response"
+            ):
+                snapshot = verify_parent_nested_floor_page(
+                    target,
+                    response_text,
+                    context_snapshot,
+                    response_status=response.status,
+                )
+                if snapshot is not None:
+                    parent_snapshot_pending.append(snapshot)
             if (
                 path == PAGE_PC_PATH
                 and target.target_type in {"thread", "post"}
@@ -654,6 +682,7 @@ class PlaywrightWebFallbackProvider:
         dom_result: DOMExtractionResult | None = None
         terminal_readiness: str | None = None
         cache_ready = False
+        comment_owner_exhausted = False
         try:
             if reuse_page and cached_page is not None:
                 cached_context = replace(
@@ -811,7 +840,9 @@ class PlaywrightWebFallbackProvider:
                         break
                 elif target.target_type == "comment":
                     state["operation_phase"] = "comment_expansion"
-                    await self._expand_comment_owner(page, target, state, capture_response, deadline)
+                    comment_owner_exhausted = await self._expand_comment_owner(
+                        page, target, state, capture_response, deadline
+                    )
                     dom_result = _extract_dom_or_empty(target, page.url, await page.content())
                     if dom_result.identity_verified:
                         dom_result = await _hover_growth_and_extract_dom(
@@ -914,7 +945,11 @@ class PlaywrightWebFallbackProvider:
             if target.target_type in {"thread", "post"} and identity_verified and post_page_snapshot is not None:
                 self._cached_post_page = post_page_snapshot
             if candidates:
-                self._cache_parent_snapshots(target, parent_snapshot_pending)
+                self._cache_parent_snapshots(
+                    target,
+                    parent_snapshot_pending,
+                    exhausted=comment_owner_exhausted and self._max_pages == 1,
+                )
                 return BrowserRunResult(
                     "ok",
                     None,
@@ -925,7 +960,11 @@ class PlaywrightWebFallbackProvider:
                     identity_methods,
                 )
             if identity_verified:
-                self._cache_parent_snapshots(target, parent_snapshot_pending)
+                self._cache_parent_snapshots(
+                    target,
+                    parent_snapshot_pending,
+                    exhausted=comment_owner_exhausted and self._max_pages == 1,
+                )
                 return BrowserRunResult(
                     "ok",
                     None,
@@ -1038,7 +1077,13 @@ class PlaywrightWebFallbackProvider:
                         ):
                             raise
 
-    def _cache_parent_snapshots(self, target: Target, snapshots: list[Any]) -> None:
+    def _cache_parent_snapshots(
+        self,
+        target: Target,
+        snapshots: list[Any],
+        *,
+        exhausted: bool = False,
+    ) -> None:
         if target.scope_generation is None or target.parent_scope_generation is None:
             self._cached_parent_snapshot = None
             return
@@ -1052,19 +1097,33 @@ class PlaywrightWebFallbackProvider:
             and cached.group_key == group_key
             and time.monotonic() - cached.cached_at <= self._parent_snapshot_ttl_seconds
         ):
+            existing_keys = {_snapshot_dedup_key(existing) for existing in cached.snapshots}
             added_snapshot = False
             for snapshot in snapshots:
-                if all(existing.source_path != snapshot.source_path for existing in cached.snapshots):
+                dedup_key = _snapshot_dedup_key(snapshot)
+                if dedup_key not in existing_keys:
                     cached.snapshots.append(snapshot)
+                    existing_keys.add(dedup_key)
                     added_snapshot = True
             if added_snapshot:
-                cached.missed_target_ids.clear()
+                cached.missed_target_ids.intersection_update(cached.growth_missed_target_ids)
+            if exhausted:
+                cached.exhausted = True
         else:
+            deduped_snapshots = []
+            seen_keys = set()
+            for snapshot in snapshots:
+                dedup_key = _snapshot_dedup_key(snapshot)
+                if dedup_key not in seen_keys:
+                    seen_keys.add(dedup_key)
+                    deduped_snapshots.append(snapshot)
             self._cached_parent_snapshot = _CachedParentSnapshot(
                 self._run_scope_id,
                 group_key,
-                list(snapshots),
+                deduped_snapshots,
                 time.monotonic(),
+                exhausted=exhausted,
+                exhausted_reason="cid_missing_from_response",
             )
 
     def _collect_from_parent_snapshot(
@@ -1122,8 +1181,26 @@ class PlaywrightWebFallbackProvider:
                 False,
             )
         if not results:
-            self._cached_parent_snapshot = None
+            if cached.exhausted and self._max_pages == 1:
+                state["parent_snapshot_hits"] = 1
+                reason = cached.exhausted_reason or "cid_missing_from_response"
+                if cached.target_count >= self._parent_snapshot_max_targets:
+                    self._cached_parent_snapshot = None
+                return BrowserRunResult(
+                    "identity_unverified",
+                    reason,
+                    (),
+                    dict(state),
+                    {
+                        name: {"status": "identity_unverified", "reason": reason}
+                        for name in target.requested_fields
+                    },
+                    False,
+                )
+            cached.missed_target_ids.add(target_key)
             state["parent_snapshot_misses"] = 1
+            if cached.target_count >= self._parent_snapshot_max_targets:
+                self._cached_parent_snapshot = None
             return None
 
         growth_fields = {"global_growth_level", "global_growth_icon_url"}
@@ -1131,6 +1208,7 @@ class PlaywrightWebFallbackProvider:
             candidate.field_name in growth_fields for result in results for candidate in result.candidates
         ):
             cached.missed_target_ids.add(target_key)
+            cached.growth_missed_target_ids.add(target_key)
             state["parent_snapshot_misses"] = 1
             if cached.target_count >= self._parent_snapshot_max_targets:
                 self._cached_parent_snapshot = None
@@ -1353,17 +1431,17 @@ class PlaywrightWebFallbackProvider:
                 await asyncio.sleep(min(0.05, remaining))
         return "timeout" if loop.time() >= task_deadline else "not_ready"
 
-    async def _expand_comment_owner(self, page, target, state, capture_response, deadline) -> None:
+    async def _expand_comment_owner(self, page, target, state, capture_response, deadline) -> bool:
         owner = page.locator(f'.pb-comment-item[data-id="{target.parent_post_pid}"]')
         if await owner.count() != 1:
-            return
+            return False
         wrapper = owner.locator(":scope > .comment-content > .lzl-wrapper")
         if await wrapper.count() != 1:
-            return
+            return False
         expansion = wrapper.locator(":scope > .show-more-lzl")
         while state["expansions"] < self._max_expansions:
             if await expansion.count() != 1:
-                return
+                return not state["blocked_reason"]
             try:
                 async with page.expect_response(
                     lambda response: urlparse(response.request.url).path == NESTED_FLOOR_PATH,
@@ -1374,19 +1452,20 @@ class PlaywrightWebFallbackProvider:
                 response = await response_info.value
             except Exception as error:
                 if _looks_like_timeout(error):
-                    return
+                    return False
                 raise
             state["expansions"] += 1
             await capture_response(response)
             owner = page.locator(f'.pb-comment-item[data-id="{target.parent_post_pid}"]')
             if await owner.count() != 1:
-                return
+                return False
             wrapper = owner.locator(":scope > .comment-content > .lzl-wrapper")
             if await wrapper.count() != 1:
-                return
+                return False
             expansion = wrapper.locator(":scope > .show-more-lzl")
             if state["blocked_reason"]:
-                return
+                return False
+        return await expansion.count() != 1 and not state["blocked_reason"]
 
     async def _install_resource_route(self, context: Any) -> None:
         route_fn = getattr(context, "route", None)

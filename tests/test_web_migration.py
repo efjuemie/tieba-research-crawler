@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine, inspect, text
 
-from src.research.migration import _ensure_content_field_sources, create_research_tables
+from src.research.migration import (
+    _ensure_content_field_sources,
+    _ensure_web_enrichment_lease_indexes,
+    create_research_tables,
+)
 
 
 class _AsyncConnectionAdapter:
@@ -91,3 +95,24 @@ def test_postgresql_web_source_migration_uses_add_column_if_not_exists():
         "ALTER TABLE research_post ADD COLUMN IF NOT EXISTS field_sources_json JSONB",
         "ALTER TABLE research_comment ADD COLUMN IF NOT EXISTS field_sources_json JSONB",
     ]
+
+
+def test_postgresql_web_enrichment_lease_indexes_migration_is_idempotent():
+    pg_statements = []
+    pg_connection = SimpleNamespace(
+        dialect=SimpleNamespace(name="postgresql"),
+        exec_driver_sql=pg_statements.append,
+    )
+    _ensure_web_enrichment_lease_indexes(pg_connection)
+    assert len(pg_statements) == 2
+    assert all("CREATE INDEX IF NOT EXISTS" in stmt for stmt in pg_statements)
+    assert any("ix_rwt_active_lease_newest" in stmt for stmt in pg_statements)
+    assert any("ix_rwt_active_lease_tid_desc" in stmt for stmt in pg_statements)
+
+    sqlite_statements = []
+    sqlite_connection = SimpleNamespace(
+        dialect=SimpleNamespace(name="sqlite"),
+        exec_driver_sql=sqlite_statements.append,
+    )
+    _ensure_web_enrichment_lease_indexes(sqlite_connection)
+    assert sqlite_statements == []
