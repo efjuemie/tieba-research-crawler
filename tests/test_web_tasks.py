@@ -31,6 +31,7 @@ from src.research.web_fallback.tasks import (
     cancel_web_enrichment_task,
     enqueue_web_enrichment_tasks,
     lease_web_enrichment_tasks,
+    reset_web_worker_failure_tasks,
     resume_web_enrichment_tasks,
 )
 
@@ -2495,3 +2496,90 @@ async def test_tiered_lease_limit_one_matches_full_batch_priority_order(research
         (1001, "post", 2101),
         (999, "comment", 3999),
     ]
+
+
+@pytest.mark.asyncio
+async def test_reset_web_worker_failure_tasks_resets_only_worker_crash_tasks(research_db):
+    engine, maker = research_db
+    observed = datetime(2026, 1, 1, tzinfo=UTC)
+    post_ids = [2951, 2952, 2953, 2954]
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                ResearchPost(
+                    pid=pid,
+                    tid=1001,
+                    fid=7654321,
+                    text=f"post {pid}",
+                    author_user_id=700 + idx,
+                    author_portrait=f"p{pid}",
+                    source_api="aiotieba.get_posts",
+                    observed_at=observed,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                )
+                for idx, pid in enumerate(post_ids)
+            ]
+        )
+    summary = await enqueue_web_enrichment_tasks(
+        maker,
+        "run-web-001",
+        ["ip_location_text"],
+        target_type="post",
+        target_ids=post_ids,
+    )
+    future_retry = datetime.now(UTC) + timedelta(minutes=5)
+    with Session(engine) as session, session.begin():
+        rows = {
+            row.target_id: row
+            for row in session.scalars(
+                select(ResearchWebEnrichmentTask).where(
+                    ResearchWebEnrichmentTask.task_key.in_(summary.task_keys)
+                )
+            ).all()
+        }
+        rows[2951].status = "failed_retryable"
+        rows[2951].attempts = 1
+        rows[2951].next_retry_at = future_retry
+        rows[2951].last_error_type = "failed_retryable"
+        rows[2951].last_error = "web_worker_target_failed"
+
+        rows[2952].status = "failed_final"
+        rows[2952].attempts = 3
+        rows[2952].last_error_type = "failed_final"
+        rows[2952].last_error = "browser_context_closed"
+        rows[2952].completed_at = datetime.now(UTC)
+
+        rows[2953].status = "failed_retryable"
+        rows[2953].attempts = 1
+        rows[2953].next_retry_at = future_retry
+        rows[2953].last_error_type = "failed_retryable"
+        rows[2953].last_error = "target_post_missing_from_response"
+
+        rows[2954].status = "completed"
+        rows[2954].attempts = 1
+        rows[2954].completed_at = datetime.now(UTC)
+
+    reset_count = await reset_web_worker_failure_tasks(maker, ["run-web-001"])
+    assert reset_count == 2
+
+    with Session(engine) as session:
+        rows = {
+            row.target_id: row
+            for row in session.scalars(
+                select(ResearchWebEnrichmentTask).where(
+                    ResearchWebEnrichmentTask.task_key.in_(summary.task_keys)
+                )
+            ).all()
+        }
+    for target_id in (2951, 2952):
+        assert rows[target_id].status == "pending_web"
+        assert rows[target_id].attempts == 0
+        assert rows[target_id].next_retry_at is None
+        assert rows[target_id].last_error_type is None
+        assert rows[target_id].last_error is None
+        assert rows[target_id].completed_at is None
+    assert rows[2953].status == "failed_retryable"
+    assert rows[2953].attempts == 1
+    assert rows[2953].last_error == "target_post_missing_from_response"
+    assert rows[2954].status == "completed"

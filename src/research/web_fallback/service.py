@@ -41,6 +41,9 @@ from .tasks import (
 
 _TRANSPORT_ERRORS = (ConnectionResetError, BrokenPipeError, EOFError, asyncio.IncompleteReadError)
 _QUEUE_WAIT_LOG_INTERVAL_SECONDS = 30.0
+_MAX_CONSECUTIVE_WEB_WORKER_FAILURES = 5
+_WEB_WORKER_FAILURE_BACKOFF_SECONDS = 2.0
+_WEB_WORKER_FAILURE_REASONS = frozenset({"web_worker_target_failed", "browser_context_closed"})
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -856,6 +859,7 @@ async def drain_pending_web_enrichment(
     stopped_run_id = None
     stopped_target_type = None
     last_queue_wait_log = 0.0
+    consecutive_worker_failures = 0
     extra_filter_kwargs: dict[str, Any] = (
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
@@ -919,7 +923,14 @@ async def drain_pending_web_enrichment(
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            logger.exception(
+                "WEB fallback worker target failed unexpectedly: task_key=%s target_type=%s target_id=%s tid=%s",
+                getattr(lease, "task_key", None),
+                getattr(lease, "target_type", None),
+                getattr(lease, "target_id", None),
+                getattr(lease, "tid", None),
+            )
             result = _status_result("timeout", "web_worker_target_failed")
             status = "failed_retryable"
             await _fail_task(
@@ -929,7 +940,7 @@ async def drain_pending_web_enrichment(
                 status=status,
                 reason_code="web_worker_target_failed",
                 field_outcomes=_failure_outcomes(lease.requested_fields, "timeout", "web_worker_target_failed"),
-                diagnostics={},
+                diagnostics={"worker_error_type": type(exc).__name__},
             )
         if not getattr(result, "preflight_skipped", False):
             collected += 1
@@ -957,6 +968,28 @@ async def drain_pending_web_enrichment(
         if status == "failed_retryable" and reason == "transport_reset":
             stopped_reason = "transport_reset"
             break
+        if status == "failed_retryable" and reason in _WEB_WORKER_FAILURE_REASONS:
+            consecutive_worker_failures += 1
+            if consecutive_worker_failures >= _MAX_CONSECUTIVE_WEB_WORKER_FAILURES:
+                logger.error(
+                    "Stopping WEB fallback worker after %d consecutive %s failures (last task_key=%s)",
+                    consecutive_worker_failures,
+                    reason,
+                    lease.task_key,
+                )
+                stopped_reason = "consecutive_web_worker_failures"
+                break
+            if consecutive_worker_failures >= 2 and _WEB_WORKER_FAILURE_BACKOFF_SECONDS > 0:
+                backoff = min(
+                    _WEB_WORKER_FAILURE_BACKOFF_SECONDS * (consecutive_worker_failures - 1),
+                    10.0,
+                )
+                if stop_event is None:
+                    await asyncio.sleep(backoff)
+                else:
+                    await _wait_for_stop_or_timeout(stop_event, backoff)
+        else:
+            consecutive_worker_failures = 0
         if status == "blocked" and _is_rate_limited(reason):
             stopped_reason = "http_429"
             break
@@ -1062,6 +1095,7 @@ async def run_live_web_fallback_worker(
     stopped_target_type = None
     all_run_ids: set[str] = set()
     last_queue_wait_log = 0.0
+    consecutive_worker_failures = 0
     extra_filter_kwargs: dict[str, Any] = (
         {"min_thread_create_time": min_thread_create_time} if min_thread_create_time is not None else {}
     )
@@ -1130,7 +1164,14 @@ async def run_live_web_fallback_worker(
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                logger.exception(
+                    "WEB fallback worker target failed unexpectedly: task_key=%s target_type=%s target_id=%s tid=%s",
+                    getattr(lease, "task_key", None),
+                    getattr(lease, "target_type", None),
+                    getattr(lease, "target_id", None),
+                    getattr(lease, "tid", None),
+                )
                 result = _status_result("timeout", "web_worker_target_failed")
                 status = "failed_retryable"
                 await _fail_task(
@@ -1142,7 +1183,7 @@ async def run_live_web_fallback_worker(
                     field_outcomes=_failure_outcomes(
                         lease.requested_fields, "timeout", "web_worker_target_failed"
                     ),
-                    diagnostics={},
+                    diagnostics={"worker_error_type": type(exc).__name__},
                 )
             if not getattr(result, "preflight_skipped", False):
                 collected += 1
@@ -1168,6 +1209,25 @@ async def run_live_web_fallback_worker(
             if status == "failed_retryable" and reason == "transport_reset":
                 stopped_reason = "transport_reset"
                 break
+            if status == "failed_retryable" and reason in _WEB_WORKER_FAILURE_REASONS:
+                consecutive_worker_failures += 1
+                if consecutive_worker_failures >= _MAX_CONSECUTIVE_WEB_WORKER_FAILURES:
+                    logger.error(
+                        "Stopping WEB fallback worker after %d consecutive %s failures (last task_key=%s)",
+                        consecutive_worker_failures,
+                        reason,
+                        lease.task_key,
+                    )
+                    stopped_reason = "consecutive_web_worker_failures"
+                    break
+                if consecutive_worker_failures >= 2 and _WEB_WORKER_FAILURE_BACKOFF_SECONDS > 0:
+                    backoff = min(
+                        _WEB_WORKER_FAILURE_BACKOFF_SECONDS * (consecutive_worker_failures - 1),
+                        10.0,
+                    )
+                    await _wait_for_stop_or_timeout(stop_event, backoff)
+            else:
+                consecutive_worker_failures = 0
             if status == "blocked" and _is_rate_limited(reason):
                 stopped_reason = "http_429"
                 break
@@ -1637,6 +1697,7 @@ def _add_diagnostics(counter: Counter[str], values: Any) -> None:
         "growth_hover_attempts",
         "parent_snapshot_hits",
         "parent_snapshot_misses",
+        "browser_relaunch_attempts",
     ):
         value = values.get(name)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
@@ -1663,6 +1724,7 @@ def _safe_diagnostics(values: Any) -> dict[str, Any]:
         "page_cache_hits",
         "post_owner_scrolls",
         "growth_hover_attempts",
+        "browser_relaunch_attempts",
     ):
         value = values.get(name)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
@@ -1676,7 +1738,7 @@ def _safe_diagnostics(values: Any) -> dict[str, Any]:
             output[name] = _safe_reason(value)
     if values.get("manual_gate_detected") is True:
         output["manual_gate_detected"] = True
-    for name in ("transport_error_type", "transport_component", "operation_phase"):
+    for name in ("transport_error_type", "transport_component", "operation_phase", "worker_error_type"):
         value = values.get(name)
         if isinstance(value, str):
             output[name] = _safe_reason(value)

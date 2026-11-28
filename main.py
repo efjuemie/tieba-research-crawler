@@ -29,6 +29,7 @@ from src.research.web_fallback.live import (
     prune_stale_web_tasks,
     run_live_web_worker,
 )
+from src.research.web_fallback.tasks import reset_web_worker_failure_tasks
 from src.scraper import Scheduler, Worker
 from src.scraper.router import QueueRouter
 from src.scraper.tasks import FullScanCommentsTask, FullScanPostsTask, IncrementalScanCommentsTask, Priority, Task
@@ -1254,6 +1255,7 @@ async def main(
     resume: bool = False,
     run_id: str | None = None,
     revalidate_failed_comment_page_zero: bool = False,
+    reset_web_worker_failures: bool = False,
     min_thread_year: int | None = None,
     newest_first: bool = False,
     ip_location_min_date: str | None = None,
@@ -1271,6 +1273,8 @@ async def main(
         raise ValueError("--backfill-sort can only be used with --mode backfill.")
     if revalidate_failed_comment_page_zero and not resume:
         raise ValueError("--revalidate-failed-comment-page-zero requires --resume.")
+    if reset_web_worker_failures and not resume:
+        raise ValueError("--reset-web-worker-failures requires --resume.")
     if api_continue_older and min_thread_year is None:
         raise ValueError("--api-continue-older requires --min-thread-year.")
     min_thread_create_time = _min_thread_create_time(min_thread_year)
@@ -1599,6 +1603,17 @@ async def main(
                         "Pruned stale WEB tasks (target_observed_at_changed) before worker start: {}",
                         stale_pruned,
                     )
+                if reset_web_worker_failures:
+                    reset_count = await reset_web_worker_failure_tasks(
+                        datastore.async_sessionmaker,
+                        web_run_ids,
+                    )
+                    if reset_count:
+                        logger.info(
+                            "Reset {} WEB tasks failed by worker/browser crash back to "
+                            "pending_web (attempts=0) before worker start.",
+                            reset_count,
+                        )
             web_stop_event = asyncio.Event()
             api_done_event = asyncio.Event()
             web_config = container.config.pydantic_config.web_fallback
@@ -1819,6 +1834,14 @@ if __name__ == "__main__":
         help="on resume, recheck one stored parent page after a page-one comment identity failure",
     )
     parser.add_argument(
+        "--reset-web-worker-failures",
+        action="store_true",
+        help=(
+            "on resume, reset failed_retryable/failed_final WEB tasks whose last error was a "
+            "worker/browser crash back to pending_web with attempts=0"
+        ),
+    )
+    parser.add_argument(
         "--min-thread-year",
         type=positive_int,
         help=(
@@ -1878,6 +1901,8 @@ if __name__ == "__main__":
             parser.error("--backfill-sort cannot be combined with drain-pending")
         if args.revalidate_failed_comment_page_zero:
             parser.error("--revalidate-failed-comment-page-zero cannot be combined with drain-pending")
+        if args.reset_web_worker_failures:
+            parser.error("--reset-web-worker-failures cannot be combined with drain-pending")
         if args.min_thread_year is not None:
             parser.error("--min-thread-year cannot be combined with drain-pending")
         if args.newest_first:
@@ -1895,6 +1920,8 @@ if __name__ == "__main__":
             parser.error("--backfill-sort can only be used with --mode backfill")
         if args.revalidate_failed_comment_page_zero and not args.resume:
             parser.error("--revalidate-failed-comment-page-zero requires --resume")
+        if args.reset_web_worker_failures and not args.resume:
+            parser.error("--reset-web-worker-failures requires --resume")
         if args.min_thread_year is not None and not 1990 <= args.min_thread_year <= 2100:
             parser.error("--min-thread-year must be between 1990 and 2100")
         if args.api_continue_older and args.min_thread_year is None:
@@ -1924,6 +1951,7 @@ if __name__ == "__main__":
                 resume=args.resume,
                 run_id=args.run_id,
                 revalidate_failed_comment_page_zero=args.revalidate_failed_comment_page_zero,
+                reset_web_worker_failures=args.reset_web_worker_failures,
                 min_thread_year=args.min_thread_year,
                 newest_first=args.newest_first,
                 ip_location_min_date=args.ip_location_min_date,

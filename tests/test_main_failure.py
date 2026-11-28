@@ -22,6 +22,17 @@ async def test_parent_zero_revalidation_flag_requires_resume_before_initializati
     initialize.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_reset_web_worker_failures_flag_requires_resume_before_initialization(monkeypatch):
+    initialize = AsyncMock()
+    monkeypatch.setattr(app_main, "initialize_application", initialize)
+
+    with pytest.raises(ValueError, match="--reset-web-worker-failures requires --resume"):
+        await app_main.main(reset_web_worker_failures=True)
+
+    initialize.assert_not_awaited()
+
+
 def test_parse_ip_location_min_date_accepts_date_none_and_rejects_invalid():
     parsed = app_main._parse_ip_location_min_date("2022-04-28")
     assert parsed is not None

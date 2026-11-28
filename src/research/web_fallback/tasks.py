@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from sqlalchemy import String, and_, any_, bindparam, case, cast, exists, func, select, text
+from sqlalchemy import String, and_, any_, bindparam, case, cast, exists, func, select, text, update
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -1767,6 +1767,45 @@ async def prune_stale_web_tasks(
     return pruned
 
 
+async def reset_web_worker_failure_tasks(
+    async_sessionmaker_: async_sessionmaker,
+    run_ids: Sequence[str],
+    *,
+    reason_codes: Sequence[str] = ("web_worker_target_failed", "browser_context_closed"),
+    now: datetime | None = None,
+) -> int:
+    """Reset WEB tasks failed by worker/browser crashes back to ``pending_web``."""
+    stable_run_ids = tuple(dict.fromkeys(run_ids))
+    stable_reasons = tuple(dict.fromkeys(reason_codes))
+    if not stable_run_ids or not stable_reasons:
+        return 0
+    current_time = _now(now)
+    async with async_sessionmaker_() as session, session.begin():
+        statement = (
+            update(ResearchWebEnrichmentTask)
+            .where(
+                ResearchWebEnrichmentTask.run_id.in_(stable_run_ids),
+                ResearchWebEnrichmentTask.status.in_(("failed_retryable", "failed_final")),
+                ResearchWebEnrichmentTask.last_error.in_(stable_reasons),
+            )
+            .values(
+                status="pending_web",
+                attempts=0,
+                next_retry_at=None,
+                last_error_type=None,
+                last_error=None,
+                lease_token=None,
+                lease_owner=None,
+                lease_until=None,
+                leased_at=None,
+                completed_at=None,
+                updated_at=current_time,
+            )
+        )
+        result = await session.execute(statement)
+    return int(result.rowcount or 0)
+
+
 __all__ = [
     "EnqueueSummary",
     "IP_BEFORE_LAUNCH_REASON",
@@ -1782,5 +1821,6 @@ __all__ = [
     "plan_web_enrichment_targets",
     "prune_pre_launch_ip_web_tasks",
     "prune_stale_web_tasks",
+    "reset_web_worker_failure_tasks",
     "resume_web_enrichment_tasks",
 ]

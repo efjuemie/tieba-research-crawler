@@ -3240,3 +3240,195 @@ async def test_parent_snapshot_falls_back_when_cached_dom_growth_needs_hover():
     assert next(c.normalized_value for c in sibling.candidates if c.field_name == "global_growth_level") == 9
     assert len(context.pages) == 2
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_context_target_closed_on_new_page_auto_relaunches_and_succeeds(tmp_path):
+    class TargetClosedError(Exception):
+        pass
+
+    launch_calls = 0
+
+    class DeadNewPageContext:
+        async def new_page(self):
+            raise TargetClosedError(
+                "BrowserContext.new_page: Target page, context or browser has been closed"
+            )
+
+        async def close(self):
+            pass
+
+    healthy_context = FakeContext(lambda: FakePage(html_text=_thread_html()))
+
+    class FakeChromium:
+        async def launch_persistent_context(self, **_kwargs):
+            nonlocal launch_calls
+            launch_calls += 1
+            return DeadNewPageContext() if launch_calls == 1 else healthy_context
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def stop(self):
+            pass
+
+    class FakeManager:
+        async def start(self):
+            return FakePlaywright()
+
+    provider = PlaywrightWebFallbackProvider(
+        profile_dir=tmp_path / "dedicated-profile",
+        budget=FakeBudget(),
+        playwright_factory=FakeManager,
+    )
+
+    result = await provider.collect(_thread_target())
+
+    assert result.status == "ok"
+    assert launch_calls == 2
+    assert result.diagnostics["browser_relaunch_attempts"] == 1
+    assert len(healthy_context.pages) == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_context_disconnected_browser_auto_relaunches_in_ensure_context(tmp_path):
+    connected = True
+    launch_calls = 0
+
+    class FakeBrowser:
+        def is_connected(self):
+            return connected
+
+    class DisconnectingContext(FakeContext):
+        def __init__(self):
+            super().__init__(lambda: FakePage(html_text=_thread_html()))
+            self.browser = FakeBrowser()
+
+    contexts = [DisconnectingContext(), FakeContext(lambda: FakePage(html_text=_thread_html()))]
+
+    class FakeChromium:
+        async def launch_persistent_context(self, **_kwargs):
+            nonlocal launch_calls
+            launch_calls += 1
+            return contexts[launch_calls - 1]
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def stop(self):
+            pass
+
+    class FakeManager:
+        async def start(self):
+            return FakePlaywright()
+
+    provider = PlaywrightWebFallbackProvider(
+        profile_dir=tmp_path / "dedicated-profile",
+        budget=FakeBudget(),
+        playwright_factory=FakeManager,
+    )
+
+    first = await provider.collect(_thread_target())
+    assert first.status == "ok"
+    assert launch_calls == 1
+
+    connected = False
+    second = await provider.collect(_thread_target())
+    assert second.status == "ok"
+    assert launch_calls == 2
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_context_target_closed_mid_task_resets_context_for_next_target(tmp_path):
+    class TargetClosedError(Exception):
+        pass
+
+    launch_calls = 0
+    broken_page = FakePage(close_error=TargetClosedError("Target page, context or browser has been closed"))
+
+    async def closed_goto(_url, **_kwargs):
+        raise TargetClosedError("Page.goto: Target page, context or browser has been closed")
+
+    broken_page.goto = closed_goto
+    broken_context = FakeContext(lambda: broken_page)
+    healthy_context = FakeContext(lambda: FakePage(html_text=_thread_html()))
+
+    class FakeChromium:
+        async def launch_persistent_context(self, **_kwargs):
+            nonlocal launch_calls
+            launch_calls += 1
+            return broken_context if launch_calls == 1 else healthy_context
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def stop(self):
+            pass
+
+    class FakeManager:
+        async def start(self):
+            return FakePlaywright()
+
+    provider = PlaywrightWebFallbackProvider(
+        profile_dir=tmp_path / "dedicated-profile",
+        budget=FakeBudget(),
+        playwright_factory=FakeManager,
+    )
+
+    first = await provider.collect(_thread_target())
+
+    assert first.status == "failed_retryable"
+    assert first.reason == "browser_context_closed"
+    assert provider._context is None
+
+    second = await provider.collect(_thread_target())
+    assert second.status == "ok"
+    assert launch_calls == 2
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_owned_context_repeated_target_closed_returns_browser_context_closed(tmp_path):
+    class TargetClosedError(Exception):
+        pass
+
+    launch_calls = 0
+
+    class DeadNewPageContext:
+        async def new_page(self):
+            raise TargetClosedError("Target page, context or browser has been closed")
+
+        async def close(self):
+            pass
+
+    class FakeChromium:
+        async def launch_persistent_context(self, **_kwargs):
+            nonlocal launch_calls
+            launch_calls += 1
+            return DeadNewPageContext()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def stop(self):
+            pass
+
+    class FakeManager:
+        async def start(self):
+            return FakePlaywright()
+
+    provider = PlaywrightWebFallbackProvider(
+        profile_dir=tmp_path / "dedicated-profile",
+        budget=FakeBudget(),
+        playwright_factory=FakeManager,
+    )
+
+    result = await provider.collect(_thread_target())
+
+    assert result.status == "failed_retryable"
+    assert result.reason == "browser_context_closed"
+    assert result.diagnostics["browser_relaunch_attempts"] == 1
+    assert launch_calls == 2
+    await provider.close()

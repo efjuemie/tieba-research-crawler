@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -50,6 +51,14 @@ _BLOCKED_ANALYTICS_HOSTS = frozenset(
     }
 )
 _TRANSPORT_ERRORS = (ConnectionResetError, BrokenPipeError, EOFError, asyncio.IncompleteReadError)
+_BROWSER_CLOSED_ERROR_MARKERS = (
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "context has been closed",
+    "browser closed",
+    "connection closed while reading from the driver",
+)
+logger = logging.getLogger(__name__)
 _COMMENT_GROWTH_HYDRATION_WAIT_SECONDS = 2.0
 _COMMENT_GROWTH_HYDRATION_POLL_SECONDS = 0.05
 _MAX_COMMENT_GROWTH_HOVERS = 3
@@ -415,6 +424,15 @@ class PlaywrightWebFallbackProvider:
             if not state.get("transport_error_type"):
                 _record_transport_error(state, error, "browser_worker_cleanup")
             return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
+        except Exception as error:
+            if not _is_browser_closed_error(error):
+                raise
+            self._cached_parent_snapshot = None
+            if not state.get("transport_error_type"):
+                _record_transport_error(state, error, "browser_worker_cleanup")
+            if self._owned_context:
+                await self._reset_dead_context()
+            return BrowserRunResult("failed_retryable", "browser_context_closed", (), dict(state))
         finally:
             self._collect_timeout.reset(timeout_token)
 
@@ -426,35 +444,66 @@ class PlaywrightWebFallbackProvider:
             self._close_task = asyncio.create_task(self._close_resources())
         await _await_cleanup(self._close_task)
 
+    async def _open_target_page(
+        self, target: Target, state: dict[str, Any]
+    ) -> tuple[Any, _CachedPostPage | None, bool, BrowserRunResult | None]:
+        for attempt in range(2):
+            try:
+                state["operation_phase"] = "browser_context_start"
+                context = await self._ensure_context()
+                cached_page = self._cached_post_page
+                reuse_page = (
+                    target.target_type in {"thread", "post"}
+                    and cached_page is not None
+                    and cached_page.tid == target.tid
+                )
+                if reuse_page and cached_page is not None:
+                    is_closed = getattr(cached_page.page, "is_closed", None)
+                    if callable(is_closed) and is_closed():
+                        self._cached_post_page = None
+                        cached_page = None
+                        reuse_page = False
+                if cached_page is not None and not reuse_page:
+                    self._cached_post_page = None
+                    state["operation_phase"] = "cached_page_close"
+                    await _await_cleanup(asyncio.create_task(cached_page.page.close()))
+                state["operation_phase"] = "page_create"
+                page = cached_page.page if reuse_page and cached_page is not None else await context.new_page()
+                return page, cached_page, reuse_page, None
+            except _TRANSPORT_ERRORS as error:
+                _record_transport_error(
+                    state, error, state.get("operation_phase", "page_create")
+                )
+                return None, None, False, BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
+            except Exception as error:
+                if not _is_browser_closed_error(error):
+                    raise
+                phase = state.get("operation_phase", "page_create")
+                if attempt == 0 and (self._owned_context or self.profile_dir is not None):
+                    state["browser_relaunch_attempts"] = state.get("browser_relaunch_attempts", 0) + 1
+                    logger.warning(
+                        "Playwright browser/context closed during %s (%s); resetting and relaunching Chromium",
+                        phase,
+                        type(error).__name__,
+                    )
+                    await self._reset_dead_context()
+                    continue
+                _record_transport_error(state, error, phase)
+                if self._owned_context:
+                    await self._reset_dead_context()
+                return None, None, False, BrowserRunResult(
+                    "failed_retryable", "browser_context_closed", (), dict(state)
+                )
+        return None, None, False, BrowserRunResult("failed_retryable", "browser_context_closed", (), dict(state))
+
     async def _collect(self, target: Target, state: dict[str, Any], deadline: float) -> BrowserRunResult:
         loop = asyncio.get_running_loop()
         cached_result = self._collect_from_parent_snapshot(target, state)
         if cached_result is not None:
             return cached_result
-        state["operation_phase"] = "browser_context_start"
-        try:
-            context = await self._ensure_context()
-        except _TRANSPORT_ERRORS as error:
-            _record_transport_error(state, error, "browser_context_start")
-            return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
-        cached_page = self._cached_post_page
-        reuse_page = (
-            target.target_type in {"thread", "post"}
-            and cached_page is not None
-            and cached_page.tid == target.tid
-        )
-        if cached_page is not None and not reuse_page:
-            self._cached_post_page = None
-            try:
-                await _await_cleanup(asyncio.create_task(cached_page.page.close()))
-            except _TRANSPORT_ERRORS as error:
-                _record_transport_error(state, error, "cached_page_close")
-                return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
-        try:
-            page = cached_page.page if reuse_page else await context.new_page()
-        except _TRANSPORT_ERRORS as error:
-            _record_transport_error(state, error, "page_create")
-            return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
+        page, cached_page, reuse_page, open_failure = await self._open_target_page(target, state)
+        if open_failure is not None:
+            return open_failure
         request_contexts: dict[Any, ImmutableRequestContext] = {}
         request_page_numbers: dict[Any, int] = {}
         request_page_urls: dict[Any, str] = {}
@@ -1041,6 +1090,17 @@ class PlaywrightWebFallbackProvider:
                     state, error, state.get("operation_phase", "page_readiness")
                 )
                 return BrowserRunResult("failed_retryable", "transport_reset", (), dict(state))
+            if _is_browser_closed_error(error):
+                phase = state.get("operation_phase", "page_readiness")
+                _record_transport_error(state, error, phase)
+                if self._owned_context:
+                    logger.warning(
+                        "Playwright browser/context closed mid-task during %s (%s); resetting dead context",
+                        phase,
+                        type(error).__name__,
+                    )
+                    await self._reset_dead_context()
+                return BrowserRunResult("failed_retryable", "browser_context_closed", (), dict(state))
             if _looks_like_timeout(error):
                 return BrowserRunResult("timeout", "browser_operation_timeout", (), dict(state))
             return BrowserRunResult("dom_changed", "browser_operation_failed", (), dict(state))
@@ -1086,6 +1146,12 @@ class PlaywrightWebFallbackProvider:
                             and not identity_mismatch
                         ):
                             raise
+                    except Exception as close_error:
+                        if not _is_browser_closed_error(close_error):
+                            raise
+                        self._cached_parent_snapshot = None
+                        if self._owned_context and not _is_context_connected(self._context):
+                            await self._reset_dead_context()
 
     def _cache_parent_snapshots(
         self,
@@ -1556,11 +1622,47 @@ class PlaywrightWebFallbackProvider:
             await result
         self._route_installed = True
 
+    async def _reset_dead_context(self) -> None:
+        self._cached_parent_snapshot = None
+        self._cached_post_page = None
+        self._manual_login_page = None
+        self._route_installed = False
+        if not (self._owned_context or self._playwright is not None or self._manager is not None):
+            return
+        owned_context = self._context if self._owned_context else None
+        playwright = self._playwright
+        manager = self._manager
+        self._context = self._external_context
+        self._playwright = None
+        self._manager = None
+        self._owned_context = False
+        if owned_context is not None:
+            try:
+                await asyncio.wait_for(owned_context.close(), timeout=5.0)
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                await asyncio.wait_for(playwright.stop(), timeout=5.0)
+            except Exception:
+                pass
+        elif manager is not None:
+            try:
+                await asyncio.wait_for(manager.stop(), timeout=5.0)
+            except Exception:
+                pass
+
     async def _ensure_context(self):
         if self._context is not None:
-            if self._block_nonessential_resources and not self._route_installed:
-                await self._install_resource_route(self._context)
-            return self._context
+            if self._owned_context and not _is_context_connected(self._context):
+                logger.warning(
+                    "Playwright owned browser disconnected before reuse; resetting and relaunching Chromium"
+                )
+                await self._reset_dead_context()
+            else:
+                if self._block_nonessential_resources and not self._route_installed:
+                    await self._install_resource_route(self._context)
+                return self._context
         if self.profile_dir is None:
             raise BrowserProviderConfigurationError("no browser context available")
         if self._playwright_factory is None:
@@ -1575,15 +1677,20 @@ class PlaywrightWebFallbackProvider:
         else:
             factory = self._playwright_factory
         self._manager = factory()
-        self._playwright = await self._manager.start()
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_dir),
-            headless=self._headless,
-        )
-        self._owned_context = True
-        if self._block_nonessential_resources:
-            await self._install_resource_route(self._context)
-        return self._context
+        self._route_installed = False
+        try:
+            self._playwright = await self._manager.start()
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=str(self.profile_dir),
+                headless=self._headless,
+            )
+            self._owned_context = True
+            if self._block_nonessential_resources:
+                await self._install_resource_route(self._context)
+            return self._context
+        except Exception:
+            await self._reset_dead_context()
+            raise
 
     @asynccontextmanager
     async def _budget(self, state: dict[str, Any] | None = None):
@@ -1628,6 +1735,7 @@ class PlaywrightWebFallbackProvider:
 
     async def _close_resources(self) -> None:
         self._cached_parent_snapshot = None
+        self._route_installed = False
         active_task = self._active_collect_task
         if active_task is not None and active_task is not asyncio.current_task():
             active_task.cancel()
@@ -1636,21 +1744,47 @@ class PlaywrightWebFallbackProvider:
         cached_page = self._cached_post_page
         self._cached_post_page = None
         if cached_page is not None:
-            await _await_cleanup(asyncio.create_task(cached_page.page.close()))
-        if self._owned_context and self._context is not None:
-            await self._context.close()
+            try:
+                await _await_cleanup(asyncio.create_task(cached_page.page.close()))
+            except Exception as error:
+                if not _is_browser_closed_error(error):
+                    raise
+        owned_context = self._context if self._owned_context else None
+        self._owned_context = False
         self._context = self._external_context
-        if self._playwright is not None:
-            await self._playwright.stop()
-        elif self._manager is not None:
-            await self._manager.stop()
+        playwright = self._playwright
+        manager = self._manager
+        self._playwright = None
+        self._manager = None
+        if owned_context is not None:
+            try:
+                await owned_context.close()
+            except Exception as error:
+                if not _is_browser_closed_error(error):
+                    raise
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception as error:
+                if not _is_browser_closed_error(error):
+                    raise
+        elif manager is not None:
+            try:
+                await manager.stop()
+            except Exception as error:
+                if not _is_browser_closed_error(error):
+                    raise
 
     async def close_manual_login_page(self) -> None:
         page = self._manual_login_page
         self._manual_login_page = None
         if page is not None:
             self._cached_parent_snapshot = None
-            await page.close()
+            try:
+                await page.close()
+            except Exception as error:
+                if not _is_browser_closed_error(error):
+                    raise
 
 
 def _field_outcomes(target, network_results, dom_result):
@@ -2249,6 +2383,26 @@ async def _page_readiness_diagnostics(
     except Exception:
         return diagnostics
     return diagnostics
+
+
+def _is_browser_closed_error(error: BaseException) -> bool:
+    if type(error).__name__ == "TargetClosedError":
+        return True
+    message = str(error).lower()
+    return any(marker in message for marker in _BROWSER_CLOSED_ERROR_MARKERS)
+
+
+def _is_context_connected(context: Any) -> bool:
+    if context is None:
+        return False
+    browser = getattr(context, "browser", None)
+    is_connected = getattr(browser, "is_connected", None)
+    if callable(is_connected):
+        try:
+            return bool(is_connected())
+        except Exception:
+            return False
+    return True
 
 
 def _looks_like_timeout(error: Exception) -> bool:

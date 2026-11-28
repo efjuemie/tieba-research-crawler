@@ -2522,3 +2522,143 @@ async def test_preflight_resolves_pre_launch_ip_task_and_strips_mixed_ip_field(r
     assert mixed_preflight.preserved_outcomes == {
         "ip_location_text": {"status": "not_applicable", "reason": IP_BEFORE_LAUNCH_REASON}
     }
+
+
+@pytest.mark.asyncio
+async def test_live_web_worker_circuit_breaker_stops_after_consecutive_worker_failures(
+    reconcile_db, monkeypatch, caplog
+):
+    engine, maker = reconcile_db
+    monkeypatch.setattr(service, "_WEB_WORKER_FAILURE_BACKOFF_SECONDS", 0.0)
+    observed = datetime(2026, 1, 1, tzinfo=UTC)
+    post_ids = [2911, 2912, 2913, 2914, 2915, 2916, 2917]
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                ResearchPost(
+                    pid=pid,
+                    tid=1001,
+                    fid=7654321,
+                    text=f"post {pid}",
+                    author_user_id=500 + idx,
+                    author_portrait=f"p{pid}",
+                    source_api="aiotieba.get_posts",
+                    observed_at=observed,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                )
+                for idx, pid in enumerate(post_ids)
+            ]
+        )
+    await enqueue_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        ["author_nickname"],
+        target_type="post",
+        target_ids=post_ids,
+        tid=1001,
+    )
+    visited = []
+
+    class BrokenProvider:
+        async def collect(self, target):
+            visited.append(target.target_id)
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    with caplog.at_level("ERROR"):
+        summary = await asyncio.wait_for(
+            service.run_live_web_fallback_worker(
+                maker,
+                lambda: ("run-reconcile-001",),
+                stop_event=asyncio.Event(),
+                api_done_event=asyncio.Event(),
+                browser_profile="synthetic-profile",
+                browser_config=SimpleNamespace(rps=1000.0),
+                provider_factory=lambda **_kwargs: BrokenProvider(),
+                headed=False,
+                wait_for_login=False,
+            ),
+            timeout=10.0,
+        )
+
+    assert len(visited) == 5
+    assert summary.stopped_reason == "consecutive_web_worker_failures"
+    assert summary.retryable_count == 5
+    assert "WEB fallback worker target failed unexpectedly" in caplog.text
+    assert "Stopping WEB fallback worker after 5 consecutive web_worker_target_failed" in caplog.text
+    with Session(engine) as session:
+        rows = session.scalars(select(ResearchWebEnrichmentTask)).all()
+    failed = [row for row in rows if row.status == "failed_retryable"]
+    untouched = [row for row in rows if row.status == "pending_web"]
+    assert len(failed) == 5
+    assert len(untouched) == 2
+    assert all(row.attempts == 0 for row in untouched)
+
+
+@pytest.mark.asyncio
+async def test_drain_web_worker_circuit_breaker_stops_after_consecutive_browser_closed(
+    reconcile_db, monkeypatch, caplog
+):
+    engine, maker = reconcile_db
+    monkeypatch.setattr(service, "_WEB_WORKER_FAILURE_BACKOFF_SECONDS", 0.0)
+    observed = datetime(2026, 1, 1, tzinfo=UTC)
+    post_ids = [2921, 2922, 2923, 2924, 2925, 2926]
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                ResearchPost(
+                    pid=pid,
+                    tid=1001,
+                    fid=7654321,
+                    text=f"post {pid}",
+                    author_user_id=600 + idx,
+                    author_portrait=f"p{pid}",
+                    source_api="aiotieba.get_posts",
+                    observed_at=observed,
+                    source_payload_json={},
+                    missing_reasons_json={},
+                )
+                for idx, pid in enumerate(post_ids)
+            ]
+        )
+    await enqueue_web_enrichment_tasks(
+        maker,
+        "run-reconcile-001",
+        ["author_nickname"],
+        target_type="post",
+        target_ids=post_ids,
+        tid=1001,
+    )
+    visited = []
+
+    class ClosedProvider:
+        async def collect(self, target):
+            visited.append(target.target_id)
+            return SimpleNamespace(
+                status="failed_retryable",
+                reason="browser_context_closed",
+                candidates=(),
+                field_outcomes={},
+                diagnostics={},
+            )
+
+    with caplog.at_level("ERROR"):
+        summary = await asyncio.wait_for(
+            service.drain_pending_web_enrichment(
+                maker,
+                ("run-reconcile-001",),
+                provider=ClosedProvider(),
+                stop_event=asyncio.Event(),
+                wait_for_login=False,
+            ),
+            timeout=10.0,
+        )
+
+    assert len(visited) == 5
+    assert summary.stopped_reason == "consecutive_web_worker_failures"
+    assert summary.retryable_count == 5
+    assert "Stopping WEB fallback worker after 5 consecutive browser_context_closed" in caplog.text
+    with Session(engine) as session:
+        rows = session.scalars(select(ResearchWebEnrichmentTask)).all()
+    assert sum(1 for row in rows if row.status == "failed_retryable") == 5
+    assert sum(1 for row in rows if row.status == "pending_web" and row.attempts == 0) == 1
